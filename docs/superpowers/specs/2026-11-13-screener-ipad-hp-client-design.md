@@ -27,9 +27,41 @@ over UDP/SRTP, with control on TCP 5900. No software is installed on the Mac.
 3. Two-way clipboard sync.
 4. Bonjour discovery of `_rfb._tcp`, saved hosts, credentials in Keychain.
 
+5. Quality-of-life features (added 2026-11-13 at the user's request: "think through all the
+   niceties like automatic reconnection, modifier keys in a floating menu, etc"):
+   - **Automatic reconnection:** reconnect silently on network change (`NWPathMonitor`), when
+     the app returns from the background, and when the host wakes. Keep the last frame on
+     screen with a small "Reconnecting…" pill. Give up only after 3 failed attempts.
+   - **Floating control menu:** a draggable pill that snaps to screen edges and auto-hides.
+     - Sticky modifiers ⌘ ⌥ ⌃ ⇧ fn: tap to latch for one keystroke, double-tap to lock.
+     - Special-keys row: Esc, Tab, arrows, F1–F12, forward delete, Home/End, PgUp/PgDn.
+     - Shortcut actions: ⌘Tab, ⌘Space, Mission Control, Lock Screen ⌃⌘Q, Force Quit ⌘⌥Esc,
+       Screenshot ⌘⇧4.
+     - Keyboard toggle, "Type Password" (types the saved password into the Mac's lock
+       screen), send/fetch clipboard, mute, stats, display mode, disconnect.
+   - **Touch input modes:** trackpad mode (relative cursor; the default, like Screens) and
+     direct-touch mode, with pinch-zoom and a viewport that follows the cursor. Also scroll
+     inertia, haptic click feedback, Apple Pencil hover moves the pointer, and pointer lock
+     when full screen with a trackpad.
+   - **Keyboard:** iPadOS system shortcuts such as ⌘H, ⌘W and ⌘Q go to the Mac where iPadOS
+     allows it, and Caps Lock state stays in sync. Shortcuts iPadOS always keeps for itself
+     (⌘Tab, ⌘Space, Globe) are reachable from the floating menu instead.
+   - **Display modes:** Fit iPad (Retina), Fit iPad (more space), Match Mac. The remote
+     resolution follows rotation and Stage Manager window resizes in-band (RFC §10.9).
+   - **Hosts:**
+     - Last-frame thumbnails, reachability badges, search, recents.
+     - Per-host settings: display mode, input mode, audio, clipboard.
+     - Wake-on-LAN, using a MAC address the user enters.
+     - Server RSA key pinning on first use, with a warning if the key changes (RFC §13.2).
+   - **System integration:**
+     - `screener://connect?host=` URL scheme and an App Intent so Shortcuts and Spotlight
+       can connect to a saved host.
+     - The idle timer stays off while connected.
+     - Several sessions at once, each in its own Stage Manager window (one scene per session).
+
 Out of scope for v1: standard VNC (non-HP) sessions, connections over the internet or
 through a relay, multi-display selection UI beyond the default display, file transfer,
-iPhone layout.
+iPhone layout, mirroring to an external display, and image/file clipboard (text only).
 
 ## Test environment
 
