@@ -62,7 +62,7 @@ the JSON is self-describing; this file summarizes the same information.
   produced anywhere in the reference (`auth.py`'s `_read_srp_result` reads
   M2 off the wire but never computes or verifies it) — it is computed here
   per the RFC doc's own stated formula
-  (`Reference/iShareScreen/docs/apple_vnc_rfc.md` §7: "M2 = H(PAD(A) || M1
+  (`Reference/iShareScreen/docs/apple_vnc_rfc.md` §4.2.4.6: "M2 = H(PAD(A) || M1
   || K)"). `wrap_key` reapplies the one-line `SHA-256(K)[:16]` truncation
   that `auth.do_srp_auth`'s final line performs on `proof.K`; `do_srp_auth`
   itself needs a live socket so cannot be called directly, but the
@@ -107,6 +107,24 @@ the JSON is self-describing; this file summarizes the same information.
   `_field_bytes`) purely to construct the *input* bytes — `extract_canvas_dims`
   itself is the unmodified reference function under test, and its result is
   asserted against the chosen (3840, 2160, 4) before being written out.
+
+  **Byte order note on `msg_1c`'s config/flags word (body +0x06):**
+  `apple_vnc_rfc.md` §10.3 documents this `u32` as host/little-endian,
+  i.e. a conforming client writes `07 00 00 00` for `config_flags = 7`.
+  `negotiation.build_0x1c()` deliberately writes it **big-endian**
+  (`00 00 00 07`) instead — its own comment explains why: the host loads
+  the word at body+0x06 un-byteswapped and forwards it to the streaming
+  agent across an IPC/NDR boundary that byte-swaps it again, so the
+  *effective* byte order the agent's `do_not_send_cursor` (`& 4`) check
+  sees is the inverse of the host's raw load; empirically, big-endian
+  `00 00 00 07` is what makes the host honor `do_not_send_cursor`, while
+  little-endian `07 00 00 00` leaves it clear and reintroduces the
+  double-cursor regression the comment describes. `msg_1c` in this
+  fixture therefore encodes the flags word big-endian, contradicting
+  §10.3's stated byte order — this is intentional and verified-by-the-
+  reference-author behavior, not a bug in the fixture. The ported Swift
+  `MediaOffer.swift` MUST follow the fixture (big-endian) here, not the
+  RFC doc's stated convention.
 
 - **`clipboard.json`** — `clipboard.py`. All byte strings come directly
   from `build_clipboard_send("héllo 👋")`, `build_auto_pasteboard_msg()`,
@@ -160,7 +178,7 @@ the JSON is self-describing; this file summarizes the same information.
   `auth.py`, never computes or verifies it — there is no `_compute_m2` or
   similar to call. The plan still lists `M2` as an expected fixture value,
   so the script computes it from the RFC doc's own stated SRP-6a formula
-  (`apple_vnc_rfc.md` §7) using `proof.Ab`, `proof.M1`, `proof.K` — all of
+  (`apple_vnc_rfc.md` §4.2.4.6) using `proof.Ab`, `proof.M1`, `proof.K` — all of
   which *do* come from the reference `_solve_srp` call. This is a second
   allowed re-implementation beyond the plan's explicit "server-side `B`"
   exception, called out here for visibility.

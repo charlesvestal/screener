@@ -343,6 +343,7 @@ def build_srtp_fixture():
             "plaintexts": [h(p) for p in plaintexts],
             "rtcp_pkt_for_srtcp_sample": h(rtcp_pkt),
         },
+        "blob": h(blob),
         "cipher_key": h(cipher_key),
         "auth_key": h(auth_key),
         "salt": h(salt),
