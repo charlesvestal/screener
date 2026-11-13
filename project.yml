@@ -1,0 +1,56 @@
+name: Screener
+options:
+  bundleIdPrefix: com.charlesvestal
+  deploymentTarget:
+    iOS: "26.0"
+  createIntermediateGroups: true
+settings:
+  base:
+    SWIFT_VERSION: "6.0"
+    DEVELOPMENT_TEAM: YOURTEAMID
+    CODE_SIGN_STYLE: Automatic
+    TARGETED_DEVICE_FAMILY: "2"
+packages:
+  BigInt:
+    url: https://github.com/attaswift/BigInt
+    from: "5.4.0"
+targets:
+  Screener:
+    type: application
+    platform: iOS
+    sources: [Screener]
+    dependencies:
+      - package: BigInt
+    info:
+      path: Screener/Info.plist
+      properties:
+        CFBundleDisplayName: Screener
+        UILaunchScreen: {}
+        UIRequiresFullScreen: false
+        UISupportedInterfaceOrientations~ipad:
+          [UIInterfaceOrientationPortrait, UIInterfaceOrientationPortraitUpsideDown,
+           UIInterfaceOrientationLandscapeLeft, UIInterfaceOrientationLandscapeRight]
+        NSLocalNetworkUsageDescription: Screener connects to Macs on your local network for screen sharing.
+        NSBonjourServices: [_rfb._tcp]
+        UIFileSharingEnabled: true
+        LSSupportsOpeningDocumentsInPlace: true
+        UIApplicationSupportsIndirectInputEvents: true
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.charlesvestal.screener
+  ScreenerTests:
+    type: bundle.unit-test
+    platform: iOS
+    sources: [ScreenerTests]
+    resources: [ScreenerTests/Fixtures]
+    dependencies:
+      - target: Screener
+    settings:
+      base:
+        GENERATE_INFOPLIST_FILE: YES
+schemes:
+  Screener:
+    build:
+      targets: {Screener: all, ScreenerTests: [test]}
+    test:
+      targets: [ScreenerTests]
