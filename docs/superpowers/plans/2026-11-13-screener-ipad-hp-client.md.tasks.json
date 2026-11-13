@@ -4,13 +4,13 @@
     {
       "id": 0,
       "subject": "Task 0: Project scaffold",
-      "status": "pending",
+      "status": "completed",
       "description": "**Goal:** A buildable, launchable iPadOS app skeleton with unit-test target, BigInt dependency, logging, AGPL licensing, the reference submodule, and device helper scripts.\n\n**Files:**\n- Create: `project.yml`, `LICENSE`, `README.md`, `.gitignore`, `.gitmodules` (via `git submodule add`)\n- Create: `Screener/App/ScreenerApp.swift`, `Screener/App/Log.swift`, `Screener/UI/HostListView.swift` (placeholder text only)\n- Create: `ScreenerTests/FixtureLoader.swift`, `ScreenerTests/SmokeTests.swift`\n- Create: `Tools/run-on-ipad.sh`, `Tools/fetch-ipad-log.sh`\n\n**Acceptance Criteria:**\n- [ ] `xcodegen generate` produces `Screener.xcodeproj` without errors\n- [ ] `SmokeTests` passes in the iPad simulator\n- [ ] `Tools/run-on-ipad.sh` installs and launches the app on the iPad (exit 0)\n- [ ] `Tools/fetch-ipad-log.sh` prints a line containing `Screener launched`\n- [ ] `Reference/iShareScreen` is a submodule at commit `9ab40d3a`\n\n**Verify:** `xcodegen generate && xcodebuild test -project Screener.xcodeproj -scheme Screener $SIM -only-testing:ScreenerTests/SmokeTests 2>&1 | tail -3` \u2192 `** TEST SUCCEEDED **`\n\n```json:metadata\n{\"files\": [\"project.yml\", \"LICENSE\", \"README.md\", \"Screener/App/ScreenerApp.swift\", \"Screener/App/Log.swift\", \"Screener/UI/HostListView.swift\", \"ScreenerTests/FixtureLoader.swift\", \"ScreenerTests/SmokeTests.swift\", \"Tools/run-on-ipad.sh\", \"Tools/fetch-ipad-log.sh\"], \"verifyCommand\": \"`xcodegen generate && xcodebuild test -project Screener.xcodeproj -scheme Screener $SIM -only-testing:ScreenerTests/SmokeTests 2>&1 | tail -3` \\u2192 `** TEST SUCCEEDED **`\", \"acceptanceCriteria\": [\"`xcodegen generate` produces `Screener.xcodeproj` without errors\", \"`SmokeTests` passes in the iPad simulator\", \"`Tools/run-on-ipad.sh` installs and launches the app on the iPad (exit 0)\", \"`Tools/fetch-ipad-log.sh` prints a line containing `Screener launched`\", \"`Reference/iShareScreen` is a submodule at commit `9ab40d3a`\"], \"modelTier\": \"standard\"}\n```"
     },
     {
       "id": 1,
       "subject": "Task 1: Reference fixture generator",
-      "status": "pending",
+      "status": "completed",
       "description": "**Goal:** A script that drives the reference Python modules with fixed inputs and writes known-answer JSON fixtures that later Swift tests compare against.\n\n**Files:**\n- Create: `Tools/fixtures/make_fixtures.py`, `Tools/fixtures/README.md`\n- Create (generated): `ScreenerTests/Fixtures/record_layer.json`, `srp.json`, `srtp.json`, `messages.json`, `media_offer.json`, `clipboard.json`, `rtcp.json`, `hevc_rtp.json`\n\n**Acceptance Criteria:**\n- [ ] `uv run ... make_fixtures.py` exits 0 and writes all 8 JSON files\n- [ ] Every byte value in the fixtures is produced by calling **reference** functions or classes (not re-implemented in the script), except where noted in Step 2\n- [ ] Re-running produces byte-identical files (all randomness seeded or fixed)\n\n**Verify:** `cd Tools/fixtures && uv run --python 3.12 --with cryptography --with pycryptodome --with numpy python make_fixtures.py && ls ../../ScreenerTests/Fixtures/*.json | wc -l` \u2192 `8`\n\n```json:metadata\n{\"files\": [\"Tools/fixtures/make_fixtures.py\", \"Tools/fixtures/README.md\", \"ScreenerTests/Fixtures/record_layer.json\"], \"verifyCommand\": \"`cd Tools/fixtures && uv run --python 3.12 --with cryptography --with pycryptodome --with numpy python make_fixtures.py && ls ../../ScreenerTests/Fixtures/*.json | wc -l` \\u2192 `8`\", \"acceptanceCriteria\": [\"`uv run ... make_fixtures.py` exits 0 and writes all 8 JSON files\", \"Every byte value in the fixtures is produced by calling **reference** functions or classes (not re-implemented in the script), except where noted in Step 2\", \"Re-running produces byte-identical files (all randomness seeded or fixed)\"], \"modelTier\": \"standard\"}\n```",
       "blockedBy": [
         0
@@ -19,7 +19,7 @@
     {
       "id": 2,
       "subject": "Task 2: ByteIO helpers",
-      "status": "pending",
+      "status": "completed_pending_review",
       "description": "**Goal:** Big-endian `ByteWriter`/`ByteReader` used by every protocol message.\n\n**Files:**\n- Create: `Screener/Support/ByteIO.swift`\n- Test: `ScreenerTests/ByteIOTests.swift`\n\n**Acceptance Criteria:**\n- [ ] Writer emits BE u8/u16/u32/u64/f32/f64, raw bytes, zero padding, and little-endian u32\n- [ ] Reader throws `ByteReader.Error.underflow` on short reads and never traps\n\n**Verify:** `xcodebuild test ... -only-testing:ScreenerTests/ByteIOTests` \u2192 `** TEST SUCCEEDED **`\n\n```json:metadata\n{\"files\": [\"Screener/Support/ByteIO.swift\", \"ScreenerTests/ByteIOTests.swift\"], \"verifyCommand\": \"`xcodebuild test ... -only-testing:ScreenerTests/ByteIOTests` \\u2192 `** TEST SUCCEEDED **`\", \"acceptanceCriteria\": [\"Writer emits BE u8/u16/u32/u64/f32/f64, raw bytes, zero padding, and little-endian u32\", \"Reader throws `ByteReader.Error.underflow` on short reads and never traps\"], \"modelTier\": \"standard\"}\n```",
       "blockedBy": [
         0
@@ -28,7 +28,7 @@
     {
       "id": 3,
       "subject": "Task 3: Crypto primitives",
-      "status": "pending",
+      "status": "in_progress",
       "description": "**Goal:** Thin, tested wrappers over CommonCrypto/CryptoKit for every primitive the protocol needs.\n\n**Files:**\n- Create: `Screener/Support/CryptoPrimitives.swift`\n- Test: `ScreenerTests/CryptoPrimitivesTests.swift`\n\n**Acceptance Criteria:**\n- [ ] `AES.ecbEncrypt/ecbDecrypt(key:block:)` for 16-byte blocks, with AES-128 and AES-256 keys\n- [ ] `AESCBCStream` keeps CBC chaining state across `update` calls (one CCCryptor, `kCCOptionECBMode` off, no padding)\n- [ ] `AES.ctr(key:iv:data:)` handles AES-256 keys and any data length\n- [ ] `Hash.sha1/sha256/sha512`, `HMAC.sha1(key:data:)`, `PBKDF2.sha512(password:salt:iterations:keyLength:)`, `SecureRandom.bytes(_:)`\n- [ ] CBC streaming test: encrypting 48 bytes in one call equals encrypting 3\u00d716 in three calls\n- [ ] PBKDF2 matches the RFC 6070-style known vector `PBKDF2-HMAC-SHA512(\"password\",\"salt\",1,64)` = `867f70cf1ade02cff3752599a3a53dc4af34c7a669815ae5d513554e1c8cf252c02d470a285a0501bad999bfe943c08f050235d7d68b1da55e63f73b60a57fce`\n\n**Verify:** `xcodebuild test ... -only-testing:ScreenerTests/CryptoPrimitivesTests` \u2192 `** TEST SUCCEEDED **`\n\n```json:metadata\n{\"files\": [\"Screener/Support/CryptoPrimitives.swift\", \"ScreenerTests/CryptoPrimitivesTests.swift\"], \"verifyCommand\": \"`xcodebuild test ... -only-testing:ScreenerTests/CryptoPrimitivesTests` \\u2192 `** TEST SUCCEEDED **`\", \"acceptanceCriteria\": [\"`AES.ecbEncrypt/ecbDecrypt(key:block:)` for 16-byte blocks, with AES-128 and AES-256 keys\", \"`AESCBCStream` keeps CBC chaining state across `update` calls (one CCCryptor, `kCCOptionECBMode` off, no padding)\", \"`AES.ctr(key:iv:data:)` handles AES-256 keys and any data length\", \"`Hash.sha1/sha256/sha512`, `HMAC.sha1(key:data:)`, `PBKDF2.sha512(password:salt:iterations:keyLength:)`, `SecureRandom.bytes(_:)`\", \"CBC streaming test: encrypting 48 bytes in one call equals encrypting 3\\u00d716 in three calls\", \"PBKDF2 matches the RFC 6070-style known vector `PBKDF2-HMAC-SHA512(\\\"password\\\",\\\"salt\\\",1,64)` = `867f70cf1ade02cff3752599a3a53dc4af34c7a669815ae5d513554e1c8cf252c02d470a285a0501bad999bfe943c08f050235d7d68b1da55e63f73b60a57fce`\"], \"modelTier\": \"standard\"}\n```",
       "blockedBy": [
         0
@@ -240,5 +240,5 @@
       ]
     }
   ],
-  "lastUpdated": "2026-11-13T21:10:22.143892"
+  "lastUpdated": "2026-11-13T21:46:39.925637"
 }
