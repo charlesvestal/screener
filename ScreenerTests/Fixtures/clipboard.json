@@ -1,0 +1,25 @@
+{
+  "_provenance": "All byte strings come directly from clipboard.build_* functions. The round-trip calls clipboard.parse_clipboard_send_header, clipboard.decompress_clipboard_payload and clipboard.parse_clipboard_items on the output of build_clipboard_send() for the same text.",
+  "args": {
+    "text": "h\u00e9llo \ud83d\udc4b"
+  },
+  "build_auto_pasteboard_msg": "1500000100000000",
+  "build_clipboard_request": "0b00000000000000",
+  "build_clipboard_send": "1f000000000000000000003500000035789c62606060646060102b284dcac94cd62b2d49b3d02dc849ccccd32d49ad28614000ee8cc32b7372f2153ecc9fd80d000000ffff",
+  "roundtrip": {
+    "decompressed": "00000001000000167075626c69632e757466382d706c61696e2d7465787400000000000000000000000b68c3a96c6c6f20f09f918b",
+    "header": {
+      "compressed_size": 53,
+      "promise": 0,
+      "reserved": 0,
+      "uncompressed_size": 53
+    },
+    "items": [
+      {
+        "aliases": [],
+        "primary_data": "68c3a96c6c6f20f09f918b",
+        "primary_uti": "public.utf8-plain-text"
+      }
+    ]
+  }
+}

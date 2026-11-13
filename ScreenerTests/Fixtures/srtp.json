@@ -1,0 +1,39 @@
+{
+  "_provenance": "blob is a fixed 46-byte test input. cipher_key/auth_key/salt are read off SRTPEncryptor.from_blob()'s private attributes, which are produced by srtp._srtp_kdf() (labels 0/1/2) inside the constructor -- not re-derived in this script. The 3 packets come from SRTPEncryptor.encrypt() with the internal _seq counter primed to 65534 before the first call so the natural wraparound produces seqs 65534, 65535, 0. The SRTCP sample wraps rtcp.build_fir(1, ssrc, 7) with SRTCPEncryptor.protect().",
+  "args": {
+    "blob": "5ce6fb126ccad0c784bbc2cbe6909f0c08bc3f432c1a2fe49aa835e0044ec88ff5ee4e8808a774b4bbf9734a1e4a",
+    "plaintexts": [
+      "686576632d7274702d666978747572652d7061796c6f61642d30",
+      "686576632d7274702d666978747572652d7061796c6f61642d31",
+      "686576632d7274702d666978747572652d7061796c6f61642d32"
+    ],
+    "pt": 100,
+    "rtcp_pkt_for_srtcp_sample": "84ce000400000001000000001122334407000000",
+    "ssrc": 287454020
+  },
+  "auth_key": "b116985abd658fc65665074cb1e11eff28e36cdc",
+  "cipher_key": "29c328eea448e9a3905226407fc8575b1ccb2a7f39fd3d08b62571c2c5e957e1",
+  "packets": [
+    {
+      "plaintext": "686576632d7274702d666978747572652d7061796c6f61642d30",
+      "seq": 65534,
+      "wire": "8064fffe000000001122334420e4bd25c58bc8fee36fe1cda57675db604ee354ad8ebbc7846dc5d0f46edf5c47617ff6"
+    },
+    {
+      "plaintext": "686576632d7274702d666978747572652d7061796c6f61642d31",
+      "seq": 65535,
+      "wire": "8064ffff000001e011223344a0cf6f00b7cbd699c9f24b5698f613d4865bb6c35385212279a74a621044fde07ac784b8"
+    },
+    {
+      "plaintext": "686576632d7274702d666978747572652d7061796c6f61642d32",
+      "seq": 0,
+      "wire": "80640000000003c0112233446f666e72468a04743220136b69fea5dced28d25b475b4f53ead3b13b6c1feb348bdc0819"
+    }
+  ],
+  "salt": "608ee45403acb1064221bca0c5df",
+  "srtcp_sample": {
+    "plaintext_rtcp": "84ce000400000001000000001122334407000000",
+    "ssrc": 287454020,
+    "wire": "84ce00040000000173bf08e5a1fe02f068c4d35780000000ccee8fc16d56a23c6ea5"
+  }
+}

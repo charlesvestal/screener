@@ -1,0 +1,52 @@
+{
+  "_provenance": "RTP payloads are hand-built per RFC Sec 10.6. Despite the plan's note that the depacketizer lives inside session.py/hevc.py and isn't callable in isolation, the actual NAL-reassembly logic is in isharescreen.proxy.media.nalu (reassemble_group/first_donl), which imports only stdlib and *is* callable standalone -- so the expected de-DONL'd NAL units here are the real output of that reference function, not hand-computed (see README deviations).",
+  "aggregation_packet": {
+    "args": {
+      "donl": 42,
+      "nals": {
+        "pps": "440150505344415441",
+        "sps": "420153505344415441",
+        "vps": "400156505344415441"
+      }
+    },
+    "expected_nalus": [
+      "400156505344415441",
+      "420153505344415441",
+      "440150505344415441"
+    ],
+    "first_donl": 42,
+    "rtp_payload": "6001002a000940015650534441544100094201535053444154410009440150505344415441"
+  },
+  "fragmentation_unit": {
+    "args": {
+      "donl": 49,
+      "fragments": [
+        "494452504152544f4e45",
+        "4944525041525454574f",
+        "494452504152545448524545"
+      ],
+      "inner_nal_type": 19
+    },
+    "expected_nalus": [
+      "2601494452504152544f4e454944525041525454574f494452504152545448524545"
+    ],
+    "first_donl": 49,
+    "rtp_payloads": {
+      "end": "6201530031494452504152545448524545",
+      "middle": "62011300314944525041525454574f",
+      "start": "6201930031494452504152544f4e45"
+    }
+  },
+  "single_nal": {
+    "args": {
+      "donl": 7,
+      "nal_type": 1,
+      "payload": "aabbccdd"
+    },
+    "expected_nalus": [
+      "0201aabbccdd"
+    ],
+    "first_donl": 7,
+    "rtp_payload": "02010007aabbccdd"
+  }
+}

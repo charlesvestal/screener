@@ -1,0 +1,59 @@
+{
+  "_provenance": "All byte strings come directly from rtcp.build_* functions.",
+  "build_fir": {
+    "args": {
+      "sender_ssrc": 1,
+      "seq_nr": 7,
+      "target_ssrc": "0x11223344"
+    },
+    "result": "84ce000400000001000000001122334407000000"
+  },
+  "build_fir_legacy": {
+    "args": {
+      "target_ssrc": "0x11223344"
+    },
+    "result": "80c0000111223344"
+  },
+  "build_nack": {
+    "args": {
+      "lost_seqs": [
+        10,
+        11,
+        13
+      ],
+      "media_ssrc": "0x11223344",
+      "sender_ssrc": 1
+    },
+    "result": "81cd00030000000111223344000a0005"
+  },
+  "build_pli": {
+    "args": {
+      "media_ssrc": "0x11223344",
+      "sender_ssrc": 1
+    },
+    "result": "81ce00020000000111223344"
+  },
+  "build_rr": {
+    "args": {
+      "note": "sr_data omitted to keep the result independent of time.time()",
+      "sender_ssrc": 1,
+      "source_ssrcs": [
+        "0x11223344"
+      ],
+      "ssrc_stats": {
+        "0x11223344": {
+          "max_seq": 100,
+          "roc": 2
+        }
+      }
+    },
+    "result": "81c9000700000001112233440000000000020064000000000000000000000000"
+  },
+  "build_rtcp_app_ltrp": {
+    "args": {
+      "ltr_id": 5,
+      "sender_ssrc": 1
+    },
+    "result": "80cc0003000000010000000500000005"
+  }
+}
