@@ -1081,7 +1081,7 @@ final class ByteStreamTests: XCTestCase {
 
 **Acceptance Criteria:**
 - [ ] `MediaOffer.create(sessionID:timestamp:callID:audioEnabled:)` → `(audio: Data, video: Data)` equals fixture `audio_offer`/`video_offer` given the fixture's fixed dynamic values (port `create_offers`, `_build_mediablob`, `_build_remote_endpoint_info`, `_build_audio_f9_entry`, protobuf helpers, plist + zlib framing). HEVC only, with `tilesPerFrame = 4`.
-- [ ] `MediaStreamOptions.build(keys:offers:uuid:flags:)` equals fixture `msg_1c` (port `negotiation.build_0x1c`; flags are little-endian at +0x06 per RFC §10.3)
+- [ ] `MediaStreamOptions.build(keys:offers:uuid:flags:)` equals fixture `msg_1c` (port `negotiation.build_0x1c`). **Flags at +0x06 are written big-endian (`00 00 00 07`), as the reference does deliberately (see its comment in `negotiation.py` ~L196). This contradicts RFC §10.3's little-endian claim; the reference/fixture is authoritative.**
 - [ ] `MediaStreamOptions.parseAnswer(_:)` → `(canvasWidth, canvasHeight, tiles)` matches `extract_canvas_dims` on the fixture answer
 - [ ] `NegotiationKeys.random()` produces 6 × 46-byte blobs from `SecureRandom`
 
