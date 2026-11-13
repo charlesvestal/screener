@@ -28,6 +28,7 @@ enum Log {
 }
 
 final class FileMirror: @unchecked Sendable {
+    // All mutable state (handle, formatter) is confined to queue
     static let shared = FileMirror()
     private let queue = DispatchQueue(label: "screener.filelog")
     private var handle: FileHandle?
@@ -38,13 +39,17 @@ final class FileMirror: @unchecked Sendable {
             .appendingPathComponent("screener.log")
         FileManager.default.createFile(atPath: url.path, contents: nil)   // truncate per launch
         handle = try? FileHandle(forWritingTo: url)
+        if handle == nil {
+            os.Logger(subsystem: "com.screener", category: "app").error("Log file could not be opened")
+        }
         formatter.formatOptions = [.withTime, .withFractionalSeconds]
     }
 
     func write(_ line: String) {
-        let stamp = formatter.string(from: Date())
-        queue.async { [handle] in
-            handle?.write(Data("\(stamp) \(line)\n".utf8))
+        let now = Date()
+        queue.async {
+            let stamp = self.formatter.string(from: now)
+            self.handle?.write(Data("\(stamp) \(line)\n".utf8))
         }
     }
 }
