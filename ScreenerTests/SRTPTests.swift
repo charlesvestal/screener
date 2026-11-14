@@ -189,6 +189,98 @@ final class SRTPTests: XCTestCase {
         _ = groupBCounts.removeValue(forKey: 20)
     }
 
+    // MARK: - Ties / forget
+
+    func testGetPrimarySSRCGroupBreaksTiesByAscendingFirstSSRC() throws {
+        let fx = try SRTPFixture()
+        for _ in 0..<5 {   // repeat: an unstable sort would flip some of the time
+            let dec = try SRTPDecryptor(blob: fx.blob)
+            for ssrc: UInt32 in [40, 41, 42, 43, 10, 11, 12, 13] {
+                let enc = try SRTPEncryptor(blob: fx.blob, ssrc: ssrc)
+                for i in 0..<3 { XCTAssertNotNil(dec.decrypt(try enc.encrypt(Data([UInt8(i)])))) }
+            }
+            XCTAssertEqual(dec.getPrimarySSRCGroup(tier: 0), [10, 11, 12, 13])
+            XCTAssertEqual(dec.getPrimarySSRCGroup(tier: 1), [40, 41, 42, 43])
+        }
+    }
+
+    func testForgetSSRCsExceptDropsCountsAndState() throws {
+        let fx = try SRTPFixture()
+        let dec = try SRTPDecryptor(blob: fx.blob)
+        for ssrc: UInt32 in [1, 2, 3] {
+            let enc = try SRTPEncryptor(blob: fx.blob, ssrc: ssrc)
+            XCTAssertNotNil(dec.decrypt(try enc.encrypt(Data([1, 2, 3]))))
+        }
+        dec.forgetSSRCs(except: [2])
+        XCTAssertEqual(dec.ssrcCounts, [2: 1])
+        XCTAssertEqual(Set(dec.stateSnapshot().keys), [2])
+    }
+
+    // MARK: - Hostile input
+
+    /// A wire packet whose auth tag is valid (ROC 0), so the parser past the
+    /// tag check is what's exercised.
+    private func signed(_ body: [UInt8], fx: SRTPFixture, dec: SRTPDecryptor) -> Data {
+        let mac = HMAC1.sha1(key: dec.derivedKeys.authKey, data: Data(body) + Data([0, 0, 0, 0]))
+        return Data(body) + mac.prefix(SRTP.authTagLength)
+    }
+
+    func testPacketShorterThan22BytesIsRejected() throws {
+        let fx = try SRTPFixture()
+        let dec = try SRTPDecryptor(blob: fx.blob)
+        for n in 0..<22 { XCTAssertNil(dec.decrypt(Data(repeating: 0x80, count: n)), "len \(n)") }
+    }
+
+    func testCSRCCountBeyondBodyIsRejected() throws {
+        let fx = try SRTPFixture()
+        let dec = try SRTPDecryptor(blob: fx.blob)
+        let body: [UInt8] = [0x8F, 100, 0, 1, 0, 0, 0, 0, 0x11, 0x22, 0x33, 0x44, 0xAA, 0xBB]   // cc=15
+        XCTAssertNil(dec.decrypt(signed(body, fx: fx, dec: dec)))
+        XCTAssertTrue(dec.ssrcCounts.isEmpty)
+    }
+
+    func testOversizedExtensionLengthIsRejected() throws {
+        let fx = try SRTPFixture()
+        let dec = try SRTPDecryptor(blob: fx.blob)
+        // X bit set, extension header claims 0xFFFF words.
+        let body: [UInt8] = [0x90, 100, 0, 1, 0, 0, 0, 0, 0x11, 0x22, 0x33, 0x44, 0xBE, 0xDE, 0xFF, 0xFF, 1, 2]
+        XCTAssertNil(dec.decrypt(signed(body, fx: fx, dec: dec)))
+        // X bit set but not even room for the 4-byte extension header.
+        let short: [UInt8] = [0x90, 100, 0, 2, 0, 0, 0, 0, 0x11, 0x22, 0x33, 0x44, 0xBE]
+        XCTAssertNil(dec.decrypt(signed(short, fx: fx, dec: dec)))
+    }
+
+    func testHeaderOnlyPacketYieldsEmptyPayload() throws {
+        let fx = try SRTPFixture()
+        let dec = try SRTPDecryptor(blob: fx.blob)
+        let body: [UInt8] = [0x80, 0xE4, 0, 7, 0, 0, 0, 9, 0x11, 0x22, 0x33, 0x44]
+        let out = try XCTUnwrap(dec.decrypt(signed(body, fx: fx, dec: dec)))
+        XCTAssertEqual(out.header, Data(body))
+        XCTAssertEqual(out.payload, Data())
+        XCTAssertEqual(out.ssrc, 0x1122_3344)
+        XCTAssertEqual(out.seq, 7)
+    }
+
+    func testSRTCPUnencryptedPacketPassesThroughWhenAuthentic() throws {
+        let fx = try SRTPFixture()
+        let (key, salt) = try SRTP.splitBlob(fx.blob)
+        let rtcpAuth = try SRTP.kdf(masterKey: key, masterSalt: salt, label: 4, length: 20)
+        let plain = fx.rtcpPktForSample
+        let body = plain + Data([0x00, 0x00, 0x00, 0x05])   // E=0, index 5
+        let wire = body + HMAC1.sha1(key: rtcpAuth, data: body).prefix(SRTP.authTagLength)
+        let dec = try SRTCPDecryptor(blob: fx.blob)
+        XCTAssertEqual(dec.unprotect(wire), plain)
+    }
+
+    func testSRTCPEncryptorRejectsShortPacketWithoutTrapping() throws {
+        let fx = try SRTPFixture()
+        let enc = try SRTCPEncryptor(blob: fx.blob)
+        XCTAssertThrowsError(try enc.protect(Data([0x80, 0xC9, 0, 1]))) { err in
+            XCTAssertEqual(err as? SRTP.Error, .packetTooShort(4))
+        }
+        XCTAssertNil(try SRTCPDecryptor(blob: fx.blob).unprotect(Data(repeating: 0, count: 21)))
+    }
+
     // MARK: - Perf (informational only; no bound asserted)
 
     func testDecryptPerformance() throws {

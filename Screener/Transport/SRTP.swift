@@ -17,6 +17,7 @@ enum SRTP {
 
     enum Error: Swift.Error, Equatable {
         case badBlobLength(Int)
+        case packetTooShort(Int)
     }
 
     static func splitBlob(_ blob: Data) throws -> (key: Data, salt: Data) {
@@ -116,10 +117,14 @@ final class SRTPDecryptor {
                 groups.append([s])
             }
         }
+        // Python's `sort(key=-sum)` is stable over groups built in ascending-SSRC order, so
+        // equal sums keep ascending first-SSRC order. Swift's sort is not guaranteed stable:
+        // make the tie-break explicit.
         groups.sort { lhs, rhs in
             let lsum = lhs.reduce(0) { $0 + (counts[$1] ?? 0) }
             let rsum = rhs.reduce(0) { $0 + (counts[$1] ?? 0) }
-            return lsum > rsum
+            if lsum != rsum { return lsum > rsum }
+            return lhs[0] < rhs[0]
         }
         let idx = min(tier, groups.count - 1)
         return Set(groups[idx])
@@ -320,7 +325,10 @@ final class SRTCPEncryptor {
         salt = try SRTP.kdf(masterKey: key, masterSalt: masterSalt, label: 5, length: 14)
     }
 
+    /// Throws `SRTP.Error.packetTooShort` for anything shorter than the 8-byte
+    /// RTCP header + sender SSRC (the reference would raise on the slice too).
     func protect(_ pkt: Data) throws -> Data {
+        guard pkt.count >= 8 else { throw SRTP.Error.packetTooShort(pkt.count) }
         let bytes = [UInt8](pkt)
         let curIndex = index
         index &+= 1
