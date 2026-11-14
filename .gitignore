@@ -6,3 +6,6 @@ xcuserdata/
 Tools/fixtures/.venv/
 .build/
 build-sim/
+# reference captures carry session keys (.key sidecar) — never commit
+*.pcap
+*.key
