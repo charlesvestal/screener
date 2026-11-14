@@ -5,17 +5,26 @@ import XCTest
 final class FakeDatagramChannel: DatagramChannel, @unchecked Sendable {
     private let lock = NSLock()
     private var receive: (@Sendable (Data) -> Void)?
+    private var failure: (@Sendable (String) -> Void)?
     private var _sent: [Data] = []
     private var _cancelled = false
+    private var _started = false
+    /// When set, `start` throws this.
+    var startError: Error?
 
-    func start(onReceive: @escaping @Sendable (Data) -> Void, onEvent: @escaping @Sendable (String) -> Void) {
-        lock.lock(); receive = onReceive; lock.unlock()
+    func start(onReceive: @escaping @Sendable (Data) -> Void, onEvent: @escaping @Sendable (String) -> Void,
+               onFailure: @escaping @Sendable (String) -> Void) throws {
+        if let startError { throw startError }
+        lock.lock(); receive = onReceive; failure = onFailure; _started = true; lock.unlock()
     }
     func deliver(_ d: Data) { lock.lock(); let r = receive; lock.unlock(); r?(d) }
+    func fail(_ why: String) { lock.lock(); let f = failure; lock.unlock(); f?(why) }
     func send(_ d: Data) { lock.lock(); _sent.append(d); lock.unlock() }
-    func cancel() { lock.lock(); _cancelled = true; lock.unlock() }
+    func cancel() async { markCancelled() }
+    private func markCancelled() { lock.lock(); _cancelled = true; lock.unlock() }
     var sent: [Data] { lock.lock(); defer { lock.unlock() }; return _sent }
     var cancelled: Bool { lock.lock(); defer { lock.unlock() }; return _cancelled }
+    var started: Bool { lock.lock(); defer { lock.unlock() }; return _started }
 }
 
 final class FakeChannels: @unchecked Sendable {
@@ -77,7 +86,7 @@ final class MediaTransportTests: XCTestCase {
     func testVideoAndAudioPacketsDecryptWithSKeysAndCarryHeaderFields() async throws {
         let ch = FakeChannels()
         let t = make(ch)
-        await t.open()
+        try await t.open()
         try await t.activate(activation)
 
         // A 4-SSRC group carrying enough packets to lock the burst.
@@ -143,7 +152,7 @@ final class MediaTransportTests: XCTestCase {
     func testDatagramsBeforeActivationAreBufferedThenDecrypted() async throws {
         let ch = FakeChannels()
         let t = make(ch)
-        await t.open()
+        try await t.open()
         let enc = try videoSender(0x2000)
         for _ in 0..<3 { ch.video.deliver(try enc.encrypt(Data([1]), pt: 100)) }
         try await waitUntil("raw buffered") { await t.stats.videoDatagrams == 3 }
@@ -160,7 +169,7 @@ final class MediaTransportTests: XCTestCase {
     func testServerRTCPIsRoutedToSRTCPAndFeedsTheReceiverReport() async throws {
         let ch = FakeChannels()
         let t = make(ch)
-        await t.open()
+        try await t.open()
         try await t.activate(activation)
 
         // A server SR on the video port, SRTCP-protected with videoKeyS.
@@ -186,7 +195,7 @@ final class MediaTransportTests: XCTestCase {
         var tuning = fastTuning
         tuning.srEveryNTicks = 2
         let t = make(ch, tuning: tuning)
-        await t.open()
+        try await t.open()
         try await t.activate(activation)
         try await waitUntil("reports") { await t.stats.reportsSent >= 2 }
         await t.close()
@@ -222,7 +231,7 @@ final class MediaTransportTests: XCTestCase {
         var tuning = fastTuning
         tuning.txInterval = .seconds(60)   // keep RR/keepalive out of the way
         let t = make(ch, tuning: tuning)
-        await t.open()
+        try await t.open()
         try await t.activate(activation)
         try await waitUntil("first tick") { await t.stats.reportsSent == 1 }
         let target: UInt32 = 0x1122_3344
@@ -248,7 +257,7 @@ final class MediaTransportTests: XCTestCase {
     func testBurstWithTooFewPacketsIsStarved() async throws {
         let ch = FakeChannels()
         let t = make(ch)
-        await t.open()
+        try await t.open()
         try await t.activate(activation)
         let enc = try videoSender(0x1000)
         for _ in 0..<5 { ch.video.deliver(try enc.encrypt(Data([1]), pt: 100)) }
@@ -260,7 +269,7 @@ final class MediaTransportTests: XCTestCase {
     func testBurstLocksTheConsecutiveGroupWithMostPacketsAndLaterAdoptsAFreshGroup() async throws {
         let ch = FakeChannels()
         let t = make(ch)
-        await t.open()
+        try await t.open()
         try await t.activate(activation)
         // Low-tier group 0x50..0x53 (2 pkts each) + primary 0x10..0x13 (8 each).
         for s: UInt32 in 0x50...0x53 { let e = try videoSender(s); for _ in 0..<2 { ch.video.deliver(try e.encrypt(Data([1]), pt: 100)) } }
@@ -277,10 +286,95 @@ final class MediaTransportTests: XCTestCase {
         await t.close()
     }
 
+    func testRTCPOnTheAudioPortAuthenticatesWithAudioKeyS() async throws {
+        let ch = FakeChannels()
+        let t = make(ch)
+        try await t.open()
+        try await t.activate(activation)
+        let sr = Data(hex: "80c80006" + "00007777" + "0001aaaa" + "bbbb0000" + "00000000" + "00000000" + "00000000")
+        ch.audio.deliver(try SRTCPEncryptor(blob: keys.audioKeyS).protect(sr))
+        try await waitUntil("rtcp") { await t.stats.rtcpPackets == 1 }
+        let s = await t.stats
+        XCTAssertEqual(s.serverSRs, 1)
+        XCTAssertEqual(s.rtcpAuthFailures, 0)
+        XCTAssertEqual(s.authFailures, 0)
+        await t.close()
+    }
+
+    // MARK: lifecycle failures
+
+    func testOpenThrowsWhenAPortCannotBeBoundAndReleasesTheOtherChannel() async throws {
+        let ch = FakeChannels()
+        ch.audio.startError = DatagramChannelError.bind(port: 5900, errno: EADDRINUSE)
+        let t = make(ch)
+        do {
+            try await t.open()
+            XCTFail("expected open to throw")
+        } catch let e as MediaTransportError {
+            guard case .bindFailed(5900, 5901, _) = e else { return XCTFail("got \(e)") }
+            XCTAssertEqual(e.localizedDescription, "UDP ports 5900/5901 unavailable (another Screen Sharing session?)")
+        }
+        XCTAssertTrue(ch.video.cancelled, "the already-bound video channel must be closed")
+    }
+
+    func testChannelFailureIsPublishedAndEndsTheBurstWait() async throws {
+        let ch = FakeChannels()
+        let t = make(ch)
+        try await t.open()
+        try await t.activate(activation)
+        ch.video.fail("receive: Socket is not connected (57)")
+        var it = t.failures.makeAsyncIterator()
+        let f = await it.next()
+        XCTAssertEqual(f, .channelFailed("receive: Socket is not connected (57)"))
+        let outcome = await t.burstOutcome()
+        XCTAssertEqual(outcome, .failed("receive: Socket is not connected (57)"))
+        await t.close()
+    }
+
+    func testResetForRetryKeepsTheChannelsAndAcceptsAFreshBurst() async throws {
+        let ch = FakeChannels()
+        let t = make(ch)
+        try await t.open()
+        try await t.activate(activation)
+        let starved = await t.burstOutcome()
+        XCTAssertEqual(starved, .starved(packets: 0))
+        await t.resetForRetry()
+        XCTAssertFalse(ch.video.cancelled)
+
+        // New handshake, new keys.
+        func variant(_ b: UInt8) -> Data { var d = blob!; d[1] ^= b; return d }
+        let keys2 = NegotiationKeys(audioKeyV: variant(5), audioKeyS: variant(6), videoKeyV: variant(7), videoKeyS: variant(8))
+        try await t.activate(.init(keys: keys2, ourVideoSSRC: ourVideo, ourAudioSSRC: ourAudio, tilesPerGroup: 4))
+        for s: UInt32 in 0x10...0x13 {
+            let e = try SRTPEncryptor(blob: keys2.videoKeyS, ssrc: s, seq: 1)
+            for _ in 0..<8 { ch.video.deliver(try e.encrypt(Data([1]), pt: 100)) }
+        }
+        let outcome = await t.burstOutcome()
+        XCTAssertEqual(outcome, .started(packets: 32, group: [0x10, 0x11, 0x12, 0x13]))
+        await t.close()
+    }
+
+    func testALaggingVideoConsumerLosesOldestPacketsAndTheyAreCounted() async throws {
+        let ch = FakeChannels()
+        var tuning = fastTuning
+        tuning.videoBufferLimit = 8
+        let t = make(ch, tuning: tuning)
+        try await t.open()
+        try await t.activate(activation)
+        for s: UInt32 in 0x10...0x13 {
+            let e = try videoSender(s)
+            for _ in 0..<8 { ch.video.deliver(try e.encrypt(Data([1]), pt: 100)) }
+        }
+        _ = await t.burstOutcome()
+        let s = await t.stats
+        XCTAssertEqual(s.videoStreamDrops, 32 - 8)
+        await t.close()
+    }
+
     func testCloseCancelsChannelsAndFinishesStreams() async throws {
         let ch = FakeChannels()
         let t = make(ch)
-        await t.open()
+        try await t.open()
         await t.close()
         XCTAssertTrue(ch.video.cancelled)
         XCTAssertTrue(ch.audio.cancelled)

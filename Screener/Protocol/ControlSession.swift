@@ -143,7 +143,7 @@ actor ControlSession {
 
         static let live = live(localAddress: nil)
 
-        /// `localAddress` pins the TCP source address. The HP server sends its
+        /// `localAddress` pins the TCP source address (DEBUG builds only). The HP server sends its
         /// UDP media to the control connection's peer address, so MediaTransport
         /// must bind the same address (matters when the Mac has several, or
         /// for same-host testing where loopback cannot work).
@@ -153,10 +153,13 @@ actor ControlSession {
                     do {
                         // Network.framework ignores a required local endpoint in the
                         // simulator, so a pinned source address uses a BSD socket.
+                        // DEBUG-only path (launch harness); release ignores it.
+                        #if DEBUG
                         if let localAddress {
                             return try await SocketTCPByteStream.connect(host: host, port: port, localAddress: localAddress,
                                                                          timeout: .seconds(10))
                         }
+                        #endif
                         return try await TCPByteStream.connect(host: host, port: port, timeout: .seconds(10))
                     } catch TransportError.timeout {
                         throw ControlSessionError.timeout(step: "connect")

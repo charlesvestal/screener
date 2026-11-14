@@ -253,8 +253,15 @@ final class TCPByteStream: ByteStream, @unchecked Sendable {
     static func connect(endpoint: NWEndpoint, timeout: Duration) async throws -> TCPByteStream {
         let params = NWParameters.tcp
         params.allowLocalEndpointReuse = true
-        if let tcp = params.defaultProtocolStack.internetProtocol as? NWProtocolTCP.Options {
+        if let tcp = params.defaultProtocolStack.transportProtocol as? NWProtocolTCP.Options {
             tcp.noDelay = true
+        }
+        // The HP media plane is IPv4-only and the server sends UDP to the TCP
+        // peer address, so the control connection must be IPv4 as well
+        // (session._resolve_host_ipv4). SessionCoordinator passes an IPv4
+        // literal; this also keeps a Bonjour endpoint (Task 18) off IPv6.
+        if let ip = params.defaultProtocolStack.internetProtocol as? NWProtocolIP.Options {
+            ip.version = .v4
         }
         let connection = NWConnection(to: endpoint, using: params)
         let queue = DispatchQueue(label: "ByteStream.TCP")

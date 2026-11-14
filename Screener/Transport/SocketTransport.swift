@@ -49,12 +49,14 @@ enum BSDSocket {
         return a
     }
 
-    static func describe(_ a: sockaddr_in) -> String {
+    static func address(_ a: sockaddr_in) -> String {
         var addr = a.sin_addr
         var buf = [CChar](repeating: 0, count: Int(INET_ADDRSTRLEN))
         inet_ntop(AF_INET, &addr, &buf, socklen_t(buf.count))
-        return "\(String(cString: buf)):\(UInt16(bigEndian: a.sin_port))"
+        return String(cString: buf)
     }
+
+    static func describe(_ a: sockaddr_in) -> String { "\(address(a)):\(UInt16(bigEndian: a.sin_port))" }
 
     static func bind(_ fd: Int32, _ a: sockaddr_in) throws {
         var a = a
@@ -91,27 +93,120 @@ enum BSDSocket {
     }
 }
 
+// MARK: - IPv4 resolution
+
+/// session._resolve_host_ipv4: the HP UDP transport is IPv4-only, so the
+/// coordinator resolves the host ONCE to an IPv4 literal and hands that same
+/// literal to the TCP control connection and to both UDP flows. Otherwise a
+/// dual-stack name can put TCP on IPv6 while UDP sits on IPv4, and the server
+/// (which sends media to the TCP peer address) never reaches us.
+///
+/// Task 18 (Bonjour): an `NWEndpoint.service` must be resolved to an IPv4
+/// literal first (or take the TCP connection's resolved IPv4 remote) and go
+/// through this same path; never hand the service endpoint to TCP directly.
+enum IPv4Resolver {
+    enum Failure: Error, Equatable, LocalizedError {
+        /// The name resolves, but only to IPv6.
+        case noIPv4(host: String)
+        case unresolvable(host: String, detail: String)
+
+        var errorDescription: String? {
+            switch self {
+            case .noIPv4(let h):
+                return "This Mac has no IPv4 address on this network (\(h) resolves only to IPv6). "
+                    + "High Performance screen sharing needs IPv4."
+            case .unresolvable(let h, let d):
+                return "Cannot find \(h) on this network (\(d))."
+            }
+        }
+    }
+
+    /// getaddrinfo blocks (DNS, mDNS); it runs here, off the main actor and
+    /// off Swift's cooperative pool.
+    private static let queue = DispatchQueue(label: "IPv4Resolver", qos: .userInitiated, attributes: .concurrent)
+
+    /// The first IPv4 address of `host` as a dotted-quad literal. IPv4
+    /// literals pass straight through.
+    static func resolve(_ host: String) async throws -> String {
+        try await withCheckedThrowingContinuation { (cont: CheckedContinuation<String, Error>) in
+            queue.async {
+                cont.resume(with: Result { try resolveBlocking(host) })
+            }
+        }
+    }
+
+    static func resolveBlocking(_ host: String) throws -> String {
+        var hints = addrinfo()
+        hints.ai_family = AF_INET
+        hints.ai_socktype = SOCK_STREAM
+        var res: UnsafeMutablePointer<addrinfo>?
+        let rc = getaddrinfo(host, nil, &hints, &res)
+        if rc == 0, let first = res {
+            defer { freeaddrinfo(res) }
+            let a = first.pointee.ai_addr.withMemoryRebound(to: sockaddr_in.self, capacity: 1) { $0.pointee }
+            return BSDSocket.address(a)
+        }
+        // Distinguish "IPv6 only" from "does not resolve at all".
+        hints.ai_family = AF_UNSPEC
+        var any: UnsafeMutablePointer<addrinfo>?
+        if getaddrinfo(host, nil, &hints, &any) == 0 {
+            freeaddrinfo(any)
+            throw Failure.noIPv4(host: host)
+        }
+        throw Failure.unresolvable(host: host, detail: String(cString: gai_strerror(rc)))
+    }
+}
+
 // MARK: - UDP
 
-/// One media flow as a UDP socket bound to a fixed local port (SO_REUSEADDR,
-/// 4 MiB SO_RCVBUF like `_bind_udp`) and connected to the server's matching
-/// port. Connected UDP reports ICMP port-unreachable as ECONNREFUSED on the
-/// next call; that is expected while punches race the server's bind and is
-/// only counted.
+/// Why a datagram channel stopped for good.
+enum DatagramChannelError: Error, Equatable, CustomStringConvertible {
+    /// bind() failed; `errno` is the cause (EADDRINUSE: another session owns the port).
+    case bind(port: UInt16, errno: Int32)
+    case setup(String)
+
+    var description: String {
+        switch self {
+        case .bind(let p, let e): return "bind UDP \(p): \(String(cString: strerror(e))) (\(e))"
+        case .setup(let s): return s
+        }
+    }
+}
+
+/// One media flow as a UDP socket bound to a fixed local port and connected
+/// to the server's matching port (`_bind_udp`).
+///   * SO_REUSEADDR + SO_REUSEPORT: a second viewer (another coordinator, a
+///     quick reconnect) can bind the same port; because every socket is
+///     connect()ed, the kernel delivers each datagram to the socket whose
+///     4-tuple matches exactly, so flows to different servers never mix.
+///     SessionCoordinator refuses two sessions to the same server IPv4.
+///   * SO_RCVBUF: 4 MiB requested, halved on refusal down to 256 KiB; the
+///     effective value is reported as an event.
+///   * Connected UDP reports ICMP port-unreachable as ECONNREFUSED on the
+///     next call; that is expected while punches race the server's bind and is
+///     only counted. Errors that mean the socket or the network is gone
+///     (`isFatal`) stop the channel and are reported through `onFailure`.
 final class SocketDatagramChannel: DatagramChannel, @unchecked Sendable {
+    static let preferredReceiveBuffer: Int32 = 4 * 1024 * 1024
+    static let minimumReceiveBuffer: Int32 = 256 * 1024
+
     private let label: String
     private let remoteHost: String
     private let remotePort: UInt16
     private let localHost: String?
     private let localPort: UInt16
     private let queue: DispatchQueue
-    // `lock` guards fd / source / closed / handlers / error counters.
+    // `lock` guards fd / source / closed / failed / handlers / counters / closeWaiters.
     private let lock = NSLock()
     private var fd: Int32 = -1
     private var source: DispatchSourceRead?
     private var closed = false
+    private var failed = false
+    private var fdClosed = true
+    private var closeWaiters: [CheckedContinuation<Void, Never>] = []
     private var onReceive: (@Sendable (Data) -> Void)?
     private var onEvent: (@Sendable (String) -> Void)?
+    private var onFailure: (@Sendable (String) -> Void)?
     private var sendErrors = 0, receiveErrors = 0
 
     init(label: String, remoteHost: String, remotePort: UInt16, localHost: String?, localPort: UInt16?) {
@@ -129,39 +224,59 @@ final class SocketDatagramChannel: DatagramChannel, @unchecked Sendable {
                                      localHost: config.localAddress, localPort: config.symmetricLocalPorts ? port : nil)
     }
 
-    func start(onReceive: @escaping @Sendable (Data) -> Void, onEvent: @escaping @Sendable (String) -> Void) {
+    /// Errors after which the socket will never work again (vs. EAGAIN /
+    /// EINTR / ECONNREFUSED, which are transient on a connected UDP socket).
+    static func isFatal(_ e: Int32) -> Bool {
+        [ENOTCONN, EBADF, ENOTSOCK, ENETDOWN, ENETUNREACH, EHOSTUNREACH, EHOSTDOWN, EADDRNOTAVAIL, EPIPE].contains(e)
+    }
+
+    /// Binds synchronously so the port is ours before the handshake starts;
+    /// throws if the port cannot be bound.
+    func start(onReceive: @escaping @Sendable (Data) -> Void, onEvent: @escaping @Sendable (String) -> Void,
+               onFailure: @escaping @Sendable (String) -> Void) throws {
         lock.lock()
         self.onReceive = onReceive
         self.onEvent = onEvent
+        self.onFailure = onFailure
         lock.unlock()
-        // Bind synchronously so the port is ours before the handshake starts.
-        do {
-            try open()
-        } catch {
-            onEvent("open failed: \(error)")
-        }
+        try open()
     }
 
     private func open() throws {
         let s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)
-        guard s >= 0 else { throw BSDSocket.Failure.syscall("socket", errno) }
+        guard s >= 0 else { throw DatagramChannelError.setup("socket: \(String(cString: strerror(errno)))") }
         BSDSocket.setInt(s, SOL_SOCKET, SO_REUSEADDR, 1)
-        BSDSocket.setInt(s, SOL_SOCKET, SO_RCVBUF, 4 * 1024 * 1024)
+        BSDSocket.setInt(s, SOL_SOCKET, SO_REUSEPORT, 1)
         BSDSocket.setInt(s, SOL_SOCKET, SO_NOSIGPIPE, 1)
+        let rcvbuf = Self.setReceiveBuffer(s)
         do {
-            try BSDSocket.bind(s, BSDSocket.local(localHost, port: localPort))
+            do {
+                try BSDSocket.bind(s, BSDSocket.local(localHost, port: localPort))
+            } catch BSDSocket.Failure.syscall(_, let e) {
+                throw DatagramChannelError.bind(port: localPort, errno: e)
+            }
             let remote = try BSDSocket.resolveIPv4(remoteHost, port: remotePort)
             if BSDSocket.connect(s, remote) != 0 { throw BSDSocket.Failure.syscall("connect", errno) }
             _ = fcntl(s, F_SETFL, fcntl(s, F_GETFL) | O_NONBLOCK)
             emit("bound local=\(BSDSocket.localName(s)) remote=\(BSDSocket.describe(remote))")
+            emit("rcvbuf requested=\(Self.preferredReceiveBuffer) accepted=\(rcvbuf.accepted) effective=\(rcvbuf.effective)")
+        } catch let e as DatagramChannelError {
+            Darwin.close(s)
+            throw e
         } catch {
             Darwin.close(s)
-            throw error
+            throw DatagramChannelError.setup("\(error)")
         }
         let src = DispatchSource.makeReadSource(fileDescriptor: s, queue: queue)
         src.setEventHandler { [weak self] in self?.drain(s) }
-        src.setCancelHandler { Darwin.close(s) }
+        // The fd is closed only here, after the source has stopped using it;
+        // `cancel()` waits for this.
+        src.setCancelHandler { [weak self] in
+            Darwin.close(s)
+            self?.didCloseFD()
+        }
         lock.lock()
+        fdClosed = false
         if closed {
             lock.unlock()
             src.setEventHandler {}
@@ -173,6 +288,22 @@ final class SocketDatagramChannel: DatagramChannel, @unchecked Sendable {
         source = src
         lock.unlock()
         src.resume()
+    }
+
+    /// SO_RCVBUF: ask for 4 MiB, halve on refusal down to 256 KiB, and read
+    /// back what the kernel granted (_check_rmem_cap's concern, every platform).
+    private static func setReceiveBuffer(_ s: Int32) -> (accepted: Int32, effective: Int32) {
+        var want = preferredReceiveBuffer
+        var accepted: Int32 = 0
+        while want >= minimumReceiveBuffer {
+            var v = want
+            if setsockopt(s, SOL_SOCKET, SO_RCVBUF, &v, socklen_t(MemoryLayout<Int32>.size)) == 0 { accepted = want; break }
+            want /= 2
+        }
+        var eff: Int32 = 0
+        var len = socklen_t(MemoryLayout<Int32>.size)
+        getsockopt(s, SOL_SOCKET, SO_RCVBUF, &eff, &len)
+        return (accepted, eff)
     }
 
     /// session._video_drain_loop: empty the kernel buffer as fast as possible.
@@ -191,6 +322,7 @@ final class SocketDatagramChannel: DatagramChannel, @unchecked Sendable {
                 lock.lock(); receiveErrors += 1; let k = receiveErrors; lock.unlock()
                 if k <= 5 || k % 100 == 0 { emit("receive error #\(k): \(String(cString: strerror(e)))") }
                 if e == ECONNREFUSED { continue }   // ICMP from an early punch; keep draining
+                if Self.isFatal(e) { fail("receive: \(String(cString: strerror(e))) (\(e))") }
                 return
             }
             return
@@ -199,7 +331,7 @@ final class SocketDatagramChannel: DatagramChannel, @unchecked Sendable {
 
     func send(_ datagram: Data) {
         lock.lock()
-        let s = closed ? -1 : fd
+        let s = closed || failed ? -1 : fd
         lock.unlock()
         guard s >= 0 else { return }
         let n = datagram.withUnsafeBytes { Darwin.send(s, $0.baseAddress, $0.count, 0) }
@@ -207,18 +339,56 @@ final class SocketDatagramChannel: DatagramChannel, @unchecked Sendable {
             let e = errno
             lock.lock(); sendErrors += 1; let k = sendErrors; lock.unlock()
             if k <= 5 || k % 100 == 0 { emit("send error #\(k): \(String(cString: strerror(e)))") }
+            if Self.isFatal(e) { fail("send: \(String(cString: strerror(e))) (\(e))") }
         }
     }
 
-    func cancel() {
+    /// A persistent socket error: stop receiving (the source's cancel handler
+    /// closes the fd) and report once.
+    private func fail(_ reason: String) {
         lock.lock()
+        guard !closed, !failed else { lock.unlock(); return }
+        failed = true
+        let src = source
+        source = nil
+        fd = -1
+        let cb = onFailure
+        lock.unlock()
+        src?.cancel()
+        cb?("udp \(label): \(reason)")
+    }
+
+    /// Stops the flow and returns once the socket is actually closed, so a
+    /// following bind of the same port never overlaps this one.
+    func cancel() async {
+        detach()?.cancel()   // the cancel handler closes the fd
+        await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+            lock.lock()
+            if fdClosed { lock.unlock(); cont.resume(); return }
+            closeWaiters.append(cont)
+            lock.unlock()
+        }
+    }
+
+    private func detach() -> DispatchSourceRead? {
+        lock.lock()
+        defer { lock.unlock() }
         closed = true
         let src = source
         source = nil
         fd = -1
         onReceive = nil
+        onFailure = nil
+        return src
+    }
+
+    private func didCloseFD() {
+        lock.lock()
+        fdClosed = true
+        let waiters = closeWaiters
+        closeWaiters = []
         lock.unlock()
-        src?.cancel()   // the cancel handler closes the fd
+        for w in waiters { w.resume() }
     }
 
     private func emit(_ msg: String) {
@@ -227,12 +397,15 @@ final class SocketDatagramChannel: DatagramChannel, @unchecked Sendable {
     }
 }
 
-// MARK: - TCP
+// MARK: - TCP (DEBUG only)
 
-/// A `ByteStream` over a BSD TCP socket, used when the control connection's
-/// source address must be pinned (`ControlSession.Seams.live(localAddress:)`).
-/// Same contract as `TCPByteStream`: one reader, many writers; cancelling a
-/// pending read closes the stream.
+#if DEBUG
+/// A `ByteStream` over a BSD TCP socket, used only when the control
+/// connection's source address must be pinned (`ControlSession.Seams
+/// .live(localAddress:)`, reachable from the DEBUG launch harness: testing
+/// against the same Mac needs a second local IP). Release builds always use
+/// `TCPByteStream`. Same contract as `TCPByteStream`: one reader, many
+/// writers; cancelling a pending read closes the stream.
 final class SocketTCPByteStream: ByteStream, @unchecked Sendable {
     private let fd: Int32
     private let readQueue = DispatchQueue(label: "SocketTCPByteStream.read")
@@ -244,20 +417,26 @@ final class SocketTCPByteStream: ByteStream, @unchecked Sendable {
 
     deinit { Darwin.close(fd) }
 
+    /// `host` should be an IPv4 literal (SessionCoordinator resolves once).
+    /// Cancelling the calling task aborts the connect with CancellationError.
     static func connect(host: String, port: UInt16, localAddress: String, timeout: Duration) async throws -> SocketTCPByteStream {
-        try await withCheckedThrowingContinuation { cont in
-            DispatchQueue.global(qos: .userInitiated).async {
-                do {
-                    cont.resume(returning: try connectBlocking(host: host, port: port, localAddress: localAddress, timeout: timeout))
-                } catch {
-                    cont.resume(throwing: error)
+        let cancelled = CancelBox()
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { cont in
+                DispatchQueue.global(qos: .userInitiated).async {
+                    cont.resume(with: Result {
+                        try connectBlocking(host: host, port: port, localAddress: localAddress, timeout: timeout,
+                                            isCancelled: { cancelled.isSet })
+                    })
                 }
             }
+        } onCancel: {
+            cancelled.set()
         }
     }
 
-    private static func connectBlocking(host: String, port: UInt16, localAddress: String,
-                                        timeout: Duration) throws -> SocketTCPByteStream {
+    private static func connectBlocking(host: String, port: UInt16, localAddress: String, timeout: Duration,
+                                        isCancelled: () -> Bool) throws -> SocketTCPByteStream {
         let remote: sockaddr_in
         do { remote = try BSDSocket.resolveIPv4(host, port: port) } catch { throw TransportError.failed("\(error)") }
         let s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP)
@@ -277,16 +456,32 @@ final class SocketTCPByteStream: ByteStream, @unchecked Sendable {
                 let e = errno; Darwin.close(s)
                 throw TransportError.failed("connect: \(String(cString: strerror(e)))")
             }
+            // Poll in short slices so cancellation is noticed; EINTR retries.
+            let deadline = ContinuousClock.now + timeout
             var pfd = pollfd(fd: s, events: Int16(POLLOUT), revents: 0)
-            let ms = Int32(min(Double(Int32.max), (Double(timeout.components.seconds) + Double(timeout.components.attoseconds) / 1e18) * 1000))
-            let rc = poll(&pfd, 1, ms)
-            if rc == 0 { Darwin.close(s); throw TransportError.timeout }
+            while true {
+                if isCancelled() { Darwin.close(s); throw CancellationError() }
+                let left = deadline - ContinuousClock.now
+                if left <= .zero { Darwin.close(s); throw TransportError.timeout }
+                let ms = Int32(min(100, max(1, Double(left.components.seconds) * 1000
+                                                + Double(left.components.attoseconds) / 1e15)))
+                pfd.revents = 0
+                let rc = poll(&pfd, 1, ms)
+                if rc == 0 { continue }
+                if rc < 0 {
+                    let e = errno
+                    if e == EINTR { continue }
+                    Darwin.close(s)
+                    throw TransportError.failed("poll: \(String(cString: strerror(e)))")
+                }
+                break
+            }
             var err: Int32 = 0
             var len = socklen_t(MemoryLayout<Int32>.size)
             getsockopt(s, SOL_SOCKET, SO_ERROR, &err, &len)
-            if rc < 0 || err != 0 {
+            if err != 0 {
                 Darwin.close(s)
-                throw TransportError.failed("connect: \(String(cString: strerror(err != 0 ? err : errno)))")
+                throw TransportError.failed("connect: \(String(cString: strerror(err)))")
             }
         }
         _ = fcntl(s, F_SETFL, flags)   // back to blocking for the read/write queues
@@ -365,3 +560,11 @@ final class SocketTCPByteStream: ByteStream, @unchecked Sendable {
         if first { shutdown(fd, SHUT_RDWR) }   // unblocks a pending recv; the fd closes in deinit
     }
 }
+
+private final class CancelBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var flag = false
+    func set() { lock.lock(); flag = true; lock.unlock() }
+    var isSet: Bool { lock.lock(); defer { lock.unlock() }; return flag }
+}
+#endif

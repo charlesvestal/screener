@@ -11,9 +11,24 @@
 // Ports are symmetric: ScreensharingAgent binds <its TCP-local IP>:P / P+1 and
 // connects those sockets to <our TCP-peer IP>:P / P+1 (netstat during a live
 // reference session, 2026-11-14), so we bind the same local port numbers and
-// connect each flow to the matching server port. The default channel is a
-// BSD socket (SocketTransport.swift): NWConnection ignores the required local
-// endpoint in the simulator. NWDatagramChannel is kept for comparison.
+// connect each flow to the matching server port. The channel is a BSD socket
+// (SocketTransport.swift): NWConnection ignores the required local endpoint
+// in the simulator. `config.host` must be the same IPv4 literal the control
+// TCP connected to (SessionCoordinator resolves it once).
+//
+// Consumer contract: `video` / `audio` are single-consumer AsyncStreams.
+// Subscribe (start iterating) BEFORE `open()`: the session-start burst
+// (VPS/SPS/PPS + the first IDR) is yielded within ~2 s of activation, and the
+// streams keep only the newest `videoBufferLimit` / `audioBufferLimit`
+// packets for a consumer that falls behind; drops are counted in
+// `Stats.videoStreamDrops` / `audioStreamDrops`.
+//
+// Lifecycle: `open()` throws if a port cannot be bound. A socket error that
+// cannot recover (ENOTCONN, ENETDOWN, ...) is published on `failures`, and
+// resolves a pending `burstOutcome()` as `.failed`. `resetForRetry()` returns
+// to the pre-activation state on the SAME sockets for a starved-burst retry
+// (the reference keeps its UDP sockets across `_handshake_with_reconnect`).
+// `close()` returns only after both sockets are closed.
 //
 // Keys (negotiation.py:818): receive with the server→viewer S blobs
 // (videoKeyS on P+1, audioKeyS on P); send with the viewer→server V blobs.
@@ -41,8 +56,11 @@
 //     active group until a decoder calls `notePublished()` (Task 13).
 //   * forget_ssrcs_except is not called: the reference defines it but never
 //     uses it; the blacklist does that job.
+//   * Adoption grace window: after adopting a group, `lastPublish` is set to
+//     the adoption time, so a further adoption waits the full stall (2 s).
+//     That is what the reference CODE does (`_last_publish_t = now` against
+//     `_SSRC_ADOPT_STALL_S`); its comment claims "~0.5 s", which we do not follow.
 import Foundation
-import Network
 
 /// One authenticated, decrypted RTP packet.
 struct MediaPacket: Sendable, Equatable {
@@ -57,11 +75,29 @@ struct MediaPacket: Sendable, Equatable {
 
 /// Seam over one connected UDP flow, so tests can inject datagrams.
 protocol DatagramChannel: AnyObject, Sendable {
-    /// Begins receiving. `onReceive` is called once per datagram, in arrival
-    /// order; `onEvent` carries diagnostics (state changes, errors).
-    func start(onReceive: @escaping @Sendable (Data) -> Void, onEvent: @escaping @Sendable (String) -> Void)
+    /// Binds and begins receiving; throws if the flow cannot be set up (e.g.
+    /// the port is taken). `onReceive` is called once per datagram, in arrival
+    /// order; `onEvent` carries diagnostics; `onFailure` is called at most once
+    /// when the flow has died for good (persistent socket error).
+    func start(onReceive: @escaping @Sendable (Data) -> Void, onEvent: @escaping @Sendable (String) -> Void,
+               onFailure: @escaping @Sendable (String) -> Void) throws
     func send(_ datagram: Data)
-    func cancel()
+    /// Stops the flow; returns once its socket is actually closed.
+    func cancel() async
+}
+
+enum MediaTransportError: Error, Equatable, LocalizedError {
+    /// A UDP port could not be bound (`underlying` carries the errno text).
+    case bindFailed(audioPort: UInt16, videoPort: UInt16, underlying: String)
+    /// A media socket died after start.
+    case channelFailed(String)
+
+    var errorDescription: String? {
+        switch self {
+        case .bindFailed(let a, let v, _): return "UDP ports \(a)/\(v) unavailable (another Screen Sharing session?)"
+        case .channelFailed(let why): return "Media connection lost (\(why))"
+        }
+    }
 }
 
 // MARK: - SSRC group tracking
@@ -166,6 +202,10 @@ actor MediaTransport {
         var adoptStall: Duration = .seconds(2)              // _SSRC_ADOPT_STALL_S
         var keyframeMinInterval: Duration = .milliseconds(250) // _FIR_MIN_INTERVAL_S
         var rawBufferLimit = 16_384                         // _UDP_DRAIN_QUEUE_MAX
+        /// `video` / `audio` stream buffers for a lagging consumer (newest kept).
+        /// Large enough for a whole start burst (≤ rawBufferLimit) released at once.
+        var videoBufferLimit = 16_384
+        var audioBufferLimit = 1024
     }
 
     struct Stats: Sendable, Equatable {
@@ -174,6 +214,8 @@ actor MediaTransport {
         var videoPackets = 0, audioPackets = 0, rtcpPackets = 0
         var authFailures = 0, rtcpAuthFailures = 0
         var droppedDatagrams = 0
+        /// Packets the `video` / `audio` streams dropped because the consumer lagged.
+        var videoStreamDrops = 0, audioStreamDrops = 0
         var punchesSent = 0, keepalivesSent = 0, reportsSent = 0, keyframeRequestsSent = 0, ltrAcksSent = 0
         var serverSRs = 0
         var activeVideoSSRCs: [UInt32] = []
@@ -183,14 +225,21 @@ actor MediaTransport {
     enum BurstOutcome: Sendable, Equatable {
         case started(packets: Int, group: [UInt32])
         case starved(packets: Int)
+        /// A media socket died (see `failures`).
+        case failed(String)
     }
 
     typealias ChannelFactory = @Sendable (_ flow: Flow, _ config: Config) -> DatagramChannel
 
+    /// Subscribe before `open()` (see the consumer contract above).
     nonisolated let video: AsyncStream<MediaPacket>
     nonisolated let audio: AsyncStream<MediaPacket>
+    /// Persistent channel failures (at most one is ever published).
+    nonisolated let failures: AsyncStream<MediaTransportError>
     private let videoOut: AsyncStream<MediaPacket>.Continuation
     private let audioOut: AsyncStream<MediaPacket>.Continuation
+    private let failuresOut: AsyncStream<MediaTransportError>.Continuation
+    private var failure: MediaTransportError?
 
     private let config: Config
     private let tuning: Tuning
@@ -231,22 +280,28 @@ actor MediaTransport {
 
     private var counters = Stats()
     private let drops = DropCounter()
+    private var streamDrops = (video: 0, audio: 0)
 
     init(config: Config, tuning: Tuning = Tuning(), channelFactory: ChannelFactory? = nil) {
         self.config = config
         self.tuning = tuning
         self.makeChannel = channelFactory ?? { flow, cfg in SocketDatagramChannel.make(flow: flow, config: cfg) }
         self.tracker = SSRCGroupTracker(threshold: tuning.adoptThreshold, stall: tuning.adoptStall)
-        (video, videoOut) = AsyncStream.makeStream(of: MediaPacket.self, bufferingPolicy: .bufferingNewest(4096))
-        (audio, audioOut) = AsyncStream.makeStream(of: MediaPacket.self, bufferingPolicy: .bufferingNewest(1024))
+        (video, videoOut) = AsyncStream.makeStream(of: MediaPacket.self,
+                                                   bufferingPolicy: .bufferingNewest(max(1, tuning.videoBufferLimit)))
+        (audio, audioOut) = AsyncStream.makeStream(of: MediaPacket.self,
+                                                   bufferingPolicy: .bufferingNewest(max(1, tuning.audioBufferLimit)))
+        (failures, failuresOut) = AsyncStream.makeStream(of: MediaTransportError.self, bufferingPolicy: .bufferingNewest(1))
     }
 
     // MARK: lifecycle
 
     /// Binds both flows and starts receiving + hole-punching. Call before the
     /// control handshake so the session-start burst (which lands within
-    /// ~100 ms of the 0x1c answer) is never dropped.
-    func open() {
+    /// ~100 ms of the 0x1c answer) is never dropped, and after subscribing to
+    /// `video` / `audio`. Throws `.bindFailed` (with both sockets closed again)
+    /// if either port cannot be bound.
+    func open() async throws {
         guard !isOpen, !isClosed else { return }
         isOpen = true
         let localDesc = config.localAddress ?? "*"
@@ -254,16 +309,26 @@ actor MediaTransport {
                        "-> \(config.host):\(config.audioPort)/\(config.videoPort)")
         for flow in [Flow.video, .audio] {
             let channel = makeChannel(flow, config)
-            channels[flow] = channel
             let (stream, cont) = AsyncStream.makeStream(of: (Data, ContinuousClock.Instant).self,
                                                         bufferingPolicy: .bufferingNewest(tuning.rawBufferLimit))
             let drops = drops
             let clock = clock
-            channel.start(onReceive: { data in
-                if case .dropped = cont.yield((data, clock.now)) { drops.increment() }
-            }, onEvent: { msg in
-                Log.media.info("udp \(flow.rawValue): \(msg)")
-            })
+            do {
+                try channel.start(onReceive: { data in
+                    if case .dropped = cont.yield((data, clock.now)) { drops.increment() }
+                }, onEvent: { msg in
+                    Log.media.info("udp \(flow.rawValue): \(msg)")
+                }, onFailure: { [weak self] why in
+                    Task { await self?.channelFailed(why) }
+                })
+            } catch {
+                cont.finish()
+                Log.media.error("udp \(flow.rawValue): \(error)")
+                await close()
+                throw MediaTransportError.bindFailed(audioPort: config.audioPort, videoPort: config.videoPort,
+                                                     underlying: "\(error)")
+            }
+            channels[flow] = channel
             pumps.append(Task { [weak self] in
                 for await (data, at) in stream {
                     guard let self else { return }
@@ -272,10 +337,16 @@ actor MediaTransport {
             })
             finishers.append { cont.finish() }
         }
+        startPunching()
+    }
+
+    private func startPunching() {
+        punchTask?.cancel()
         let punchEvery = tuning.punchInterval
         punchTask = Task { [weak self] in
             while !Task.isCancelled {
-                await self?.punch()
+                guard let self else { return }
+                await self.punch()
                 try? await Task.sleep(for: punchEvery)
             }
         }
@@ -285,9 +356,10 @@ actor MediaTransport {
 
     /// Installs the negotiated keys, processes everything buffered so far and
     /// starts the keepalive / RTCP loop and the burst SSRC-group lock.
-    func activate(_ a: Activation) throws {
+    func activate(_ a: Activation) async throws {
         guard !isClosed, activation == nil else { return }
-        if !isOpen { open() }
+        if !isOpen { try await open() }
+        guard !isClosed, activation == nil else { return }
         let k = a.keys
         videoDecryptor = try SRTPDecryptor(blob: k.videoKeyS)
         audioDecryptor = try SRTPDecryptor(blob: k.audioKeyS)
@@ -308,12 +380,14 @@ actor MediaTransport {
         let deadline = tuning.burstDeadline
         burstTimer = Task { [weak self] in
             try? await Task.sleep(for: deadline)
-            await self?.burstDeadlineReached()
+            guard !Task.isCancelled, let self else { return }
+            await self.burstDeadlineReached()
         }
         let interval = tuning.txInterval
         txTask = Task { [weak self] in
             while !Task.isCancelled {
-                await self?.txTick()
+                guard let self else { return }
+                await self.txTick()
                 try? await Task.sleep(for: interval)
             }
         }
@@ -326,19 +400,56 @@ actor MediaTransport {
         return await withCheckedContinuation { burstWaiters.append($0) }
     }
 
-    func close() {
+    /// Back to the pre-activation state on the same sockets, for a fresh
+    /// handshake after a starved burst: keys, burst/SSRC-group state and
+    /// counters are cleared, punching restarts. The `video` / `audio` streams
+    /// (and their consumers) carry on.
+    func resetForRetry() {
+        guard !isClosed, failure == nil else { return }
+        txTask?.cancel(); txTask = nil
+        burstTimer?.cancel(); burstTimer = nil
+        resolveBurst(.starved(packets: counters.videoPackets), ifUnresolvedOnly: true)
+        activation = nil
+        videoDecryptor = nil; audioDecryptor = nil
+        rtcpDecryptors = [:]; rtcpKeyLogged = []
+        keepaliveEncryptor = nil; rtcpEncryptor = nil
+        serverSR = [:]; tick = 0
+        lastKeyframeRequest = [:]; lastLTRAcked = nil
+        decoderDrivesPublish = false
+        tracker = SSRCGroupTracker(threshold: tuning.adoptThreshold, stall: tuning.adoptStall)
+        groupLocked = false; burstLockScheduled = false
+        burstVideo = []; burstResult = nil
+        pending = []
+        counters = Stats()
+        Log.media.info("media transport reset for a fresh handshake (sockets kept)")
+        if isOpen { startPunching() }
+    }
+
+    /// Stops everything and returns once both sockets are closed.
+    func close() async {
         guard !isClosed else { return }
         isClosed = true
         punchTask?.cancel(); txTask?.cancel(); burstTimer?.cancel()
-        for c in channels.values { c.cancel() }
+        let open = Array(channels.values)
         channels = [:]
         for f in finishers { f() }
         finishers = []
         for p in pumps { p.cancel() }
         pumps = []
-        videoOut.finish(); audioOut.finish()
+        videoOut.finish(); audioOut.finish(); failuresOut.finish()
         resolveBurst(.starved(packets: counters.videoPackets), ifUnresolvedOnly: true)
+        for c in open { await c.cancel() }
         Log.media.info("media transport closed: \(statsLine())")
+    }
+
+    /// A channel died for good: publish once and end a pending burst wait.
+    private func channelFailed(_ why: String) {
+        guard !isClosed, failure == nil else { return }
+        let f = MediaTransportError.channelFailed(why)
+        failure = f
+        Log.media.error("media channel failed: \(why)")
+        failuresOut.yield(f)
+        resolveBurst(.failed(why), ifUnresolvedOnly: true)
     }
 
     // MARK: public API
@@ -348,6 +459,8 @@ actor MediaTransport {
     var stats: Stats {
         var s = counters
         s.droppedDatagrams = drops.value
+        s.videoStreamDrops = streamDrops.video
+        s.audioStreamDrops = streamDrops.audio
         s.activeVideoSSRCs = tracker.active
         s.ssrcCounts = videoDecryptor?.ssrcCounts ?? [:]
         return s
@@ -421,7 +534,7 @@ actor MediaTransport {
         switch flow {
         case .audio:
             counters.audioPackets += 1
-            audioOut.yield(pkt)
+            emitAudio(pkt)
         case .video:
             counters.videoPackets += 1
             handleVideo(pkt)
@@ -436,18 +549,32 @@ actor MediaTransport {
         }
         if tracker.active.contains(pkt.ssrc) {
             if !decoderDrivesPublish { tracker.notePublish(at: pkt.arrival) }
-            videoOut.yield(pkt)
+            emitVideo(pkt)
             return
         }
         let counts = videoDecryptor?.ssrcCounts ?? [:]
         if let adopted = tracker.noteUnknown(pkt.ssrc, counts: counts, now: clock.now) {
             Log.media.info("adopting fresh SSRC group: \(adopted.map(hex))")
             for s in adopted { requestKeyframe(ssrc: s) }
-            videoOut.yield(pkt)
+            emitVideo(pkt)
         }
     }
 
     private var burstLockScheduled = false
+
+    private func emitVideo(_ p: MediaPacket) {
+        guard case .dropped = videoOut.yield(p) else { return }
+        streamDrops.video += 1
+        let n = streamDrops.video
+        if n <= 5 || n % 1000 == 0 { Log.media.error("video stream consumer lagging: \(n) packets dropped") }
+    }
+
+    private func emitAudio(_ p: MediaPacket) {
+        guard case .dropped = audioOut.yield(p) else { return }
+        streamDrops.audio += 1
+        let n = streamDrops.audio
+        if n <= 5 || n % 1000 == 0 { Log.media.error("audio stream consumer lagging: \(n) packets dropped") }
+    }
 
     private func scheduleBurstLock() {
         guard !burstLockScheduled else { return }
@@ -456,7 +583,8 @@ actor MediaTransport {
         let settle = tuning.burstSettle
         burstTimer = Task { [weak self] in
             try? await Task.sleep(for: settle)
-            await self?.lockBurstGroup()
+            guard !Task.isCancelled, let self else { return }
+            await self.lockBurstGroup()
         }
     }
 
@@ -486,7 +614,7 @@ actor MediaTransport {
         if let declared = activation?.tilesPerGroup, declared != group.count {
             Log.media.info("tile count: burst observed \(group.count), offered \(declared)")
         }
-        for p in burstVideo where primary.contains(p.ssrc) { videoOut.yield(p) }
+        for p in burstVideo where primary.contains(p.ssrc) { emitVideo(p) }
         burstVideo = []
         resolveBurst(.started(packets: total, group: group))
     }
@@ -564,7 +692,8 @@ actor MediaTransport {
         let s = stats
         return "M3 udp video pkts=\(s.videoPackets) audio pkts=\(s.audioPackets) ssrcs=[\(s.activeVideoSSRCs.map(hex).joined(separator: ","))]"
             + " rtcp=\(s.rtcpPackets) raw=\(s.videoDatagrams)/\(s.audioDatagrams) authfail=\(s.authFailures)"
-            + " rtcpfail=\(s.rtcpAuthFailures) drop=\(s.droppedDatagrams) sr=\(s.serverSRs)"
+            + " rtcpfail=\(s.rtcpAuthFailures) drop=\(s.droppedDatagrams) streamdrop=\(s.videoStreamDrops)/\(s.audioStreamDrops)"
+            + " sr=\(s.serverSRs)"
             + " tx ka=\(s.keepalivesSent) rr=\(s.reportsSent) fir=\(s.keyframeRequestsSent) punch=\(s.punchesSent)"
     }
 }
@@ -578,150 +707,4 @@ private final class DropCounter: @unchecked Sendable {
     private var n = 0
     func increment() { lock.lock(); n += 1; lock.unlock() }
     var value: Int { lock.lock(); defer { lock.unlock() }; return n }
-}
-
-// MARK: - Network.framework channel
-
-/// A UDP flow as a connected `NWConnection` (IPv4, like the reference's
-/// AF_INET sockets) bound to a fixed local port. The server sends from the
-/// same port we send to, so a connected flow sees all of its traffic.
-final class NWDatagramChannel: DatagramChannel, @unchecked Sendable {
-    // `lock` guards connection / closed / handlers / restarts.
-    private let lock = NSLock()
-    private let queue: DispatchQueue
-    private let label: String
-    private let remote: NWEndpoint
-    private let local: NWEndpoint?
-    private var connection: NWConnection?
-    private var closed = false
-    private var onReceive: (@Sendable (Data) -> Void)?
-    private var onEvent: (@Sendable (String) -> Void)?
-    private var restarts = 0
-    private var sendErrors = 0
-    private var receiveErrors = 0
-
-    init(label: String, remoteHost: String, remotePort: UInt16, localHost: String?, localPort: UInt16?) {
-        self.label = label
-        queue = DispatchQueue(label: "MediaTransport.\(label)", qos: .userInteractive)
-        remote = .hostPort(host: NWEndpoint.Host(remoteHost), port: NWEndpoint.Port(rawValue: remotePort) ?? .any)
-        if localHost != nil || localPort != nil {
-            local = .hostPort(host: NWEndpoint.Host(localHost ?? "0.0.0.0"),
-                              port: localPort.flatMap { NWEndpoint.Port(rawValue: $0) } ?? .any)
-        } else {
-            local = nil
-        }
-    }
-
-    static func make(flow: MediaTransport.Flow, config: MediaTransport.Config) -> NWDatagramChannel {
-        let port = config.remotePort(flow)
-        return NWDatagramChannel(label: flow.rawValue, remoteHost: config.host, remotePort: port,
-                                 localHost: config.localAddress,
-                                 localPort: config.symmetricLocalPorts ? port : nil)
-    }
-
-    func start(onReceive: @escaping @Sendable (Data) -> Void, onEvent: @escaping @Sendable (String) -> Void) {
-        lock.lock()
-        self.onReceive = onReceive
-        self.onEvent = onEvent
-        lock.unlock()
-        openConnection()
-    }
-
-    private func makeParameters() -> NWParameters {
-        let params = NWParameters.udp
-        params.allowLocalEndpointReuse = true
-        if let ip = params.defaultProtocolStack.internetProtocol as? NWProtocolIP.Options { ip.version = .v4 }
-        if let local { params.requiredLocalEndpoint = local }
-        return params
-    }
-
-    private func openConnection() {
-        lock.lock()
-        guard !closed else { lock.unlock(); return }
-        let conn = NWConnection(to: remote, using: makeParameters())
-        connection = conn
-        lock.unlock()
-        conn.stateUpdateHandler = { [weak self, weak conn] state in
-            guard let self, let conn else { return }
-            switch state {
-            case .ready:
-                let path = conn.currentPath
-                self.emit("ready local=\(path?.localEndpoint.map { "\($0)" } ?? "?") remote=\(path?.remoteEndpoint.map { "\($0)" } ?? "\(self.remote)")")
-                self.receiveLoop(conn)
-            case .waiting(let error):
-                self.emit("waiting: \(error)")
-            case .failed(let error):
-                self.emit("failed: \(error); reopening")
-                conn.cancel()
-                self.queue.asyncAfter(deadline: .now() + 0.2) { [weak self] in self?.reopen(after: conn) }
-            default:
-                break
-            }
-        }
-        conn.start(queue: queue)
-    }
-
-    private func reopen(after old: NWConnection) {
-        lock.lock()
-        let stale = connection !== old || closed
-        if !stale { restarts += 1 }
-        lock.unlock()
-        if !stale { openConnection() }
-    }
-
-    private func receiveLoop(_ conn: NWConnection) {
-        conn.receiveMessage { [weak self, weak conn] data, _, _, error in
-            guard let self, let conn else { return }
-            if let data, !data.isEmpty { self.deliver(data) }
-            if let error {
-                let n = self.bumpReceiveErrors()
-                if n <= 5 || n % 100 == 0 { self.emit("receive error #\(n): \(error)") }
-                if case .cancelled = conn.state { return }
-                // Connected UDP surfaces ICMP port-unreachable (e.g. a punch that
-                // beat the server's bind) as ECONNREFUSED; keep listening.
-                self.queue.asyncAfter(deadline: .now() + 0.02) { [weak self] in self?.rearm(conn) }
-                return
-            }
-            self.rearm(conn)
-        }
-    }
-
-    private func rearm(_ conn: NWConnection) {
-        lock.lock()
-        let live = connection === conn && !closed
-        lock.unlock()
-        if live, case .ready = conn.state { receiveLoop(conn) }
-    }
-
-    private func deliver(_ data: Data) {
-        lock.lock(); let cb = onReceive; lock.unlock()
-        cb?(data)
-    }
-
-    private func emit(_ msg: String) {
-        lock.lock(); let cb = onEvent; lock.unlock()
-        cb?(msg)
-    }
-
-    private func bumpReceiveErrors() -> Int { lock.lock(); defer { lock.unlock() }; receiveErrors += 1; return receiveErrors }
-    private func bumpSendErrors() -> Int { lock.lock(); defer { lock.unlock() }; sendErrors += 1; return sendErrors }
-
-    func send(_ datagram: Data) {
-        lock.lock(); let conn = closed ? nil : connection; lock.unlock()
-        conn?.send(content: datagram, completion: .contentProcessed { [weak self] error in
-            guard let self, let error else { return }
-            let n = self.bumpSendErrors()
-            if n <= 5 || n % 100 == 0 { self.emit("send error #\(n): \(error)") }
-        })
-    }
-
-    func cancel() {
-        lock.lock()
-        closed = true
-        let conn = connection
-        connection = nil
-        onReceive = nil
-        lock.unlock()
-        conn?.cancel()
-    }
 }

@@ -92,20 +92,14 @@ final class VideoCaptureWriter {
 
 #if DEBUG
 extension VideoCaptureFile {
-    /// When $SCREENER_CAPTURE_VIDEO is set: waits for the coordinator's media
-    /// transport, then dumps its video packets there and runs them through an
-    /// HEVCAssembler (keyframe requests included), logging a summary. Attaching
-    /// before the burst matters: MediaTransport's video stream keeps only the
-    /// newest 4096 packets until someone reads it.
+    /// When $SCREENER_CAPTURE_VIDEO is set: registers a media consumer, so
+    /// each session's video packets are dumped there (subscribed before the
+    /// UDP bind, start burst included) and run through an HEVCAssembler
+    /// (keyframe requests included), logging a summary.
     @MainActor
     static func attachIfRequested(to model: SessionCoordinator) {
         guard let path = ProcessInfo.processInfo.environment[envKey], !path.isEmpty else { return }
-        Task { @MainActor in
-            for _ in 0..<6000 {                          // ≤ 30 s
-                if let media = model.media { run(media, path: path); return }
-                try? await Task.sleep(for: .milliseconds(5))
-            }
-        }
+        model.addMediaConsumer { media in run(media, path: path) }
     }
 
     private static func run(_ media: MediaTransport, path: String) {
