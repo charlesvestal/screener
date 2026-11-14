@@ -167,14 +167,14 @@ actor VideoPipeline {
                 Log.video.error("video: decoder rebuild failed: \(error)")
             }
             lastErrorReport = now
-            await handle(a.noteDecodeError(tile: tile))
+            await handle(a.noteDecodeError(tile: tile, don: don))
             return
         }
         // Concealment-class error: gate + keyframe, throttled (vtdecode: 0.5 s).
         if let last = lastErrorReport, now - last < .milliseconds(500) { return }
         lastErrorReport = now
         Log.video.error("video: decode error status=\(status) tile=\(tile) don=\(don); requesting keyframe")
-        await handle(a.noteDecodeError(tile: tile))
+        await handle(a.noteDecodeError(tile: tile, don: don))
     }
 
     private func logStats(_ now: ContinuousClock.Instant) {
