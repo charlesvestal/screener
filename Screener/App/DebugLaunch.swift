@@ -45,6 +45,7 @@ enum DebugLaunch {
             }
             await model.disconnect()
         } : nil
+        VideoCaptureFile.attachIfRequested(to: model)
         await model.connect(host: host, port: port, username: user, password: pass, order: order, localAddress: local)
         switch model.state {
         case .connected(let w, let h): Log.app.info("DEBUG autoConnect connected canvas=\(w)x\(h)")
