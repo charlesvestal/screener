@@ -2,19 +2,22 @@ import MetalKit
 import SwiftUI
 
 /// Full-screen remote desktop: the composited video with the input layer on
-/// top (RemoteInputView), a small floating toolbar (Keyboard, Share Log,
-/// Disconnect) and a "Connecting…" overlay until the first
+/// top (RemoteInputView), the floating control menu (FloatingMenuView:
+/// sticky modifiers, special keys, Mac shortcuts, Keyboard, Type Password,
+/// Share Log, Disconnect, …) and a "Connecting…" overlay until the first
 /// picture decodes ("Reconnecting…" over the last picture while a session
 /// suspended by backgrounding is resumed).
 struct SessionView: View {
     let model: SessionCoordinator
     @State private var keyboardVisible = false
+    @State private var menu = ControlMenuModel()
+    @State private var menuExpanded = false
 
     var body: some View {
         ZStack {
             Color.black.ignoresSafeArea()
             RemoteScreenView(model: model, store: model.frames, cursor: model.cursor, input: model.input,
-                             keyboardVisible: $keyboardVisible)
+                             menu: menu, keyboardVisible: $keyboardVisible, menuExpanded: $menuExpanded)
                 .ignoresSafeArea()
             if model.isReconnecting || !model.hasFirstFrame {
                 VStack(spacing: 12) {
@@ -25,35 +28,18 @@ struct SessionView: View {
                 .padding(24)
                 .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 16))
             }
+            FloatingMenuView(menu: menu, expanded: $menuExpanded, keyboardVisible: $keyboardVisible,
+                             controls: SessionControls(inputAvailable: model.input != nil,
+                                                       disconnect: { Task { await model.disconnect() } }))
         }
-        .overlay(alignment: .topTrailing) { toolbar }
+        .onAppear {
+            // Read on demand from the in-memory connect request (cleared on
+            // a user disconnect); never copied or logged.
+            let coordinator = model
+            menu.password = { [weak coordinator] in coordinator?.lastRequest?.password }
+        }
         .statusBarHidden(true)
         .persistentSystemOverlays(.hidden)
-    }
-
-    private var toolbar: some View {
-        HStack(spacing: 4) {
-            Button {
-                keyboardVisible.toggle()
-            } label: {
-                Label(keyboardVisible ? "Hide Keyboard" : "Show Keyboard",
-                      systemImage: keyboardVisible ? "keyboard.chevron.compact.down" : "keyboard")
-            }
-            .disabled(model.input == nil)
-            ShareLogButton()
-            Button(role: .destructive) {
-                Task { await model.disconnect() }
-            } label: {
-                Label("Disconnect", systemImage: "xmark.circle.fill")
-            }
-        }
-        .labelStyle(.iconOnly)
-        .font(.title3)
-        .buttonStyle(.borderless)
-        .padding(.horizontal, 10)
-        .padding(.vertical, 6)
-        .background(.ultraThinMaterial, in: Capsule())
-        .padding(12)
     }
 }
 
@@ -77,7 +63,9 @@ struct RemoteScreenView: UIViewRepresentable {
     let store: VideoFrameStore
     let cursor: RemoteCursor
     let input: InputController?
+    let menu: ControlMenuModel
     @Binding var keyboardVisible: Bool
+    @Binding var menuExpanded: Bool
 
     final class Coordinator {
         var renderer: MetalRenderer?
@@ -123,6 +111,14 @@ struct RemoteScreenView: UIViewRepresentable {
         let binding = $keyboardVisible
         view.remoteInput.onSoftwareKeyboardDismissed = { binding.wrappedValue = false }
         view.remoteInput.softwareKeyboardVisible = keyboardVisible && input != nil
+        // The floating menu: shared sticky modifiers, its key sink, ⌘⌥M, and
+        // the pointer position for keeping the pill out of the cursor's way.
+        view.remoteInput.modifiers = menu.modifiers
+        menu.sink = view.remoteInput
+        let expanded = $menuExpanded
+        view.remoteInput.onToggleMenu = { expanded.wrappedValue.toggle() }
+        view.remoteInput.onInputReleased = { [weak menu] in menu?.inputWasReleased() }
+        view.remoteInput.onPointerMoved = { [weak menu] in menu?.pointerMoved(to: $0) }
     }
 
     static func dismantleUIView(_ view: Container, coordinator: Coordinator) {
@@ -130,6 +126,8 @@ struct RemoteScreenView: UIViewRepresentable {
         view.video.delegate = nil
         view.remoteInput.input = nil
         view.remoteInput.cursor = nil
+        view.remoteInput.modifiers = nil
+        view.remoteInput.onPointerMoved = nil
         coordinator.renderer?.detach()
         coordinator.renderer = nil
     }

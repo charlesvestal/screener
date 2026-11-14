@@ -4,6 +4,16 @@ import SwiftUI
 struct ScreenerApp: App {
     init() { Log.app.info("Screener launched") }
     var body: some Scene {
-        WindowGroup { HostListView() }
+        WindowGroup {
+            #if DEBUG
+            if UserDefaults.standard.bool(forKey: "previewControlMenu") {
+                FloatingMenuPreview()
+            } else {
+                HostListView()
+            }
+            #else
+            HostListView()
+            #endif
+        }
     }
 }
