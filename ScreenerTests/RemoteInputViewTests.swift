@@ -230,6 +230,159 @@ final class RemoteInputViewTests: XCTestCase {
         XCTAssertEqual(got_new, [])
     }
 
+    // MARK: sticky modifiers (floating menu)
+
+    private func makeSticky() -> (RemoteInputView, InputController, Sink, StickyModifiers) {
+        let (view, input, sink) = make()
+        let sticky = StickyModifiers(now: { 0 })
+        view.modifiers = sticky
+        return (view, input, sink, sticky)
+    }
+
+    func testSoftKeyboardCharacterWithLatchedCommand() async {
+        let (view, input, sink, sticky) = makeSticky()
+        sticky.tap(.command)
+        view.typeText("cc")
+        let got = await events(input, sink)
+        XCTAssertEqual(got, [
+            .key(down: true, keysym: 0xffeb), .key(down: true, keysym: 0x63),
+            .key(down: false, keysym: 0x63), .key(down: false, keysym: 0xffeb),
+            .key(down: true, keysym: 0x63), .key(down: false, keysym: 0x63),    // latched: first character only
+        ])
+        XCTAssertEqual(sticky.state[.command], .off)
+    }
+
+    func testSoftKeyboardUppercaseWithStickyCommandSendsShiftPlusLowercase() async {
+        let (view, input, sink, sticky) = makeSticky()
+        sticky.tap(.command)
+        view.typeText("Z")
+        let got = await events(input, sink)
+        XCTAssertEqual(got, [
+            .key(down: true, keysym: 0xffeb), .key(down: true, keysym: 0xffe1),
+            .key(down: true, keysym: 0x7a), .key(down: false, keysym: 0x7a),
+            .key(down: false, keysym: 0xffe1), .key(down: false, keysym: 0xffeb),
+        ])
+    }
+
+    func testStickyShiftAndTypedShiftDoNotDoubleDown() async {
+        let (view, input, sink, sticky) = makeSticky()
+        sticky.tap(.shift)
+        view.typeText("A")
+        let got = await events(input, sink)
+        XCTAssertEqual(got, [
+            .key(down: true, keysym: 0xffe1), .key(down: true, keysym: 0x41),
+            .key(down: false, keysym: 0x41), .key(down: false, keysym: 0xffe1),
+        ])
+    }
+
+    func testSoftDeleteWithFnIsForwardDelete() async {
+        let (view, input, sink, sticky) = makeSticky()
+        sticky.tap(.fn)
+        view.softDelete()
+        view.softDelete()
+        let got = await events(input, sink)
+        XCTAssertEqual(got, [
+            .key(down: true, keysym: 0xffff), .key(down: false, keysym: 0xffff),
+            .key(down: true, keysym: 0xff08), .key(down: false, keysym: 0xff08),
+        ])
+    }
+
+    func testClickWithLatchedCommand() async {
+        let (view, input, sink, sticky) = makeSticky()
+        sticky.tap(.command)
+        view.click(at: CGPoint(x: 10, y: 10), button: InputController.Button.left)
+        view.click(at: CGPoint(x: 10, y: 10), button: InputController.Button.left)
+        let got = await events(input, sink)
+        XCTAssertEqual(got, [
+            .pointer(buttons: 0, x: 10, y: 10),
+            .key(down: true, keysym: 0xffeb), .pointer(buttons: 1, x: 10, y: 10),
+            .pointer(buttons: 0, x: 10, y: 10), .key(down: false, keysym: 0xffeb),
+            .pointer(buttons: 0, x: 10, y: 10),                         // latched ⌘ consumed by the first click
+            .pointer(buttons: 1, x: 10, y: 10), .pointer(buttons: 0, x: 10, y: 10),
+        ])
+    }
+
+    func testLockedOptionHeldAcrossADrag() async {
+        let (view, input, sink, sticky) = makeSticky()
+        sticky.tap(.option); sticky.tap(.option)                 // same instant: locked
+        view.pointerDown(buttons: InputController.Button.left, at: CGPoint(x: 5, y: 5))
+        view.movePointer(to: CGPoint(x: 20, y: 20), coalescable: false)
+        view.releaseAll()
+        let got = await events(input, sink)
+        XCTAssertEqual(got.first, .key(down: true, keysym: 0xffe9))
+        XCTAssertEqual(got[1], .pointer(buttons: 1, x: 5, y: 5))
+        XCTAssertTrue(got.contains(.key(down: false, keysym: 0xffe9)))
+        XCTAssertEqual(sticky.state[.option], .locked)
+    }
+
+    func testHardwareKeyWithLatchedCommandUsesUSKeysymAndHoldsUntilKeyUp() async {
+        let (view, input, sink, sticky) = makeSticky()
+        sticky.tap(.command)
+        view.keyDown(.keyboardC, modifiers: [], characters: "c")
+        view.keyUp(.keyboardC)
+        let got = await events(input, sink)
+        XCTAssertEqual(got, [
+            .key(down: true, keysym: 0xffeb), .key(down: true, keysym: 0x63),
+            .key(down: false, keysym: 0x63), .key(down: false, keysym: 0xffeb),
+        ])
+    }
+
+    func testPhysicalCommandUnionWithStickyCommandNoDoubleDown() async {
+        let (view, input, sink, sticky) = makeSticky()
+        sticky.tap(.command)
+        view.keyDown(.keyboardLeftGUI, modifiers: [.command], characters: "")
+        view.keyDown(.keyboardC, modifiers: [.command], characters: "c")
+        view.keyUp(.keyboardC)
+        view.keyUp(.keyboardLeftGUI)
+        let got = await events(input, sink)
+        XCTAssertEqual(got, [
+            .key(down: true, keysym: 0xffeb), .key(down: true, keysym: 0x63),
+            .key(down: false, keysym: 0x63), .key(down: false, keysym: 0xffeb),
+        ])
+    }
+
+    func testMenuShortcutIsNotForwarded() async {
+        let (view, input, sink, _) = makeSticky()
+        XCTAssertFalse(view.keyDown(.keyboardM, modifiers: [.command, .alternate], characters: "m"))
+        XCTAssertFalse(view.keyUp(.keyboardM))
+        var toggled = 0
+        view.onToggleMenu = { toggled += 1 }
+        view.toggleControlMenu(nil)
+        XCTAssertEqual(toggled, 1)
+        let cmd = view.keyCommands?.first
+        XCTAssertEqual(cmd?.input, "m")
+        XCTAssertEqual(cmd?.modifierFlags, [.command, .alternate])
+        let got = await events(input, sink)
+        XCTAssertEqual(got, [])
+    }
+
+    func testMenuHoldsAreReferenceCountedWithHardware() async {
+        let (view, input, sink, _) = makeSticky()
+        view.holdModifier(0xffeb)
+        view.keyDown(.keyboardLeftGUI, modifiers: [.command], characters: "")
+        view.releaseModifier(0xffeb)
+        view.keyUp(.keyboardLeftGUI)
+        view.releaseModifier(0xffeb)                            // extra release: ignored
+        let got = await events(input, sink)
+        XCTAssertEqual(got, [.key(down: true, keysym: 0xffeb), .key(down: false, keysym: 0xffeb)])
+    }
+
+    func testReleaseAllReleasesMenuHoldsAndNotifies() async {
+        let (view, input, sink, _) = makeSticky()
+        var released = 0
+        view.onInputReleased = { released += 1 }
+        view.holdModifier(0xffe3)
+        view.holdModifier(0xffeb)
+        view.releaseAll()
+        view.releaseModifier(0xffeb)                            // after the flush: nothing
+        let got = await events(input, sink)
+        XCTAssertEqual(got, [
+            .key(down: true, keysym: 0xffe3), .key(down: true, keysym: 0xffeb),
+            .key(down: false, keysym: 0xffeb), .key(down: false, keysym: 0xffe3),
+        ])
+        XCTAssertEqual(released, 1)
+    }
+
     func testKeyboardProxyIsTransparentNotHidden() {
         let (view, _, _) = make()
         let proxy = view.subviews.first { $0 is SoftKeyboardProxy }

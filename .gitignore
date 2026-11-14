@@ -22,4 +22,6 @@ build-quality/
 build-input/
 build-wire/
 build-wire-dev/
+build-menu/
+build-menu-dev/
 build-tear/

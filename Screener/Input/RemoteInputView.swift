@@ -43,10 +43,16 @@
 // the app resigns active or the view's scene deactivates, before `input` is
 // switched (on the OLD controller), and on `releaseAll()` (session teardown).
 // iPadOS system shortcuts (⌘H, ⌘Tab, …) are not captured here (Task 22).
+// Sticky modifiers (the floating menu's ⌘ ⌥ ⌃ ⇧, `modifiers`) are held
+// around the next hardware key, soft-keyboard character, Delete, or pointer
+// click/drag (latched ones then clear). Every modifier hold — hardware,
+// sticky, the menu's shortcuts — is reference-counted per keysym, so the Mac
+// sees one down and one up however many sources hold it (no double-downs).
+// ⌘⌥M toggles the floating menu (a UIKeyCommand; the M is not forwarded).
 import UIKit
 
 @MainActor
-final class RemoteInputView: UIView, UIPointerInteractionDelegate, UIGestureRecognizerDelegate {
+final class RemoteInputView: UIView, UIPointerInteractionDelegate, UIGestureRecognizerDelegate, RemoteKeySink {
     /// Device-tunable input constants, in one place.
     enum Tuning {
         /// Points of wheel translation per wheel notch (GLFW reports 1.0 per
@@ -92,6 +98,24 @@ final class RemoteInputView: UIView, UIPointerInteractionDelegate, UIGestureReco
     }
     /// The user dismissed the on-screen keyboard from the keyboard itself.
     var onSoftwareKeyboardDismissed: (() -> Void)?
+    /// The floating menu's sticky modifiers (shared with ControlMenuModel).
+    var modifiers: StickyModifiers?
+    /// ⌘⌥M on a hardware keyboard.
+    var onToggleMenu: (() -> Void)?
+    /// Everything held was released on the wire (focus loss, teardown, a
+    /// controller switch): holders such as the menu forget their holds.
+    var onInputReleased: (() -> Void)?
+    /// The pointer moved to a point in window coordinates (nil: it left /
+    /// the host cursor was hidden). Used to keep the menu pill out of its way.
+    var onPointerMoved: ((CGPoint?) -> Void)?
+
+    /// Reference counts of held modifier keysyms, and their press order.
+    private var modifierHolds: [UInt32: Int] = [:]
+    private var modifierOrder: [UInt32] = []
+    /// Sticky modifiers held for a hardware key (by HID usage) until its key-up.
+    private var stickyForKey: [Int: [UInt32]] = [:]
+    /// Sticky modifiers held for the current pointer press until buttons 0.
+    private var stickyForPointer: [UInt32] = []
 
     private var buttons = 0
     private var lastHost: (x: Int, y: Int)?
@@ -171,7 +195,7 @@ final class RemoteInputView: UIView, UIPointerInteractionDelegate, UIGestureReco
         // focusable responder; it is 1×1 and invisible either way.
         keyboardProxy.alpha = 0
         keyboardProxy.onText = { [weak self] in self?.typeText($0) }
-        keyboardProxy.onDelete = { [weak self] in self?.tapKey(Keysyms.backSpace) }
+        keyboardProxy.onDelete = { [weak self] in self?.softDelete() }
         keyboardProxy.onPresses = { [weak self] presses, down in self?.handle(presses, down: down) ?? presses }
         keyboardProxy.onResign = { [weak self] in self?.softwareKeyboardResigned() }
         addSubview(keyboardProxy)
@@ -207,6 +231,73 @@ final class RemoteInputView: UIView, UIPointerInteractionDelegate, UIGestureReco
         guard buttons != 0 else { return }
         buttons = 0
         sendButtons()
+        releaseStickyForPointer()
+    }
+
+    // MARK: modifier holds (RemoteKeySink)
+
+    func sendKey(down: Bool, keysym: UInt32) {
+        input?.key(down: down, keysym: keysym)
+    }
+
+    func holdModifier(_ keysym: UInt32) {
+        let n = modifierHolds[keysym, default: 0]
+        modifierHolds[keysym] = n + 1
+        guard n == 0 else { return }
+        modifierOrder.append(keysym)
+        input?.key(down: true, keysym: keysym)
+    }
+
+    func releaseModifier(_ keysym: UInt32) {
+        guard let n = modifierHolds[keysym] else { return }
+        if n > 1 {
+            modifierHolds[keysym] = n - 1
+            return
+        }
+        modifierHolds[keysym] = nil
+        modifierOrder.removeAll { $0 == keysym }
+        input?.key(down: false, keysym: keysym)
+    }
+
+    /// The sticky modifiers to apply now (none if no menu is attached).
+    private var sticky: ModifierState { modifiers?.state ?? ModifierState() }
+
+    /// Holds the active sticky modifiers; latched ones clear. Returns what
+    /// was held, to release later.
+    private func holdSticky() -> [UInt32] {
+        let mods = sticky.pressedKeysyms()
+        for m in mods { holdModifier(m) }
+        modifiers?.consumeLatched()
+        return mods
+    }
+
+    private func pressStickyForPointer() {
+        guard stickyForPointer.isEmpty else { return }
+        stickyForPointer = holdSticky()
+    }
+
+    private func releaseStickyForPointer() {
+        let mods = stickyForPointer
+        stickyForPointer = []
+        for m in mods.reversed() { releaseModifier(m) }
+    }
+
+    // MARK: menu shortcut
+
+    override var keyCommands: [UIKeyCommand]? {
+        let toggle = UIKeyCommand(title: "Show/Hide Control Menu", action: #selector(toggleControlMenu(_:)),
+                                  input: "m", modifierFlags: [.command, .alternate])
+        toggle.wantsPriorityOverSystemBehavior = true
+        return [toggle]
+    }
+
+    @objc func toggleControlMenu(_ sender: Any?) {
+        onToggleMenu?()
+    }
+
+    /// ⌘⌥M is the iPad-side menu shortcut: never forwarded.
+    static func isMenuShortcut(_ usage: UIKeyboardHIDUsage, modifiers: UIKeyModifierFlags) -> Bool {
+        usage == .keyboardM && modifiers.contains(.command) && modifiers.contains(.alternate)
     }
 
     @objc private func appWillResignActive(_ note: Notification) {
@@ -229,6 +320,7 @@ final class RemoteInputView: UIView, UIPointerInteractionDelegate, UIGestureReco
         guard let input else { return }
         if buttons == 0, !input.fittedRect(in: bounds.size).contains(point) {
             cursor?.hide()
+            onPointerMoved?(nil)
             return
         }
         guard let host = input.hostPoint(forViewPoint: point, viewSize: bounds.size) else { return }
@@ -238,6 +330,7 @@ final class RemoteInputView: UIView, UIPointerInteractionDelegate, UIGestureReco
             input.pointer(buttons: buttons, x: host.x, y: host.y, coalescable: coalescable)
         }
         cursor?.move(toHostX: host.x, y: host.y, hostWidth: input.serverWidth, hostHeight: input.serverHeight)
+        onPointerMoved?(convert(point, to: nil))
     }
 
     /// Sends the current buttons at the last pointer position.
@@ -251,7 +344,10 @@ final class RemoteInputView: UIView, UIPointerInteractionDelegate, UIGestureReco
         case .began, .changed:
             movePointer(to: g.location(in: self), coalescable: true)
         case .ended, .cancelled, .failed:
-            if buttons == 0 { cursor?.hide() }
+            if buttons == 0 {
+                cursor?.hide()
+                onPointerMoved?(nil)
+            }
         default:
             break
         }
@@ -279,6 +375,7 @@ final class RemoteInputView: UIView, UIPointerInteractionDelegate, UIGestureReco
 
     /// A pointer button press at `point` (view coordinates).
     func pointerDown(buttons mask: Int, at point: CGPoint) {
+        if buttons == 0 { pressStickyForPointer() }
         buttons = mask
         movePointer(to: point, coalescable: false)
     }
@@ -296,12 +393,14 @@ final class RemoteInputView: UIView, UIPointerInteractionDelegate, UIGestureReco
         lastHost = input?.hostPoint(forViewPoint: t.location(in: self), viewSize: bounds.size) ?? lastHost
         buttons = 0
         sendButtons()
+        releaseStickyForPointer()
     }
 
     override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent?) {
         guard pointerTouch(touches) != nil else { return super.touchesCancelled(touches, with: event) }
         buttons = 0
         sendButtons()
+        releaseStickyForPointer()
     }
 
     // MARK: scrolling
@@ -348,13 +447,16 @@ final class RemoteInputView: UIView, UIPointerInteractionDelegate, UIGestureReco
 
     // MARK: touch clicks
 
-    private func click(at point: CGPoint, button: Int) {
+    /// A touch click at `point` (sticky modifiers held around it).
+    func click(at point: CGPoint, button: Int) {
         guard input != nil, buttons == 0 else { return }
         movePointer(to: point, coalescable: false)
+        pressStickyForPointer()
         buttons = button
         sendButtons()
         buttons = 0
         sendButtons()
+        releaseStickyForPointer()
     }
 
     @objc private func tap(_ g: UITapGestureRecognizer) {
@@ -371,6 +473,7 @@ final class RemoteInputView: UIView, UIPointerInteractionDelegate, UIGestureReco
         switch g.state {
         case .began:
             movePointer(to: g.location(in: self), coalescable: false)
+            pressStickyForPointer()
             buttons = InputController.Button.left
             sendButtons()
         case .changed:
@@ -378,6 +481,7 @@ final class RemoteInputView: UIView, UIPointerInteractionDelegate, UIGestureReco
         case .ended, .cancelled, .failed:
             buttons = 0
             sendButtons()
+            releaseStickyForPointer()
         default:
             break
         }
@@ -448,11 +552,27 @@ final class RemoteInputView: UIView, UIPointerInteractionDelegate, UIGestureReco
     }
 
     /// A hardware key went down; false if it has no keysym (passed on).
+    /// Modifier keys are reference-counted holds; any other key gets the
+    /// sticky modifiers held around it until its key-up.
     @discardableResult
-    func keyDown(_ usage: UIKeyboardHIDUsage, modifiers: UIKeyModifierFlags, characters: String) -> Bool {
-        guard let input, let ks = keys.press(usage, modifiers: modifiers, characters: characters) else { return false }
+    func keyDown(_ usage: UIKeyboardHIDUsage, modifiers flags: UIKeyModifierFlags, characters: String) -> Bool {
+        guard let input, !Self.isMenuShortcut(usage, modifiers: flags) else { return false }
+        if Keysyms.isModifier(usage) {
+            guard let ks = keys.press(usage, modifiers: flags, characters: characters) else { return false }
+            holdModifier(ks)
+            return true
+        }
+        var flags = flags
+        // A sticky ⌘/⌥/⌃ chord sends the unshifted US keysym, as a hardware chord does.
+        if sticky.commandLikeActive { flags.insert(.command) }
+        guard let ks = keys.press(usage, modifiers: flags, characters: characters) else { return false }
+        if let old = stickyForKey.removeValue(forKey: usage.rawValue) {   // a repeated down without an up
+            for m in old.reversed() { releaseModifier(m) }
+        }
+        let mods = holdSticky()
+        if !mods.isEmpty { stickyForKey[usage.rawValue] = mods }
         input.key(down: true, keysym: ks)
-        if !Keysyms.isModifier(usage) { repeater.keyDown(usage: usage.rawValue, keysym: ks) }
+        repeater.keyDown(usage: usage.rawValue, keysym: ks)
         return true
     }
 
@@ -461,32 +581,57 @@ final class RemoteInputView: UIView, UIPointerInteractionDelegate, UIGestureReco
     func keyUp(_ usage: UIKeyboardHIDUsage) -> Bool {
         repeater.keyUp(usage: usage.rawValue)
         guard let ks = keys.release(usage) else { return false }
-        input?.key(down: false, keysym: ks)
+        if Keysyms.isModifier(usage) {
+            releaseModifier(ks)
+        } else {
+            input?.key(down: false, keysym: ks)
+            for m in (stickyForKey.removeValue(forKey: usage.rawValue) ?? []).reversed() { releaseModifier(m) }
+        }
         return true
     }
 
     private func releaseHeldKeys() {
         repeater.cancel()
-        for ks in keys.releaseAll() { input?.key(down: false, keysym: ks) }
+        for ks in keys.releaseAll() where modifierHolds[ks] == nil { input?.key(down: false, keysym: ks) }
+        for ks in modifierOrder.reversed() { input?.key(down: false, keysym: ks) }
+        modifierHolds.removeAll()
+        modifierOrder.removeAll()
+        stickyForKey.removeAll()
+        stickyForPointer.removeAll()
+        onInputReleased?()
     }
 
     // MARK: on-screen keyboard
 
-    private func typeText(_ text: String) {
+    /// Soft-keyboard text. Each character gets the sticky modifiers (a
+    /// latched one applies to the first character only). Under a sticky
+    /// ⌘/⌥/⌃ a letter goes as its lowercase keysym (Shift stays a separate
+    /// key), as a hardware chord does: latched ⌘ + "c" = ⌘C.
+    func typeText(_ text: String) {
         guard let input else { return }
         for ch in text {
+            let commandLike = sticky.commandLikeActive
+            let mods = holdSticky()
             for t in Keysyms.typed(ch) {
-                if t.shift { input.key(down: true, keysym: Keysyms.shiftL) }
-                input.key(down: true, keysym: t.keysym)
-                input.key(down: false, keysym: t.keysym)
-                if t.shift { input.key(down: false, keysym: Keysyms.shiftL) }
+                var ks = t.keysym
+                if commandLike, (0x41...0x5a).contains(ks) { ks += 0x20 }
+                if t.shift { holdModifier(Keysyms.shiftL) }
+                input.key(down: true, keysym: ks)
+                input.key(down: false, keysym: ks)
+                if t.shift { releaseModifier(Keysyms.shiftL) }
             }
+            for m in mods.reversed() { releaseModifier(m) }
         }
     }
 
-    private func tapKey(_ keysym: UInt32) {
-        input?.key(down: true, keysym: keysym)
-        input?.key(down: false, keysym: keysym)
+    /// Soft-keyboard Delete: with the sticky modifiers; fn makes it forward Delete.
+    func softDelete() {
+        guard input != nil else { return }
+        let key: SpecialKey = sticky.fnActive ? SpecialKey.backspace.withFn : .backspace
+        let mods = holdSticky()
+        input?.key(down: true, keysym: key.keysym)
+        input?.key(down: false, keysym: key.keysym)
+        for m in mods.reversed() { releaseModifier(m) }
     }
 
     private func softwareKeyboardResigned() {
