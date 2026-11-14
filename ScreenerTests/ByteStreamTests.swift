@@ -14,8 +14,24 @@ final class ByteStreamTests: XCTestCase {
 
     func testPipeCloseFailsReads() async throws {
         let (a, b) = MemoryPipe.pair()
-        Task { try? await Task.sleep(for: .milliseconds(20)); a.close() }
-        do { _ = try await b.read(exactly: 1); XCTFail("expected closed") }
+        guard let bEnd = b as? MemoryPipeEnd else {
+            XCTFail("expected MemoryPipeEnd")
+            return
+        }
+        let readTask = Task { try await b.read(exactly: 1) }
+
+        // Poll (bounded by a timeout) until the reader is actually registered as
+        // waiting, instead of guessing with a fixed sleep, so this test covers
+        // close-while-a-read-is-genuinely-suspended deterministically.
+        let deadline = Date().addingTimeInterval(2)
+        while !bEnd.hasWaiterForTesting, Date() < deadline {
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        XCTAssertTrue(bEnd.hasWaiterForTesting, "reader never registered as waiting")
+
+        a.close()
+
+        do { _ = try await readTask.value; XCTFail("expected closed") }
         catch TransportError.closed {}
     }
 
@@ -73,6 +89,7 @@ final class ByteStreamTests: XCTestCase {
 
     func testTCPLoopbackRoundTripThenClose() async throws {
         let listener = try NWListener(using: .tcp)
+        defer { listener.cancel() }
         let ready = expectation(description: "listener ready")
         let accepted = AcceptedConnectionBox()
 
@@ -111,6 +128,83 @@ final class ByteStreamTests: XCTestCase {
             // Also acceptable: NWConnection can surface closure as a POSIX error
             // on some simulator network stacks.
         }
+    }
+
+    func testTCPReadCancellationClosesStream() async throws {
+        let listener = try NWListener(using: .tcp)
+        defer { listener.cancel() }
+        let ready = expectation(description: "listener ready")
+        listener.newConnectionHandler = { conn in conn.start(queue: .main) }
+        listener.stateUpdateHandler = { state in
+            if case .ready = state { ready.fulfill() }
+        }
+        listener.start(queue: .main)
+        await fulfillment(of: [ready], timeout: 5)
+
+        guard let port = listener.port else { XCTFail("no port"); return }
+        let client = try await TCPByteStream.connect(host: "127.0.0.1", port: port.rawValue, timeout: .seconds(5))
+
+        // Nothing is ever written, so this read would otherwise block forever
+        // waiting for data.
+        let readTask = Task { try await client.read(exactly: 1) }
+        readTask.cancel()
+
+        do {
+            _ = try await readTask.value
+            XCTFail("expected CancellationError")
+        } catch is CancellationError {
+            // expected: cancelling a pending TCP read surfaces CancellationError.
+        } catch {
+            XCTFail("expected CancellationError, got \(error)")
+        }
+
+        // Per the documented ByteStream cancellation semantics, cancelling a pending
+        // read on TCPByteStream closes the stream: a subsequent read must observe it
+        // as closed (not silently hang, and not succeed).
+        do {
+            _ = try await client.read(exactly: 1)
+            XCTFail("expected closed after cancellation")
+        } catch TransportError.closed {
+        } catch TransportError.failed {
+            // Also acceptable: NWConnection can surface a cancelled connection as a
+            // POSIX error on some simulator network stacks.
+        }
+    }
+
+    func testTCPConcurrentReadsThrowFailed() async throws {
+        let listener = try NWListener(using: .tcp)
+        defer { listener.cancel() }
+        let ready = expectation(description: "listener ready")
+        listener.newConnectionHandler = { conn in conn.start(queue: .main) }
+        listener.stateUpdateHandler = { state in
+            if case .ready = state { ready.fulfill() }
+        }
+        listener.start(queue: .main)
+        await fulfillment(of: [ready], timeout: 5)
+
+        guard let port = listener.port else { XCTFail("no port"); return }
+        let client = try await TCPByteStream.connect(host: "127.0.0.1", port: port.rawValue, timeout: .seconds(5))
+
+        // Read A: nothing is ever written, so it blocks until cancelled below.
+        let readA = Task { try await client.read(exactly: 1) }
+
+        // Poll (bounded by a timeout) until read A has actually registered itself as
+        // the active reader, instead of guessing with a fixed sleep.
+        let deadline = Date().addingTimeInterval(2)
+        while !client.isReadActiveForTesting, Date() < deadline {
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        XCTAssertTrue(client.isReadActiveForTesting, "read A never became active")
+
+        do {
+            _ = try await client.read(exactly: 1)
+            XCTFail("expected a second concurrent read to fail")
+        } catch TransportError.failed(let message) {
+            XCTAssertEqual(message, "concurrent read")
+        }
+
+        readA.cancel()
+        _ = try? await readA.value
     }
 
     private func receiveExactly(_ n: Int, from conn: NWConnection) async throws -> Data {

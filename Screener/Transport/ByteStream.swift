@@ -13,9 +13,17 @@ enum TransportError: Error, Equatable {
 ///
 /// Cancellation semantics: if the calling `Task` is cancelled while a `read(exactly:)`
 /// or `readSome()` call is suspended waiting for data, the call throws
-/// `CancellationError` (not `TransportError.closed`) — the stream itself is left open
-/// and other callers may continue to use it. This matches Swift's general convention
-/// that task cancellation surfaces as `CancellationError` at a cancellation checkpoint.
+/// `CancellationError` (not `TransportError.closed`). What happens to the stream
+/// itself differs by implementation: cancelling a pending read on `TCPByteStream`
+/// closes the stream (a cancelled `NWConnection.receive` may still complete and its
+/// bytes would otherwise be silently discarded, desyncing the RFB stream — closing is
+/// the only safe outcome); on `MemoryPipe` it leaves the stream usable, since no bytes
+/// can be lost that way in-process.
+///
+/// Concurrency: a `ByteStream` instance supports exactly one concurrent reader (i.e.
+/// at most one of `read(exactly:)`/`readSome()` in flight at a time) but any number of
+/// concurrent writers. This matches its intended use by `ControlSession`, which has a
+/// single reader task and multiple concurrent writers.
 protocol ByteStream: Sendable {
     /// Reads exactly `count` bytes, buffering partial reads internally until satisfied.
     func read(exactly count: Int) async throws -> Data
@@ -49,12 +57,22 @@ enum MemoryPipe {
 /// (buffer, closed flag, waiter list, peer reference) is guarded by `lock`; the only
 /// exception is `peer`, which is assigned exactly once by `MemoryPipe.pair()` before
 /// either end is handed to concurrent callers, and never mutated afterwards.
-private final class MemoryPipeEnd: ByteStream, @unchecked Sendable {
+final class MemoryPipeEnd: ByteStream, @unchecked Sendable {
     private let lock = NSLock()
     private var buffer = Data()
     private var closed = false
     private var waiters: [UUID: CheckedContinuation<Void, Never>] = [:]
     fileprivate weak var peer: MemoryPipeEnd?
+
+    /// Test-only hook: true once at least one reader is registered as waiting for
+    /// more data (i.e. a `read`/`readSome` call has found nothing buffered and is
+    /// suspended). Lets tests deterministically detect "a reader is blocked" instead
+    /// of guessing with a fixed sleep.
+    var hasWaiterForTesting: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return !waiters.isEmpty
+    }
 
     func read(exactly count: Int) async throws -> Data {
         guard count >= 0 else { throw TransportError.failed("negative read length") }
@@ -187,10 +205,21 @@ private final class MemoryPipeEnd: ByteStream, @unchecked Sendable {
 final class TCPByteStream: ByteStream, @unchecked Sendable {
     private let connection: NWConnection
     private let queue: DispatchQueue
-    /// Buffers bytes that arrived from the network but haven't been consumed by a
-    /// `read(exactly:)` call yet. Only ever touched on `queue`.
-    private var pending = Data()
-    private var closed = false
+    /// Guards `readerActive`, the only mutable state on this instance: `connection`
+    /// and `queue` are immutable, and NWConnection's own callbacks are independently
+    /// thread-safe. `@unchecked Sendable` is justified by this lock.
+    private let stateLock = NSLock()
+    /// Whether a `read(exactly:)`/`readSome()` call is currently in flight. Enforces
+    /// the single-reader contract documented on `ByteStream`.
+    private var readerActive = false
+
+    /// Test-only hook mirroring `readerActive`, so tests can deterministically wait
+    /// for a read to become active instead of guessing with a fixed sleep.
+    var isReadActiveForTesting: Bool {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return readerActive
+    }
 
     private init(connection: NWConnection, queue: DispatchQueue) {
         self.connection = connection
@@ -231,6 +260,12 @@ final class TCPByteStream: ByteStream, @unchecked Sendable {
                     switch state {
                     case .ready:
                         if resumeState.markResumed() {
+                            // Clear the handler now that connect has resumed: reads
+                            // already surface errors via `receive`'s completion, so
+                            // there's no reader-facing need for state updates past
+                            // this point, and clearing it breaks the
+                            // connection↔handler reference cycle this closure forms.
+                            connection.stateUpdateHandler = nil
                             cont.resume(returning: TCPByteStream(connection: connection, queue: queue))
                         }
                     case .failed(let error):
@@ -262,9 +297,16 @@ final class TCPByteStream: ByteStream, @unchecked Sendable {
 
     func read(exactly count: Int) async throws -> Data {
         guard count >= 0 else { throw TransportError.failed("negative read length") }
+        try beginRead()
+        defer { endRead() }
         var result = Data()
         result.reserveCapacity(count)
         while result.count < count {
+            // If this throws (closed/failed/cancelled), the bytes already
+            // accumulated in `result` are discarded along with it: the stream is
+            // dead at that point, so there's no way for a caller to resume a
+            // partial read, and returning a short `Data` would silently desync the
+            // RFB framing above us.
             let chunk = try await receiveChunk(maximumLength: count - result.count)
             result.append(chunk)
         }
@@ -272,7 +314,26 @@ final class TCPByteStream: ByteStream, @unchecked Sendable {
     }
 
     func readSome() async throws -> Data {
-        try await receiveChunk(maximumLength: 64 * 1024)
+        try beginRead()
+        defer { endRead() }
+        return try await receiveChunk(maximumLength: 64 * 1024)
+    }
+
+    /// Marks a read as in-flight, enforcing the single-reader contract documented on
+    /// `ByteStream`. Throws `TransportError.failed` if another read is already active.
+    private func beginRead() throws {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        if readerActive {
+            throw TransportError.failed("concurrent read")
+        }
+        readerActive = true
+    }
+
+    private func endRead() {
+        stateLock.lock()
+        readerActive = false
+        stateLock.unlock()
     }
 
     func write(_ data: Data) async throws {
@@ -291,24 +352,34 @@ final class TCPByteStream: ByteStream, @unchecked Sendable {
         connection.cancel()
     }
 
-    /// Receives at least 1 and at most `maximumLength` bytes, consulting any
-    /// internally-buffered leftovers first. Throws `TransportError.closed` on a
-    /// clean remote close, `TransportError.failed` on a network error, and
-    /// `CancellationError` if the calling task is cancelled while waiting (per the
-    /// documented `ByteStream` cancellation semantics).
+    /// Receives at least 1 and at most `maximumLength` bytes. Throws
+    /// `TransportError.closed` on a clean remote close, `TransportError.failed` on a
+    /// network error, and `CancellationError` if the calling task is cancelled while
+    /// waiting (per the documented `ByteStream` cancellation semantics).
     private func receiveChunk(maximumLength: Int) async throws -> Data {
-        if !pending.isEmpty {
-            let take = min(pending.count, maximumLength)
-            let chunk = pending.prefix(take)
-            pending.removeFirst(take)
-            return Data(chunk)
-        }
+        // Set by `onCancel` below, and consulted by the `receive` completion so it
+        // can report `CancellationError` instead of whatever NWError the now-cancelled
+        // connection happens to surface for this in-flight call.
+        let cancelFlag = CancelFlag()
         return try await withTaskCancellationHandler {
             try Task.checkCancellation()
             return try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Data, Error>) in
                 connection.receive(minimumIncompleteLength: 1, maximumLength: max(maximumLength, 1)) { data, _, isComplete, error in
+                    if cancelFlag.isSet {
+                        cont.resume(throwing: CancellationError())
+                        return
+                    }
                     if let error {
-                        cont.resume(throwing: TransportError.failed("\(error)"))
+                        // A receive on a connection that was cancelled out from under
+                        // it (by a *different* call's cancellation, via `onCancel`
+                        // below) surfaces as a POSIX ECANCELED NWError. Report that as
+                        // `.closed`, matching the documented outcome that cancelling a
+                        // pending read closes the stream for everyone.
+                        if case .posix(.ECANCELED) = error {
+                            cont.resume(throwing: TransportError.closed)
+                        } else {
+                            cont.resume(throwing: TransportError.failed("\(error)"))
+                        }
                         return
                     }
                     if let data, !data.isEmpty {
@@ -323,14 +394,36 @@ final class TCPByteStream: ByteStream, @unchecked Sendable {
                 }
             }
         } onCancel: {
-            // We intentionally do not cancel the whole connection here: a cancelled
-            // read should not tear down the stream for other callers. The in-flight
-            // `receive` completion (if any) will simply be ignored once this call's
-            // continuation has already thrown via checkCancellation at the next
-            // checkpoint; NWConnection itself has no per-call cancel, so a cancelled
-            // read may still let its receive complete and its data be dropped. This
-            // is an accepted limitation of the current implementation.
+            // NWConnection has no per-call cancel: a cancelled read's in-flight
+            // `receive` would otherwise complete and silently drop its bytes,
+            // desyncing the RFB stream for whoever reads next. So cancellation
+            // closes the whole connection instead, making the suspended read throw
+            // CancellationError and any subsequent read throw TransportError.closed
+            // — the only safe outcome, per the documented ByteStream cancellation
+            // semantics.
+            cancelFlag.set()
+            connection.cancel()
         }
+    }
+}
+
+/// A lock-protected one-shot flag, set by a `withTaskCancellationHandler`'s
+/// `onCancel` closure and read from the concurrently-running `receive` completion
+/// handler it races with.
+private final class CancelFlag: @unchecked Sendable {
+    private let lock = NSLock()
+    private var flag = false
+
+    func set() {
+        lock.lock()
+        flag = true
+        lock.unlock()
+    }
+
+    var isSet: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return flag
     }
 }
 
