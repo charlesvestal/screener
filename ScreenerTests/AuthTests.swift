@@ -232,7 +232,7 @@ final class AuthTests: XCTestCase {
     func testSRPHappyPathAgainstFakeServer() async throws {
         let fx = try SRPFixture()
         let key = try TestRSAKey()
-        let (client, server) = TestPipe.pair()
+        let (client, server) = MemoryPipe.pair()
         let serverTask = Task { try await runFakeSRPServer(server, key: key, fx: fx, m2: fx.M2) }
 
         let result = try await Authenticator.run(stream: client, username: "alice", password: fx.password,
@@ -262,7 +262,7 @@ final class AuthTests: XCTestCase {
     func testM2MismatchLogsButSucceeds() async throws {
         let fx = try SRPFixture()
         let key = try TestRSAKey()
-        let (client, server) = TestPipe.pair()
+        let (client, server) = MemoryPipe.pair()
         var badM2 = fx.M2; badM2[0] ^= 0xff
         let serverTask = Task { try await runFakeSRPServer(server, key: key, fx: fx, m2: badM2) }
         let result = try await Authenticator.run(stream: client, username: "alice", password: fx.password,
@@ -274,7 +274,7 @@ final class AuthTests: XCTestCase {
     func testRejectedSecurityResultWithReason() async throws {
         let fx = try SRPFixture()
         let key = try TestRSAKey()
-        let (client, server) = TestPipe.pair()
+        let (client, server) = MemoryPipe.pair()
         let serverTask = Task {
             try await runFakeSRPServer(server, key: key, fx: fx, m2: fx.M2, result: 1, reason: "Authentication failed")
         }
@@ -291,7 +291,7 @@ final class AuthTests: XCTestCase {
     func testRejectedSecurityResultWithoutReason() async throws {
         let fx = try SRPFixture()
         let key = try TestRSAKey()
-        let (client, server) = TestPipe.pair()
+        let (client, server) = MemoryPipe.pair()
         let serverTask = Task {
             let c = try await runFakeSRPServer(server, key: key, fx: fx, m2: fx.M2, result: 1)
             server.close()      // reference server just drops the connection
@@ -309,7 +309,7 @@ final class AuthTests: XCTestCase {
 
     func testShortChallengeMeansSRPUnavailable() async throws {
         let key = try TestRSAKey()
-        let (client, server) = TestPipe.pair()
+        let (client, server) = MemoryPipe.pair()
         let serverTask = Task {
             _ = try await serveKeyRequest(server, key: key)
             _ = try await server.read(exactly: 654)
@@ -329,7 +329,7 @@ final class AuthTests: XCTestCase {
     /// client sends and that the returned key is the RSA-wrapped AES key.
     func testNonSRPAgainstFakeServer() async throws {
         let key = try TestRSAKey()
-        let (client, server) = TestPipe.pair()
+        let (client, server) = MemoryPipe.pair()
         let serverTask = Task { () -> (Data, Data, Data) in
             let keyReq = try await serveKeyRequest(server, key: key)
             let lenBytes = try await server.read(exactly: 4)
@@ -374,7 +374,7 @@ final class AuthTests: XCTestCase {
 
     func testNonSRPRejected() async throws {
         let key = try TestRSAKey()
-        let (client, server) = TestPipe.pair()
+        let (client, server) = MemoryPipe.pair()
         let serverTask = Task {
             _ = try await serveKeyRequest(server, key: key)
             _ = try await server.read(exactly: 4 + 394)
@@ -395,8 +395,8 @@ final class AuthTests: XCTestCase {
     /// NEW connection, run non-SRP on it.
     func testFallbackReconnectsAndRunsNonSRP() async throws {
         let key = try TestRSAKey()
-        let (c1, s1) = TestPipe.pair()
-        let (c2, s2) = TestPipe.pair()
+        let (c1, s1) = MemoryPipe.pair()
+        let (c2, s2) = MemoryPipe.pair()
         let srpServer = Task {
             _ = try await serveKeyRequest(s1, key: key)
             _ = try await s1.read(exactly: 654)
@@ -426,7 +426,7 @@ final class AuthTests: XCTestCase {
     }
 
     func testTransportErrorDoesNotFallBack() async throws {
-        let (c1, s1) = TestPipe.pair()
+        let (c1, s1) = MemoryPipe.pair()
         s1.close()
         let conns = ConnQueue([c1])
         do {
@@ -440,11 +440,11 @@ final class AuthTests: XCTestCase {
     }
 
     func testReadsAreCancellable() async throws {
-        let (client, server) = TestPipe.pair()
+        let (client, server) = MemoryPipe.pair()
         let task = Task { try await Authenticator.run(stream: client, username: "a", password: "b") }
         // Wait until the client is blocked reading the key response.
         _ = try await server.read(exactly: 15)
-        let end = client as! TestPipeEnd
+        let end = client as! MemoryPipeEnd
         while !end.hasWaiterForTesting { await Task.yield() }
         task.cancel()
         do { _ = try await task.value; XCTFail("expected cancellation") } catch {
@@ -461,100 +461,5 @@ private actor ConnQueue {
         guard !streams.isEmpty else { throw TransportError.failed("no more connections") }
         opened += 1
         return streams.removeFirst()
-    }
-}
-
-// MARK: - Race-free in-memory pipe
-
-/// Local stand-in for `MemoryPipe`. `MemoryPipeEnd` (ByteStream.swift) has a
-/// lost-wakeup race: `read` sees an empty buffer and unlocks, then
-/// `waitForMore` registers its continuation without checking the buffer
-/// again. A `deliver` that lands in that gap resumes no waiter, and the reader
-/// hangs forever. (A cancel that fires before registration has the same problem.)
-/// It made these tests hang intermittently, so they use this pipe until
-/// MemoryPipe is fixed.
-enum TestPipe {
-    static func pair() -> (ByteStream, ByteStream) {
-        let a = TestPipeEnd(), b = TestPipeEnd()
-        a.peer = b; b.peer = a
-        return (a, b)
-    }
-}
-
-final class TestPipeEnd: ByteStream, @unchecked Sendable {
-    private let lock = NSLock()
-    private var buffer = Data()
-    private var closed = false
-    private var generation = 0
-    private var waiter: CheckedContinuation<Void, Error>?
-    fileprivate weak var peer: TestPipeEnd?
-
-    var hasWaiterForTesting: Bool { lock.withLock { waiter != nil } }
-
-    func read(exactly count: Int) async throws -> Data {
-        while true {
-            let (out, gen): (Data?, Int) = try lock.withLock {
-                if buffer.count >= count {
-                    let d = Data(buffer.prefix(count)); buffer.removeFirst(count); return (d, generation)
-                }
-                if closed { throw TransportError.closed }
-                return (nil, generation)
-            }
-            if let out { return out }
-            try await wait(since: gen)
-        }
-    }
-
-    func readSome() async throws -> Data {
-        while true {
-            let (out, gen): (Data?, Int) = try lock.withLock {
-                if !buffer.isEmpty { let d = buffer; buffer.removeAll(); return (d, generation) }
-                if closed { throw TransportError.closed }
-                return (nil, generation)
-            }
-            if let out { return out }
-            try await wait(since: gen)
-        }
-    }
-
-    func write(_ data: Data) async throws {
-        guard let peer else { throw TransportError.closed }
-        try peer.deliver(data)
-    }
-
-    func close() { markClosed(); peer?.markClosed() }
-
-    fileprivate func deliver(_ data: Data) throws {
-        let w: CheckedContinuation<Void, Error>? = try lock.withLock {
-            if closed { throw TransportError.closed }
-            buffer.append(data); generation += 1
-            defer { waiter = nil }
-            return waiter
-        }
-        w?.resume()
-    }
-
-    fileprivate func markClosed() {
-        let w: CheckedContinuation<Void, Error>? = lock.withLock {
-            closed = true; generation += 1
-            defer { waiter = nil }
-            return waiter
-        }
-        w?.resume()
-    }
-
-    private func wait(since gen: Int) async throws {
-        try await withTaskCancellationHandler {
-            try await withCheckedThrowingContinuation { (c: CheckedContinuation<Void, Error>) in
-                lock.lock()
-                if Task.isCancelled { lock.unlock(); c.resume(throwing: CancellationError()); return }
-                if generation != gen { lock.unlock(); c.resume(); return }
-                waiter = c
-                lock.unlock()
-            }
-        } onCancel: {
-            let w: CheckedContinuation<Void, Error>? = lock.withLock { defer { waiter = nil }; return waiter }
-            w?.resume(throwing: CancellationError())
-        }
     }
 }
