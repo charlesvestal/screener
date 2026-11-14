@@ -22,7 +22,24 @@ final class RecordLayerTests: XCTestCase {
         let rx = try RecordLayer(rekeyBody: Data(count: 36), wrapKey: Data(count: 16))
         var wire = try tx.seal(Data([0x03, 0x00]))
         wire[5] ^= 0xff
-        XCTAssertThrowsError(try rx.open(ciphertext: wire.dropFirst(2)))
+        XCTAssertThrowsError(try rx.open(ciphertext: wire.dropFirst(2))) { error in
+            XCTAssertEqual(error as? RecordLayerError, .integrity)
+        }
+        // CBC chaining state and the sequence counter must still be in sync
+        // after a failed record, so a second, correctly-sealed record from
+        // tx must still open cleanly on rx (proves the decrypt always ran
+        // and the sequence window resynced).
+        let second = Data([0x04, 0x05, 0x06])
+        let wire2 = try tx.seal(second)
+        XCTAssertEqual(try rx.open(ciphertext: wire2.dropFirst(2)), second)
+    }
+
+    func testOpenRejectsShortCiphertext() throws {
+        let rx = try RecordLayer(rekeyBody: Data(count: 36), wrapKey: Data(count: 16))
+        let shortCiphertext = Data(count: 16)
+        XCTAssertThrowsError(try rx.open(ciphertext: shortCiphertext)) { error in
+            XCTAssertEqual(error as? RecordLayerError, .badFrame)
+        }
     }
 
     func testFrameSplitter() throws {
@@ -31,5 +48,30 @@ final class RecordLayerTests: XCTestCase {
         XCTAssertEqual(try s.push(frame.prefix(10)).count, 0)
         XCTAssertEqual(try s.push(frame.dropFirst(10) + frame).count, 2)
         XCTAssertThrowsError(try s.push(Data([0x00, 0x11])))
+    }
+
+    func testFrameSplitterRejectsZeroLength() {
+        var s = FrameSplitter()
+        XCTAssertThrowsError(try s.push(Data([0x00, 0x00]))) { error in
+            XCTAssertEqual(error as? RecordLayerError, .badFrame)
+        }
+    }
+
+    func testFrameSplitterByteAtATimeMatchesWholeStream() throws {
+        let frame1 = Data([0x00, 0x10]) + Data(repeating: 0xaa, count: 16)
+        let frame2 = Data([0x00, 0x20]) + Data(repeating: 0xbb, count: 32)
+        let stream = frame1 + frame2
+
+        var whole = FrameSplitter()
+        let wholeFrames = try whole.push(stream)
+
+        var trickled = FrameSplitter()
+        var trickledFrames: [Data] = []
+        for byte in stream {
+            trickledFrames.append(contentsOf: try trickled.push(Data([byte])))
+        }
+
+        XCTAssertEqual(trickledFrames, wholeFrames)
+        XCTAssertEqual(trickledFrames.count, 2)
     }
 }

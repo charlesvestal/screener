@@ -17,6 +17,10 @@ final class SRPTests: XCTestCase {
             privateA: ha("a_entropy_64B")
         )
         XCTAssertEqual(client.publicA.hex, h("A").hex)
+        XCTAssertEqual(Data(client.x.serialize()).hex, h("x").hex)
+        let (u, S) = try client.debugIntermediates(serverB: h("B"))
+        XCTAssertEqual(u.hex, h("u").hex)
+        XCTAssertEqual(S.hex, h("S").hex)
         let proof = try client.respond(to: h("B"))
         XCTAssertEqual(proof.M1.hex, h("M1").hex)
         XCTAssertEqual(proof.K.hex, h("K").hex)
@@ -31,6 +35,24 @@ final class SRPTests: XCTestCase {
     func testRejectsZeroB() throws {
         let c = try SRPClient(password: "p", salt: Data(count: 32), iterations: 1,
                                privateA: Data(repeating: 1, count: 32))
-        XCTAssertThrowsError(try c.respond(to: SRPGroup.N.serialize()))
+        XCTAssertThrowsError(try c.respond(to: SRPGroup.N.serialize())) { error in
+            XCTAssertEqual(error as? SRPError, .invalidServerValue)
+        }
+    }
+
+    func testRejectsExcessiveIterations() {
+        XCTAssertThrowsError(
+            try SRPClient(password: "p", salt: Data(count: 32),
+                           iterations: SRPClient.maxIterations + 1,
+                           privateA: Data(repeating: 1, count: 32))
+        ) { error in
+            XCTAssertEqual(error as? SRPError, .invalidServerValue)
+        }
+    }
+
+    func testDefaultEntropyProducesDifferentPublicA() throws {
+        let c1 = try SRPClient(password: "p", salt: Data(count: 32), iterations: 1)
+        let c2 = try SRPClient(password: "p", salt: Data(count: 32), iterations: 1)
+        XCTAssertNotEqual(c1.publicA, c2.publicA)
     }
 }

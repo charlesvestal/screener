@@ -7,7 +7,7 @@
 import Foundation
 import BigInt
 
-enum SRPError: Error {
+enum SRPError: Error, Equatable {
     case invalidServerValue
 }
 
@@ -50,23 +50,50 @@ struct SRPProof {
     /// function in the reference computes M2 (it treats the server's M2 as
     /// opaque and unverified), so this is the one formula not cross-checked
     /// against `auth.py` — only against the fixture.
-    func verifyServerProof(_ m2: Data) -> Bool { m2 == expectedM2 }
+    ///
+    /// IMPORTANT (I-2): `expectedM2`/`verifyServerProof` implement the M2
+    /// formula as stated in `Reference/iShareScreen/docs/apple_vnc_rfc.md`,
+    /// but the reference implementation (`auth.py`) never computes or checks
+    /// M2 against a live server at all — it treats the server's M2 as
+    /// opaque. This formula is therefore verified only against the local
+    /// fixture, not against real screensharingd traffic. The auth layer
+    /// (a later task) MUST log loudly on an M2 mismatch but must NOT
+    /// hard-fail the login on that mismatch until a live login has
+    /// confirmed this formula is actually what the server sends.
+    func verifyServerProof(_ m2: Data) -> Bool { ConstantTime.equal(m2, expectedM2) }
 }
 
+/// Doing a full SRP exchange (`init` + `respond`) is CPU-heavy: PBKDF2-SHA512
+/// at real server iteration counts plus several 4096-bit modexps can take
+/// seconds in a Debug build. `SRPClient` itself does no threading — callers
+/// (a later task) MUST run this off the main actor (e.g. a detached /
+/// background `Task`), never inline on the UI thread.
 struct SRPClient {
     let publicA: Data
+    /// Exposed `internal` (not `private`) so tests can assert it against the
+    /// fixture's `x` value directly, per the AC gap in the review (I-1/AC).
+    let x: BigUInt
     private let a: BigUInt
-    private let x: BigUInt
     private let salt: Data
+
+    /// Maximum PBKDF2 iteration count we are willing to run (M-2). Apple's
+    /// real server sends counts in the low thousands; anything above this is
+    /// almost certainly a malicious or corrupted challenge trying to force a
+    /// multi-minute (or longer) CPU-bound PBKDF2 run as a DoS, so we reject
+    /// it outright rather than silently clamping and grinding through it.
+    static let maxIterations: UInt64 = 10_000_000
 
     /// - Parameters:
     ///   - iterations: PBKDF2 iteration count as received on the wire (u64).
     ///     Converted to `Int` with clamping; `PBKDF2.sha512` itself throws if
-    ///     the clamped value still exceeds `UInt32.max`.
+    ///     the clamped value still exceeds `UInt32.max`. Rejected outright
+    ///     (`SRPError.invalidServerValue`) if it exceeds `maxIterations`,
+    ///     since the caller logs — this initializer stays log-free.
     ///   - privateA: Raw entropy for the ephemeral private exponent `a`
     ///     (reference uses `os.urandom(64)`). Reduced the same way the
     ///     reference does: `a = (entropy mod (N-1)) + 1`.
     init(password: String, salt: Data, iterations: UInt64, privateA: Data = SecureRandom.bytes(64)) throws {
+        guard iterations <= Self.maxIterations else { throw SRPError.invalidServerValue }
         self.salt = salt
         let itersInt = iterations > UInt64(Int.max) ? Int.max : Int(iterations)
         let pPrime = try PBKDF2.sha512(password: Data(password.utf8), salt: salt,
@@ -82,24 +109,12 @@ struct SRPClient {
     }
 
     func respond(to serverB: Data) throws -> SRPProof {
+        let (_, S) = try debugIntermediates(serverB: serverB)
         let N = SRPGroup.N, L = SRPGroup.length
         let B = BigUInt(serverB)
-        guard B % N != 0 else { throw SRPError.invalidServerValue }
         let Bb = B.padded(to: L)
         let gPadded = SRPGroup.g.padded(to: L)
-
-        // k = H(N || PAD(g))
-        let k = BigUInt(Hash.sha512(N.padded(to: L) + gPadded))
-        // u = H(PAD(A) || PAD(B))
-        let u = BigUInt(Hash.sha512(publicA + Bb))
-        guard u != 0 else { throw SRPError.invalidServerValue }
-
-        // S = (B - k*g^x)^(a + u*x) mod N
-        let gx = SRPGroup.g.power(x, modulus: N)
-        let kgx = (k * gx) % N
-        let base = (B + N - kgx) % N
-        let S = base.power(a + u * x, modulus: N)
-        let K = Hash.sha512(S.padded(to: L))
+        let K = Hash.sha512(S)
 
         // M1 = H(H(N) XOR H(g) || H("") || salt || PAD(A) || PAD(B) || K)
         let hN = Hash.sha512(N.padded(to: L)), hg = Hash.sha512(gPadded)
@@ -111,5 +126,33 @@ struct SRPClient {
         let M2 = Hash.sha512(publicA + M1 + K)
 
         return SRPProof(M1: M1, K: K, expectedM2: M2)
+    }
+
+    /// Internal-only accessor for the SRP intermediates `u` (the scrambling
+    /// parameter `H(PAD(A) || PAD(B))`) and `S` (the raw, un-hashed shared
+    /// secret, padded to the group length) so tests can assert them against
+    /// the fixture directly. Not part of the public API surface used by
+    /// callers outside the module.
+    func debugIntermediates(serverB: Data) throws -> (u: Data, S: Data) {
+        let N = SRPGroup.N, L = SRPGroup.length
+        let B = BigUInt(serverB)
+        guard B % N != 0 else { throw SRPError.invalidServerValue }
+        let Bb = B.padded(to: L)
+        let gPadded = SRPGroup.g.padded(to: L)
+
+        // k = H(N || PAD(g))
+        let k = BigUInt(Hash.sha512(N.padded(to: L) + gPadded))
+        // u = H(PAD(A) || PAD(B))
+        let uHash = Hash.sha512(publicA + Bb)
+        let u = BigUInt(uHash)
+        guard u != 0 else { throw SRPError.invalidServerValue }
+
+        // S = (B - k*g^x)^(a + u*x) mod N
+        let gx = SRPGroup.g.power(x, modulus: N)
+        let kgx = (k * gx) % N
+        let base = (B + N - kgx) % N
+        let S = base.power(a + u * x, modulus: N)
+
+        return (u: uHash, S: S.padded(to: L))
     }
 }

@@ -125,6 +125,22 @@ enum PBKDF2 {
     }
 }
 
+/// Constant-time comparison helpers, to avoid timing side-channels when
+/// comparing MACs or other secret-derived values.
+enum ConstantTime {
+    /// Compares two `Data` values in constant time with respect to their
+    /// contents. Still short-circuits on differing lengths (lengths are not
+    /// secret in our use sites), but never early-exits on a byte mismatch.
+    static func equal(_ a: Data, _ b: Data) -> Bool {
+        guard a.count == b.count else { return false }
+        var diff: UInt8 = 0
+        for i in 0..<a.count {
+            diff |= a[a.startIndex + i] ^ b[b.startIndex + i]
+        }
+        return diff == 0
+    }
+}
+
 enum SecureRandom {
     static func bytes(_ n: Int) -> Data {
         var d = Data(count: n)

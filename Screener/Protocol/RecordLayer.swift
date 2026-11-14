@@ -18,13 +18,20 @@
 //   bytes   mac             (20-byte plain SHA-1 tag)
 import Foundation
 
-enum RecordLayerError: Error {
+enum RecordLayerError: Error, Equatable {
     case badRekey
     case integrity
     case badFrame
 }
 
 /// Bidirectional enc1103 cipher state, built from the 36-byte 1103 blob.
+///
+/// Threading contract: `seal` and the corresponding socket write MUST happen
+/// as a single serialized step (one actor/writer owning both), because wire
+/// order must equal counter order — the reference holds its send lock across
+/// the socket write in `encrypt_and_send`. If two callers race to `seal`
+/// concurrently and then write independently, the wire order can diverge
+/// from the sequence order the receiver expects, breaking the MAC window.
 final class RecordLayer: @unchecked Sendable {
     /// The unwrapped CBC key, public because the alt-session path's input
     /// wrapper needs to AES-128-ECB-encrypt blocks under this same key.
@@ -52,7 +59,8 @@ final class RecordLayer: @unchecked Sendable {
 
     /// Encrypts one control-channel message. Returns the full wire form
     /// `u16 len || ciphertext`. Callers MUST write records in the order they
-    /// were sealed (wire order == counter order).
+    /// were sealed (wire order == counter order) — see the class doc comment:
+    /// `seal` and the socket write must be one serialized step.
     func seal(_ body: Data) throws -> Data {
         lock.lock(); defer { lock.unlock() }
         var w = ByteWriter(capacity: body.count + 40)
@@ -81,22 +89,33 @@ final class RecordLayer: @unchecked Sendable {
         let ctrStart = recvSeq
         recvSeq &+= 1
 
-        // Reference: a block no longer than the mac has no room for a mac at
-        // all, so it's returned verbatim (unreachable in practice, since the
-        // sender's padding scheme never emits a frame this short).
-        guard ciphertext.count > Self.macLen else { return plaintext }
+        // Minimum legit record: 2-byte length + 0-byte body + 20-byte mac,
+        // padded up to a 32-byte multiple of the 16-byte block size. Anything
+        // shorter cannot possibly contain a real mac, so treating it as
+        // "trusted plaintext, no mac to check" (as the reference does for
+        // unreachable short blocks) would be a integrity bypass; reject it.
+        guard ciphertext.count >= 32 else { throw RecordLayerError.badFrame }
 
         let body = plaintext.prefix(plaintext.count - Self.macLen)
         let mac = plaintext.suffix(Self.macLen)
-        let lo = ctrStart == 0 ? 0 : ctrStart - 1
-        for c in lo..<(ctrStart + Self.decryptWindow) {
+        // Iterate in Int space to avoid overflow when ctrStart is near
+        // UInt32.max, then convert back with truncation (matching the
+        // reference's modular u32 counter semantics).
+        let loInt = ctrStart == 0 ? 0 : Int(ctrStart) - 1
+        let hiInt = Int(ctrStart) + Int(Self.decryptWindow)
+        for cInt in loInt..<hiInt {
+            let c = UInt32(truncatingIfNeeded: cInt)
             var s = ByteWriter()
             s.u32(c)
-            if Hash.sha1(s.data + body) == mac {
+            if ConstantTime.equal(Hash.sha1(s.data + body), mac) {
                 recvSeq = c &+ 1
-                var r = ByteReader(body)
-                let len = Int(try r.u16())
-                return try r.bytes(len)
+                do {
+                    var r = ByteReader(body)
+                    let len = Int(try r.u16())
+                    return try r.bytes(len)
+                } catch {
+                    throw RecordLayerError.badFrame
+                }
             }
         }
         throw RecordLayerError.integrity
@@ -111,12 +130,23 @@ struct FrameSplitter {
     mutating func push(_ chunk: Data) throws -> [Data] {
         buffer.append(chunk)
         var out: [Data] = []
-        while buffer.count >= 2 {
-            let len = Int(buffer[buffer.startIndex]) << 8 | Int(buffer[buffer.startIndex + 1])
+        // Track a read position within this push and remove the whole
+        // consumed prefix once at the end, rather than repeatedly calling
+        // removeFirst() (which would re-copy/re-release the backing storage
+        // on every frame). Behavior is identical to the previous
+        // per-frame-removal version.
+        var pos = buffer.startIndex
+        defer {
+            if pos > buffer.startIndex {
+                buffer.removeSubrange(buffer.startIndex..<pos)
+            }
+        }
+        while buffer.count - (pos - buffer.startIndex) >= 2 {
+            let len = Int(buffer[pos]) << 8 | Int(buffer[pos + 1])
             guard len > 0, len % 16 == 0 else { throw RecordLayerError.badFrame }
-            guard buffer.count >= 2 + len else { break }
-            out.append(buffer.subdata(in: buffer.startIndex + 2 ..< buffer.startIndex + 2 + len))
-            buffer.removeFirst(2 + len)
+            guard buffer.distance(from: pos, to: buffer.endIndex) >= 2 + len else { break }
+            out.append(buffer.subdata(in: pos + 2 ..< pos + 2 + len))
+            pos += 2 + len
         }
         return out
     }

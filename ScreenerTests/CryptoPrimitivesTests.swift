@@ -66,4 +66,11 @@ final class CryptoPrimitivesTests: XCTestCase {
         XCTAssertEqual(ct.hex, "8ea2b7ca516745bfeafc49904b496089")
         XCTAssertEqual(try AES.ecbDecrypt(key: key256, block: ct), block)
     }
+
+    func testConstantTimeEqual() {
+        XCTAssertTrue(ConstantTime.equal(Data([1, 2, 3]), Data([1, 2, 3])))
+        XCTAssertFalse(ConstantTime.equal(Data([1, 2, 3]), Data([1, 2, 4])))
+        XCTAssertFalse(ConstantTime.equal(Data([1, 2]), Data([1, 2, 3])))
+        XCTAssertTrue(ConstantTime.equal(Data(), Data()))
+    }
 }
