@@ -689,6 +689,7 @@ actor ControlSession {
             case .timeout: return "The Mac didn't respond."
             case .closed: return "The Mac closed the connection."
             case .failed(let why): return "Connection failed: \(why)"
+            case .posix(let e): return "Connection failed: \(String(cString: strerror(e))) (\(e))"
             }
         case let e as RecordLayerError:
             return "The encrypted connection failed (\(e)); disconnected."

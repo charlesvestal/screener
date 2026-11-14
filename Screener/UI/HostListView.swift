@@ -1,8 +1,10 @@
 import SwiftUI
+import UIKit
 
 struct HostListView: View {
     @State private var model = SessionCoordinator()
     @State private var showingConnect = false
+    @Environment(\.scenePhase) private var scenePhase
 
     var body: some View {
         NavigationStack {
@@ -23,6 +25,22 @@ struct HostListView: View {
             set: { shown in if !shown, model.isSessionActive { Task { await model.disconnect() } } })) {
             SessionView(model: model)
         }
+        // Background: close the session at once (the Mac stops sharing);
+        // active again: reconnect (SessionCoordinator / LifecyclePolicy).
+        .onChange(of: scenePhase) { _, phase in
+            switch phase {
+            case .background:
+                let token = BackgroundTask.begin("close session")
+                Task {
+                    await model.enterBackground()
+                    token.end()
+                }
+            case .active:
+                Task { await model.becomeActive() }
+            default:
+                break
+            }
+        }
         #if DEBUG
         .task { await DebugLaunch.runIfRequested(model) }
         #endif
@@ -34,7 +52,9 @@ struct HostListView: View {
             // Behind the full-screen SessionView.
             Text("Connected — canvas \(w)×\(h)").font(.title2)
         case .connecting:
-            ProgressView("Connecting…")
+            ProgressView(model.isReconnecting ? "Reconnecting…" : "Connecting…")
+        case .suspended:
+            ProgressView("Reconnecting…")
         case .failed(let message):
             ContentUnavailableView("Couldn't connect", systemImage: "exclamationmark.triangle",
                                    description: Text(message))
@@ -42,5 +62,25 @@ struct HostListView: View {
             ContentUnavailableView("No Macs yet", systemImage: "desktopcomputer",
                                    description: Text("Tap + to connect to a Mac."))
         }
+    }
+}
+
+/// Extra time to finish closing the session after the app is backgrounded.
+@MainActor
+final class BackgroundTask {
+    private var id: UIBackgroundTaskIdentifier = .invalid
+
+    static func begin(_ name: String) -> BackgroundTask {
+        let t = BackgroundTask()
+        t.id = UIApplication.shared.beginBackgroundTask(withName: name) { [weak t] in
+            MainActor.assumeIsolated { t?.end() }
+        }
+        return t
+    }
+
+    func end() {
+        guard id != .invalid else { return }
+        UIApplication.shared.endBackgroundTask(id)
+        id = .invalid
     }
 }

@@ -115,7 +115,7 @@ final class ByteStreamTests: XCTestCase {
             XCTFail("expected timeout or failure")
         } catch TransportError.timeout {
             // expected on most networks
-        } catch TransportError.failed {
+        } catch TransportError.failed, TransportError.posix {
             // some simulator network configurations fail fast with a different
             // NWError (e.g. "no route to host") before our timer fires; accept it.
         } catch {
@@ -160,7 +160,7 @@ final class ByteStreamTests: XCTestCase {
             _ = try await client.read(exactly: 1)
             XCTFail("expected closed after close()")
         } catch TransportError.closed {
-        } catch TransportError.failed {
+        } catch TransportError.failed, TransportError.posix {
             // Also acceptable: NWConnection can surface closure as a POSIX error
             // on some simulator network stacks.
         }
@@ -201,7 +201,7 @@ final class ByteStreamTests: XCTestCase {
             _ = try await client.read(exactly: 1)
             XCTFail("expected closed after cancellation")
         } catch TransportError.closed {
-        } catch TransportError.failed {
+        } catch TransportError.failed, TransportError.posix {
             // Also acceptable: NWConnection can surface a cancelled connection as a
             // POSIX error on some simulator network stacks.
         }
@@ -227,7 +227,7 @@ final class ByteStreamTests: XCTestCase {
             try await client.write(Data([0x01]))
             XCTFail("expected write after close to throw")
         } catch TransportError.closed {
-        } catch TransportError.failed {
+        } catch TransportError.failed, TransportError.posix {
             // Also acceptable: some simulator network stacks surface a cancelled
             // connection's send failure as a different NWError.
         }

@@ -26,6 +26,13 @@
 // and never touches shared state once it is stale. Teardown awaits the media
 // sockets' close, and the next connect waits for a pending teardown, so the
 // UDP ports are never bound twice by this app at once.
+//
+// Background / foreground (LifecyclePolicy, SessionLifecycle.swift): going to
+// the background closes the session at once (`.suspended`, request kept in
+// memory); becoming active reconnects with `isReconnecting` set, so the
+// session view stays up with "Reconnecting…" over the last picture until the
+// resumed session decodes. Errors reach the UI only through
+// UserFacingError.message (never raw errno text).
 import CoreGraphics
 import CoreVideo
 import Observation
@@ -37,7 +44,19 @@ final class SessionCoordinator {
         case idle
         case connecting
         case connected(canvasWidth: Int, canvasHeight: Int)
+        /// Closed because the app went to the background; reconnects when active.
+        case suspended
         case failed(String)
+    }
+
+    /// What `connect` was asked for; kept (in memory only) to reconnect.
+    struct ConnectRequest: Equatable, Sendable {
+        var host: String
+        var port: UInt16
+        var username: String
+        var password: String
+        var order: ControlSession.StartupOrder = .reference
+        var localAddress: String?
     }
 
     struct Policy: Sendable {
@@ -76,8 +95,20 @@ final class SessionCoordinator {
     let frames = VideoFrameStore()
     /// The current session decoded its first picture.
     private(set) var hasFirstFrame = false
-    /// Connected: the session view is up.
-    var isSessionActive: Bool { if case .connected = state { true } else { false } }
+    /// A suspended session is being resumed: from the background close until
+    /// the resumed session's first picture (or its failure).
+    private(set) var isReconnecting = false
+    /// The last connect request (cleared by a user disconnect).
+    private(set) var lastRequest: ConnectRequest?
+    private(set) var lifecycle = LifecyclePolicy()
+    /// The session view is up: connected, suspended, or reconnecting.
+    var isSessionActive: Bool {
+        switch state {
+        case .connected, .suspended: true
+        case .connecting: isReconnecting
+        case .idle, .failed: false
+        }
+    }
     #if DEBUG
     /// Per-session DEBUG packet tap (video capture), created on the video task.
     var makeVideoTap: (@Sendable () -> (any VideoPacketTap)?)?
@@ -105,7 +136,10 @@ final class SessionCoordinator {
         frames.onFirstFrame = { [weak self] pb in
             Log.video.info("M4 first frame \(CVPixelBufferGetWidth(pb))x\(CVPixelBufferGetHeight(pb)) "
                            + "pixfmt=\(CVPixelBufferGetPixelFormatType(pb).fourCC)")
-            Task { @MainActor in self?.hasFirstFrame = true }
+            Task { @MainActor in
+                self?.hasFirstFrame = true
+                self?.isReconnecting = false
+            }
         }
     }
 
@@ -121,13 +155,23 @@ final class SessionCoordinator {
     func connect(host: String, port: UInt16, username: String, password: String,
                  order: ControlSession.StartupOrder = .reference, localAddress: String? = nil) async {
         guard connectTask == nil, control == nil, media == nil, state != .connecting else { return }
+        let request = ConnectRequest(host: host, port: port, username: username, password: password,
+                                     order: order, localAddress: localAddress)
+        lifecycle.userConnected()
+        isReconnecting = false
+        lastRequest = request
+        await begin(request)
+    }
+
+    private func begin(_ r: ConnectRequest) async {
+        guard connectTask == nil, control == nil, media == nil, state != .connecting else { return }
         generation += 1
         let gen = generation
         state = .connecting
         let task = Task<Void, Never> { [weak self] in
             guard let self else { return }
-            await self.run(gen, host: host, port: port, username: username, password: password,
-                            order: order, localAddress: localAddress)
+            await self.run(gen, host: r.host, port: r.port, username: r.username, password: r.password,
+                           order: r.order, localAddress: r.localAddress)
         }
         connectTask = task
         await task.value
@@ -135,11 +179,74 @@ final class SessionCoordinator {
     }
 
     func disconnect() async {
+        lifecycle.userDisconnected()
+        lastRequest = nil
+        isReconnecting = false
         generation += 1
         connectTask?.cancel()
         connectTask = nil
         state = .idle
         await teardown()
+    }
+
+    // MARK: background / foreground
+
+    /// The scene went to the background: close a session (or a connect in
+    /// progress) now, so the Mac ends sharing; reconnect on `becomeActive`.
+    func enterBackground() async {
+        let status: LifecyclePolicy.SessionStatus = switch state {
+        case .connected: .connected
+        case .connecting: .connecting
+        default: .none
+        }
+        guard lifecycle.didEnterBackground(session: status) == .suspend else { return }
+        Log.app.info("app backgrounded: closing the session (will reconnect when active)")
+        await suspend()
+    }
+
+    /// The scene is active again: resume a suspended session.
+    func becomeActive() async {
+        switch lifecycle.didBecomeActive(canReconnect: lastRequest != nil) {
+        case .reconnect:
+            await reconnect()
+        case .none, .suspend:
+            if state == .suspended { state = .idle; isReconnecting = false }
+        }
+    }
+
+    private func suspend() async {
+        generation += 1
+        connectTask?.cancel()
+        connectTask = nil
+        state = .suspended
+        isReconnecting = true
+        await teardown()
+    }
+
+    private func reconnect() async {
+        guard let r = lastRequest else { return }
+        Log.app.info("reconnecting to \(r.host)")
+        isReconnecting = true
+        await begin(r)
+    }
+
+    /// Every error that ends session `gen` comes here: the lifecycle policy
+    /// may turn it into a quiet suspend or a reconnect; otherwise the user
+    /// sees UserFacingError's message.
+    private func fail(_ gen: Int, _ error: Error) async {
+        guard gen == generation else { return }
+        let kind = UserFacingError.kind(of: error)
+        let wasConnected = if case .connected = state { true } else { false }
+        Log.app.error("session failed (\(kind), connected=\(wasConnected)): \(ControlSession.describe(error))")
+        switch lifecycle.sessionFailed(kind: kind, wasConnected: wasConnected, canReconnect: lastRequest != nil) {
+        case .suspend:
+            await suspend()
+        case .reconnect:
+            await suspend()
+            Task { [weak self] in await self?.reconnect() }
+        case .none:
+            await end(gen, .failed(UserFacingError.message(for: error)))
+        }
     }
 
     private func isCurrent(_ gen: Int) -> Bool { gen == generation && !Task.isCancelled }
@@ -156,7 +263,7 @@ final class SessionCoordinator {
             ip = try await seams.resolveIPv4(host)
         } catch {
             guard isCurrent(gen) else { return }
-            return await end(gen, .failed(Self.describe(error)))
+            return await fail(gen, error)
         }
         guard isCurrent(gen) else { return }
         guard Self.activeServers.insert(ip).inserted else {
@@ -178,7 +285,7 @@ final class SessionCoordinator {
         } catch {
             guard isCurrent(gen) else { return }
             Log.app.error("media open failed: \(error)")
-            return await end(gen, .failed(Self.describe(error)))
+            return await fail(gen, error)
         }
         guard isCurrent(gen) else { return }
         startStatsPolling(media)
@@ -208,7 +315,7 @@ final class SessionCoordinator {
                     return await end(gen, .failed(MediaTransportError.localNetworkMessage))
                 }
                 guard isCurrent(gen) else { return }
-                return await end(gen, .failed(Self.describe(error)))
+                return await fail(gen, error)
             }
             guard isCurrent(gen) else { return }
             mediaParams = params
@@ -222,7 +329,7 @@ final class SessionCoordinator {
                 state = .connected(canvasWidth: params.canvas.width, canvasHeight: params.canvas.height)
                 return
             case .failed(let error):
-                return await end(gen, .failed(Self.describe(error)))
+                return await fail(gen, error)
             case .starved(let packets):
                 // Drop only the TCP side; the UDP sockets stay bound.
                 eventsTask?.cancel(); eventsTask = nil
@@ -249,6 +356,7 @@ final class SessionCoordinator {
     /// Ends the session of generation `gen` (if still current) in `final`.
     private func end(_ gen: Int, _ final: State) async {
         guard gen == generation else { return }
+        isReconnecting = false
         generation += 1
         connectTask?.cancel()
         connectTask = nil
@@ -295,7 +403,11 @@ final class SessionCoordinator {
             for await _ in session.events {}
             let failure = await session.failure
             guard let self, !Task.isCancelled, self.control === session else { return }
-            await self.end(gen, failure.map { .failed(ControlSession.describe($0)) } ?? .idle)
+            if let failure {
+                await self.fail(gen, failure)
+            } else {
+                await self.end(gen, .idle)
+            }
         }
     }
 
@@ -333,7 +445,7 @@ final class SessionCoordinator {
         mediaFailureTask = Task { [weak self] in
             for await f in media.failures {
                 guard let self, !Task.isCancelled, self.media === media else { return }
-                await self.end(gen, .failed(Self.describe(f)))
+                await self.fail(gen, f)
                 return
             }
         }
@@ -351,13 +463,8 @@ final class SessionCoordinator {
         }
     }
 
-    static func describe(_ error: Error) -> String {
-        switch error {
-        case let e as MediaTransportError: return e.localizedDescription
-        case let e as IPv4Resolver.Failure: return e.localizedDescription
-        default: return ControlSession.describe(error)
-        }
-    }
+    /// The UI text for `error` (UserFacingError: no raw errno text).
+    static func describe(_ error: Error) -> String { UserFacingError.message(for: error) }
 
     /// Advertised display: the window scene's screen in points (logical) and
     /// `points × nativeScale` (backing). Using bounds × scale rather than

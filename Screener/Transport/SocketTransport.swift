@@ -564,7 +564,7 @@ final class SocketTCPByteStream: ByteStream, @unchecked Sendable {
         if BSDSocket.connect(s, remote) != 0 {
             guard errno == EINPROGRESS else {
                 let e = errno; Darwin.close(s)
-                throw TransportError.failed("connect: \(String(cString: strerror(e)))")
+                throw TransportError.posix(e)
             }
             // Poll in short slices so cancellation is noticed; EINTR retries.
             let deadline = ContinuousClock.now + timeout
@@ -591,7 +591,7 @@ final class SocketTCPByteStream: ByteStream, @unchecked Sendable {
             getsockopt(s, SOL_SOCKET, SO_ERROR, &err, &len)
             if err != 0 {
                 Darwin.close(s)
-                throw TransportError.failed("connect: \(String(cString: strerror(err)))")
+                throw TransportError.posix(err)
             }
         }
         _ = fcntl(s, F_SETFL, flags)   // back to blocking for the read/write queues
@@ -632,7 +632,7 @@ final class SocketTCPByteStream: ByteStream, @unchecked Sendable {
                     let n = buf.withUnsafeMutableBytes { recv(fd, $0.baseAddress, $0.count, 0) }
                     if n > 0 { cont.resume(returning: Data(buf[0..<n])); return }
                     if n == 0 || isClosed { cont.resume(throwing: TransportError.closed); return }
-                    cont.resume(throwing: TransportError.failed("recv: \(String(cString: strerror(errno)))"))
+                    cont.resume(throwing: TransportError.posix(errno))
                 }
             }
         } onCancel: {
@@ -652,7 +652,7 @@ final class SocketTCPByteStream: ByteStream, @unchecked Sendable {
                         if errno == EINTR { continue }
                         let e = errno
                         cont.resume(throwing: isClosed ? TransportError.closed
-                                                       : TransportError.failed("send: \(String(cString: strerror(e)))"))
+                                                       : TransportError.posix(e))
                         return
                     }
                     off += n

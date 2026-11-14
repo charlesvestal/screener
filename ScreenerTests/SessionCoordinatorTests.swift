@@ -172,7 +172,7 @@ final class SessionCoordinatorTests: XCTestCase {
         try await waitUntil("handshaking") { rec.authCalls == 1 }
         rec.channels[0].fail("receive: Network is down (50)")
         await t.value
-        XCTAssertEqual(c.state, .failed("Media connection lost (receive: Network is down (50))"))
+        XCTAssertEqual(c.state, .failed(UserFacingError.lostMessage))
         XCTAssertNil(c.control)
         XCTAssertTrue(rec.channels.allSatisfy(\.cancelled))
     }
@@ -191,6 +191,59 @@ final class SessionCoordinatorTests: XCTestCase {
         await c.connect(host: "mac", port: 5900, username: "u", password: "p")
         XCTAssertEqual(c.state, .failed(MediaTransportError.localNetworkMessage))
         XCTAssertTrue(rec.channels.allSatisfy(\.cancelled))
+    }
+
+    /// Backgrounding mid-connect closes everything; activation reconnects
+    /// with the same request and the session view stays up ("Reconnecting…").
+    func testBackgroundSuspendsAndActiveReconnects() async throws {
+        let rec = Recorder()
+        let c = SessionCoordinator(seams: seams(rec, resolve: ["mac": "192.0.2.80"]))
+        let t = connect(c, "mac")
+        try await waitUntil("handshaking") { rec.authCalls == 1 }
+
+        await c.enterBackground()
+        await t.value
+        XCTAssertEqual(c.state, .suspended)
+        XCTAssertTrue(c.isSessionActive, "the session view stays up")
+        XCTAssertTrue(c.isReconnecting)
+        XCTAssertNil(c.control)
+        XCTAssertNil(c.media)
+        XCTAssertTrue(rec.channels.allSatisfy(\.cancelled), "sockets closed in the background")
+
+        let resumed = Task { await c.becomeActive() }
+        try await waitUntil("reconnect handshake") { rec.authCalls == 2 }
+        XCTAssertEqual(c.state, .connecting)
+        XCTAssertTrue(c.isSessionActive)
+        XCTAssertTrue(c.isReconnecting)
+        XCTAssertEqual(c.lastRequest?.host, "mac")
+
+        await c.disconnect()
+        await resumed.value
+        XCTAssertEqual(c.state, .idle)
+        XCTAssertFalse(c.isReconnecting)
+        XCTAssertNil(c.lastRequest, "credentials dropped on a user disconnect")
+    }
+
+    func testBackgroundWithoutASessionDoesNothing() async {
+        let rec = Recorder()
+        let c = SessionCoordinator(seams: seams(rec))
+        await c.enterBackground()
+        await c.becomeActive()
+        XCTAssertEqual(c.state, .idle)
+        XCTAssertEqual(rec.authCalls, 0)
+    }
+
+    /// TCP refused: the friendly text, not "Connection failed: ...".
+    func testARefusedConnectionShowsFriendlyText() async {
+        let rec = Recorder()
+        var s = seams(rec, resolve: ["mac": "192.0.2.90"])
+        s.controlSeams = { _ in
+            ControlSession.Seams(connect: { _, _ in throw TransportError.posix(ECONNREFUSED) },
+                                 authenticate: { _, _, connect in _ = try await connect(); throw TransportError.closed })
+        }
+        let c = SessionCoordinator(seams: s)
+        await c.connect(host: "mac", port: 5900, username: "u", password: "p")
+        XCTAssertEqual(c.state, .failed(UserFacingError.unreachableMessage))
     }
 
     func testAHostWithoutIPv4FailsClearly() async {

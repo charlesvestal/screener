@@ -6,6 +6,15 @@ enum TransportError: Error, Equatable {
     case timeout
     case closed
     case failed(String)
+    /// A socket-level failure with its errno (ECONNREFUSED, ECONNABORTED, ...),
+    /// so the UI can say something useful instead of the raw code.
+    case posix(Int32)
+
+    /// NWError → `.posix` when it carries an errno, else `.failed`.
+    static func from(_ error: NWError) -> TransportError {
+        if case .posix(let code) = error { return .posix(code.rawValue) }
+        return .failed("\(error)")
+    }
 }
 
 /// An async byte-oriented transport: read/write `Data` without caring whether the
@@ -289,7 +298,17 @@ final class TCPByteStream: ByteStream, @unchecked Sendable {
                         if resumeState.markResumed() {
                             connection.stateUpdateHandler = nil
                             connection.cancel()
-                            cont.resume(throwing: TransportError.failed("\(error)"))
+                            cont.resume(throwing: TransportError.from(error))
+                        }
+                    case .waiting(let error):
+                        // NWConnection waits (and retries) on a refused
+                        // connect; nobody is listening, so say so now rather
+                        // than after the timeout. Other waits (no route yet,
+                        // Local Network prompt) run until the timeout.
+                        if case .posix(.ECONNREFUSED) = error, resumeState.markResumed() {
+                            connection.stateUpdateHandler = nil
+                            connection.cancel()
+                            cont.resume(throwing: TransportError.posix(ECONNREFUSED))
                         }
                     case .cancelled:
                         if resumeState.markResumed() {
@@ -368,7 +387,7 @@ final class TCPByteStream: ByteStream, @unchecked Sendable {
                     if case .posix(.ECANCELED) = error {
                         cont.resume(throwing: TransportError.closed)
                     } else {
-                        cont.resume(throwing: TransportError.failed("\(error)"))
+                        cont.resume(throwing: TransportError.from(error))
                     }
                 } else {
                     cont.resume(returning: ())
@@ -407,7 +426,7 @@ final class TCPByteStream: ByteStream, @unchecked Sendable {
                         if case .posix(.ECANCELED) = error {
                             cont.resume(throwing: TransportError.closed)
                         } else {
-                            cont.resume(throwing: TransportError.failed("\(error)"))
+                            cont.resume(throwing: TransportError.from(error))
                         }
                         return
                     }

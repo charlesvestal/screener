@@ -3,7 +3,8 @@ import SwiftUI
 
 /// Full-screen remote desktop: the composited video, a small floating toolbar
 /// (Disconnect, Share Log) and a "Connecting…" overlay until the first
-/// picture decodes.
+/// picture decodes ("Reconnecting…" over the last picture while a session
+/// suspended by backgrounding is resumed).
 struct SessionView: View {
     let model: SessionCoordinator
 
@@ -12,10 +13,11 @@ struct SessionView: View {
             Color.black.ignoresSafeArea()
             VideoView(store: model.frames)
                 .ignoresSafeArea()
-            if !model.hasFirstFrame {
+            if model.isReconnecting || !model.hasFirstFrame {
                 VStack(spacing: 12) {
                     ProgressView().controlSize(.large).tint(.white)
-                    Text("Connecting…").font(.headline).foregroundStyle(.white)
+                    Text(model.isReconnecting ? "Reconnecting…" : "Connecting…")
+                        .font(.headline).foregroundStyle(.white)
                 }
                 .padding(24)
                 .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 16))
