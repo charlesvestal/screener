@@ -200,6 +200,14 @@ final class SessionCoordinator {
                                                ourAudioSSRC: MediaOffer.extractSSRC(params.audioOffer, isVideo: false)))
             } catch {
                 guard isCurrent(gen) else { return }
+                // A handshake that died while our UDP sends were blocked is
+                // almost always Local Network privacy, whatever TCP reported.
+                if let blocked = await media.startupBlockedErrno {
+                    guard isCurrent(gen) else { return }
+                    Log.app.error("control start failed (\(error)) while UDP sends are blocked (errno \(blocked))")
+                    return await end(gen, .failed(MediaTransportError.localNetworkMessage))
+                }
+                guard isCurrent(gen) else { return }
                 return await end(gen, .failed(Self.describe(error)))
             }
             guard isCurrent(gen) else { return }
@@ -213,8 +221,8 @@ final class SessionCoordinator {
                 frames.configure(canvas: CGSize(width: params.canvas.width, height: params.canvas.height))
                 state = .connected(canvasWidth: params.canvas.width, canvasHeight: params.canvas.height)
                 return
-            case .failed(let why):
-                return await end(gen, .failed(MediaTransportError.channelFailed(why).localizedDescription))
+            case .failed(let error):
+                return await end(gen, .failed(Self.describe(error)))
             case .starved(let packets):
                 // Drop only the TCP side; the UDP sockets stay bound.
                 eventsTask?.cancel(); eventsTask = nil

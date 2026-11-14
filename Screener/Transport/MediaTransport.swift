@@ -84,6 +84,13 @@ protocol DatagramChannel: AnyObject, Sendable {
     func send(_ datagram: Data)
     /// Stops the flow; returns once its socket is actually closed.
     func cancel() async
+    /// Before any datagram arrived: the errno of an unbroken run of blocking
+    /// send/receive errors (EPIPE, EPERM, EHOSTUNREACH, ...), else nil.
+    var startupBlockedErrno: Int32? { get }
+}
+
+extension DatagramChannel {
+    var startupBlockedErrno: Int32? { nil }
 }
 
 enum MediaTransportError: Error, Equatable, LocalizedError {
@@ -91,11 +98,19 @@ enum MediaTransportError: Error, Equatable, LocalizedError {
     case bindFailed(audioPort: UInt16, videoPort: UInt16, underlying: String)
     /// A media socket died after start.
     case channelFailed(String)
+    /// Sends were still blocked (EPERM, EPIPE, EHOSTUNREACH, ...) when the
+    /// start burst should have arrived: almost always iOS Local Network
+    /// privacy (denied, or the prompt still up).
+    case localNetworkBlocked(errno: Int32)
+
+    static let localNetworkMessage =
+        "Screener needs Local Network access — check Settings › Privacy & Security › Local Network."
 
     var errorDescription: String? {
         switch self {
         case .bindFailed(let a, let v, _): return "UDP ports \(a)/\(v) unavailable (another Screen Sharing session?)"
         case .channelFailed(let why): return "Media connection lost (\(why))"
+        case .localNetworkBlocked: return Self.localNetworkMessage
         }
     }
 }
@@ -225,8 +240,8 @@ actor MediaTransport {
     enum BurstOutcome: Sendable, Equatable {
         case started(packets: Int, group: [UInt32])
         case starved(packets: Int)
-        /// A media socket died (see `failures`).
-        case failed(String)
+        /// A media socket died, or sends stayed blocked (see `failures`).
+        case failed(MediaTransportError)
     }
 
     typealias ChannelFactory = @Sendable (_ flow: Flow, _ config: Config) -> DatagramChannel
@@ -444,13 +459,25 @@ actor MediaTransport {
 
     /// A channel died for good: publish once and end a pending burst wait.
     private func channelFailed(_ why: String) {
-        guard !isClosed, failure == nil else { return }
-        let f = MediaTransportError.channelFailed(why)
-        failure = f
-        Log.media.error("media channel failed: \(why)")
-        failuresOut.yield(f)
-        resolveBurst(.failed(why), ifUnresolvedOnly: true)
+        fail(.channelFailed(why))
     }
+
+    private func fail(_ f: MediaTransportError) {
+        guard !isClosed, failure == nil else { return }
+        failure = f
+        Log.media.error("media channel failed: \(f)")
+        failuresOut.yield(f)
+        resolveBurst(.failed(f), ifUnresolvedOnly: true)
+    }
+
+    /// A flow's sends are currently blocked before the stream started (the
+    /// errno), e.g. by iOS Local Network privacy.
+    var startupBlockedErrno: Int32? {
+        for flow in [Flow.audio, .video] { if let e = channels[flow]?.startupBlockedErrno { return e } }
+        return nil
+    }
+
+    var localNetworkBlocked: Bool { startupBlockedErrno != nil }
 
     // MARK: public API
 
@@ -601,6 +628,13 @@ actor MediaTransport {
         let total = counters.videoPackets
         let primary = videoDecryptor?.getPrimarySSRCGroup(tier: 0, groupSize: tracker.groupSize) ?? []
         Log.media.info("initial-burst packets: \(total)")
+        if total < tuning.burstStarvedBelow || primary.isEmpty, let blocked = startupBlockedErrno {
+            Log.media.error("burst window closed with UDP sends still blocked (\(String(cString: strerror(blocked))) "
+                            + "(\(blocked))); Local Network access?")
+            burstVideo = []
+            fail(.localNetworkBlocked(errno: blocked))
+            return
+        }
         if total < tuning.burstStarvedBelow || primary.isEmpty {
             Log.media.error("burst starved (no-video-rtp, \(total) pkts)")
             burstVideo = []

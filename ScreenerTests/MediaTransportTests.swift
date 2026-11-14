@@ -9,8 +9,15 @@ final class FakeDatagramChannel: DatagramChannel, @unchecked Sendable {
     private var _sent: [Data] = []
     private var _cancelled = false
     private var _started = false
+    private var _blocked: Int32?
     /// When set, `start` throws this.
     var startError: Error?
+    /// What `startupBlockedErrno` reports (EPERM etc. before the stream).
+    var blocked: Int32? {
+        get { lock.lock(); defer { lock.unlock() }; return _blocked }
+        set { lock.lock(); _blocked = newValue; lock.unlock() }
+    }
+    var startupBlockedErrno: Int32? { blocked }
 
     func start(onReceive: @escaping @Sendable (Data) -> Void, onEvent: @escaping @Sendable (String) -> Void,
                onFailure: @escaping @Sendable (String) -> Void) throws {
@@ -327,7 +334,27 @@ final class MediaTransportTests: XCTestCase {
         let f = await it.next()
         XCTAssertEqual(f, .channelFailed("receive: Socket is not connected (57)"))
         let outcome = await t.burstOutcome()
-        XCTAssertEqual(outcome, .failed("receive: Socket is not connected (57)"))
+        XCTAssertEqual(outcome, .failed(.channelFailed("receive: Socket is not connected (57)")))
+        await t.close()
+    }
+
+    /// Sends still failing with a privacy-class error when the burst window
+    /// closes: the session fails with the Local Network message, not "starved".
+    func testABurstThatTimesOutWhileSendsAreBlockedFailsWithTheLocalNetworkMessage() async throws {
+        let ch = FakeChannels()
+        let t = make(ch)
+        try await t.open()
+        ch.audio.blocked = EPERM
+        let blockedNow = await t.localNetworkBlocked
+        XCTAssertTrue(blockedNow)
+        try await t.activate(activation)
+        let outcome = await t.burstOutcome()
+        XCTAssertEqual(outcome, .failed(.localNetworkBlocked(errno: EPERM)))
+        XCTAssertEqual(MediaTransportError.localNetworkBlocked(errno: EPERM).localizedDescription,
+                       "Screener needs Local Network access — check Settings › Privacy & Security › Local Network.")
+        var it = t.failures.makeAsyncIterator()
+        let f = await it.next()
+        XCTAssertEqual(f, .localNetworkBlocked(errno: EPERM))
         await t.close()
     }
 

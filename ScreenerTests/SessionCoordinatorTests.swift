@@ -177,6 +177,22 @@ final class SessionCoordinatorTests: XCTestCase {
         XCTAssertTrue(rec.channels.allSatisfy(\.cancelled))
     }
 
+    /// The handshake fails while the UDP sends are still blocked (iOS Local
+    /// Network privacy): the user sees the Settings hint, not the TCP error.
+    func testAHandshakeFailureWhileUDPIsBlockedShowsTheLocalNetworkHint() async {
+        let rec = Recorder()
+        var s = seams(rec, resolve: ["mac": "192.0.2.70"])
+        s.channelFactory = { flow, _ in let c = rec.make(flow); c.blocked = EPERM; return c }
+        s.controlSeams = { _ in
+            ControlSession.Seams(connect: { _, _ in throw TransportError.closed },
+                                 authenticate: { _, _, _ in throw TransportError.timeout })
+        }
+        let c = SessionCoordinator(seams: s)
+        await c.connect(host: "mac", port: 5900, username: "u", password: "p")
+        XCTAssertEqual(c.state, .failed(MediaTransportError.localNetworkMessage))
+        XCTAssertTrue(rec.channels.allSatisfy(\.cancelled))
+    }
+
     func testAHostWithoutIPv4FailsClearly() async {
         let rec = Recorder()
         let c = SessionCoordinator(seams: seams(rec))

@@ -175,37 +175,66 @@ enum DatagramChannelError: Error, Equatable, CustomStringConvertible {
 
 /// What a socket error means for a media flow (pure; the channel holds one
 /// under its lock).
-///   * EBADF / ENOTSOCK / ENOTCONN / EADDRNOTAVAIL (and EPIPE: shut down):
-///     the socket or its address is gone; fatal at once.
-///   * EHOSTUNREACH / EHOSTDOWN / ENETUNREACH / ENETDOWN: routing trouble
-///     (Wi-Fi roam, sleep, an ICMP unreachable). Fatal only when they keep
-///     coming for more than `routingGrace` with no successful send or
-///     receive in between; any success restarts the clock.
-///   * Everything else (ECONNREFUSED from a racing punch, ENOBUFS, ...) is
-///     transient.
-/// Transient errors are logged at most once per `logInterval` per errno.
+///   * EBADF / ENOTSOCK / ENOTCONN / EADDRNOTAVAIL: the socket or its address
+///     is gone; fatal at once.
+///   * Before the stream is established (no datagram received yet: the
+///     hole-punch / pre-burst phase), EPIPE, routing errors (EHOSTUNREACH,
+///     EHOSTDOWN, ENETUNREACH, ENETDOWN) and EPERM / EACCES are never fatal.
+///     On the first launch iOS fails sends with EPIPE while the Local Network
+///     prompt is up, and with EPERM/EHOSTUNREACH once access is denied (first
+///     iPad run, 2026-11-14). The run is remembered as `startupBlocked`
+///     until a send or receive works; MediaTransport turns a block that
+///     outlasts the start burst into the Local Network message.
+///   * After the stream is established, the same errors are fatal only when
+///     they keep coming for more than `routingGrace` with no successful send
+///     or receive in between; any success restarts the clock.
+///   * ECONNREFUSED (ICMP port-unreachable while the server's sockets are not
+///     up yet) is never fatal and is logged on the 1st and every 50th
+///     occurrence only.
+///   * Everything else (ENOBUFS, ...) is transient.
+/// Other transient errors are logged at most once per `logInterval` per errno.
 struct SocketErrorPolicy {
     enum Verdict: Equatable { case transient(log: Bool), fatal }
 
     static let routingGrace: Duration = .seconds(3)
     static let logInterval: Duration = .seconds(1)
+    static let refusedLogEvery = 50
 
-    static func isFatal(_ e: Int32) -> Bool { [EBADF, ENOTSOCK, ENOTCONN, EADDRNOTAVAIL, EPIPE].contains(e) }
+    static func isFatal(_ e: Int32) -> Bool { [EBADF, ENOTSOCK, ENOTCONN, EADDRNOTAVAIL].contains(e) }
     static func isRouting(_ e: Int32) -> Bool { [EHOSTUNREACH, EHOSTDOWN, ENETUNREACH, ENETDOWN].contains(e) }
+    /// Errors that mean "the path is blocked for now": routing trouble, a
+    /// send pipe the system shut (EPIPE), or a privacy / policy denial.
+    static func isBlocking(_ e: Int32) -> Bool { isRouting(e) || [EPIPE, EPERM, EACCES].contains(e) }
 
-    /// Start of the current unbroken run of routing errors.
-    private var routingSince: ContinuousClock.Instant?
+    /// A datagram has arrived: the server is sending.
+    private(set) var established = false
+    /// Start of the current unbroken run of blocking errors.
+    private var blockedSince: ContinuousClock.Instant?
+    private var lastBlocking: Int32?
+    private var refused = 0
     private var lastLogged: [Int32: ContinuousClock.Instant] = [:]
 
+    /// Before the stream is established: the errno of an unbroken run of
+    /// blocking errors (nil once a send or receive succeeds).
+    var startupBlocked: Int32? { established || blockedSince == nil ? nil : lastBlocking }
+
     /// A send or receive succeeded: the network works.
-    mutating func noteSuccess() { routingSince = nil }
+    mutating func noteSuccess() { blockedSince = nil; lastBlocking = nil }
+
+    /// A datagram was received.
+    mutating func noteReceive() { established = true; noteSuccess() }
 
     mutating func note(error e: Int32, at now: ContinuousClock.Instant) -> Verdict {
         if Self.isFatal(e) { return .fatal }
-        if Self.isRouting(e) {
-            let since = routingSince ?? now
-            routingSince = since
-            if now - since > Self.routingGrace { return .fatal }
+        if e == ECONNREFUSED {
+            refused += 1
+            return .transient(log: refused == 1 || refused % Self.refusedLogEvery == 0)
+        }
+        if Self.isBlocking(e) {
+            let since = blockedSince ?? now
+            blockedSince = since
+            lastBlocking = e
+            if established, now - since > Self.routingGrace { return .fatal }
         }
         if let last = lastLogged[e], now - last < Self.logInterval { return .transient(log: false) }
         lastLogged[e] = now
@@ -224,9 +253,10 @@ struct SocketErrorPolicy {
 ///     effective value is reported as an event.
 ///   * Connected UDP reports ICMP port-unreachable as ECONNREFUSED on the
 ///     next call; that is expected while punches race the server's bind and is
-///     only counted. Errors that mean the socket is gone, or routing errors
-///     that persist (`SocketErrorPolicy`), stop the channel and are reported
-///     through `onFailure`.
+///     not counted until the server has sent something. Errors that mean the
+///     socket is gone, or blocking errors that persist after the stream is up
+///     (`SocketErrorPolicy`), stop the channel and are reported through
+///     `onFailure`; before that, a block is exposed as `startupBlockedErrno`.
 final class SocketDatagramChannel: DatagramChannel, @unchecked Sendable {
     static let preferredReceiveBuffer: Int32 = 4 * 1024 * 1024
     static let minimumReceiveBuffer: Int32 = 256 * 1024
@@ -349,7 +379,7 @@ final class SocketDatagramChannel: DatagramChannel, @unchecked Sendable {
         while true {
             let n = buf.withUnsafeMutableBytes { recv(s, $0.baseAddress, $0.count, 0) }
             if n > 0 {
-                lock.lock(); errorPolicy.noteSuccess(); let cb = onReceive; lock.unlock()
+                lock.lock(); errorPolicy.noteReceive(); let cb = onReceive; lock.unlock()
                 cb?(Data(buf[0..<n]))
                 continue
             }
@@ -382,22 +412,43 @@ final class SocketDatagramChannel: DatagramChannel, @unchecked Sendable {
         lock.lock(); errorPolicy.noteSuccess(); lock.unlock()
     }
 
+    /// A datagram arrived (internal for tests; `drain` does this).
+    func noteSocketReceive() {
+        lock.lock(); errorPolicy.noteReceive(); lock.unlock()
+    }
+
+    var startupBlockedErrno: Int32? {
+        lock.lock(); defer { lock.unlock() }; return errorPolicy.startupBlocked
+    }
+
+    /// (send, receive) errors counted so far (tests, diagnostics).
+    var errorCounts: (send: Int, receive: Int) {
+        lock.lock(); defer { lock.unlock() }; return (sendErrors, receiveErrors)
+    }
+
     /// The error path of `send` / `drain` (internal for tests): counts and
     /// rate-limits the log, and stops the flow when the policy says fatal.
     /// Returns false once the channel has failed.
     @discardableResult
     func noteSocketError(_ e: Int32, op: String, at now: ContinuousClock.Instant = .now) -> Bool {
         lock.lock()
-        let k: Int
-        if op == "send" { sendErrors += 1; k = sendErrors } else { receiveErrors += 1; k = receiveErrors }
+        // Refusals before the server sends are expected (its sockets are not up).
+        let counts = !(e == ECONNREFUSED && !errorPolicy.established)
+        if counts { if op == "send" { sendErrors += 1 } else { receiveErrors += 1 } }
+        let k = op == "send" ? sendErrors : receiveErrors
         let verdict = errorPolicy.note(error: e, at: now)
+        let established = errorPolicy.established
         lock.unlock()
         switch verdict {
         case .fatal:
             fail("\(op): \(String(cString: strerror(e))) (\(e))")
             return false
         case .transient(let log):
-            if log { emit("\(op) error #\(k): \(String(cString: strerror(e))) (\(e))") }
+            if log {
+                let what = counts ? "error #\(k)" : "error (server not sending yet)"
+                let phase = established ? "" : " [startup, transient]"
+                emit("\(op) \(what): \(String(cString: strerror(e))) (\(e))\(phase)")
+            }
             return true
         }
     }

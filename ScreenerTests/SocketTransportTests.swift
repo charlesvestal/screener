@@ -132,8 +132,9 @@ final class SocketTransportTests: XCTestCase {
         for e in [ENOTCONN, EBADF, ENOTSOCK, EADDRNOTAVAIL] {
             XCTAssertTrue(SocketErrorPolicy.isFatal(e), "\(e)")
         }
-        // Routing errors are fatal only once they persist (SocketErrorPolicy).
-        for e in [EAGAIN, EINTR, ECONNREFUSED, ENOBUFS, ENETDOWN, EHOSTUNREACH, ENETUNREACH, EHOSTDOWN] {
+        // Routing errors (and EPIPE / EPERM / EACCES) are fatal only once they persist.
+        for e in [EAGAIN, EINTR, ECONNREFUSED, ENOBUFS, ENETDOWN, EHOSTUNREACH, ENETUNREACH, EHOSTDOWN,
+                  EPIPE, EPERM, EACCES] {
             XCTAssertFalse(SocketErrorPolicy.isFatal(e), "\(e)")
         }
     }
@@ -142,6 +143,7 @@ final class SocketTransportTests: XCTestCase {
         let t0 = ContinuousClock.now
         func at(_ ms: Int) -> ContinuousClock.Instant { t0.advanced(by: .milliseconds(ms)) }
         var p = SocketErrorPolicy()
+        p.noteReceive()   // the stream is up (before that, see the startup test)
         XCTAssertEqual(p.note(error: EHOSTUNREACH, at: at(0)), .transient(log: true))
         XCTAssertEqual(p.note(error: ENETDOWN, at: at(500)), .transient(log: true))       // other errno: own limit
         XCTAssertEqual(p.note(error: EHOSTUNREACH, at: at(900)), .transient(log: false))  // ≤ 1 log/s
@@ -163,6 +165,79 @@ final class SocketTransportTests: XCTestCase {
         XCTAssertEqual(r.note(error: ECONNREFUSED, at: at(10_200)), .transient(log: false))
     }
 
+    /// iPad, first launch: the very first punch hit EPIPE while iOS held the
+    /// Local Network prompt. Before the server has sent anything, EPIPE,
+    /// routing errors and EPERM/EACCES (privacy denial) never fail the flow;
+    /// they are remembered as `startupBlocked` until a send or receive works.
+    func testStartupErrorsAreTransientUntilTheStreamIsEstablished() {
+        let t0 = ContinuousClock.now
+        func at(_ ms: Int) -> ContinuousClock.Instant { t0.advanced(by: .milliseconds(ms)) }
+        for e in [EPIPE, EHOSTUNREACH, ENETUNREACH, EHOSTDOWN, ENETDOWN, EPERM, EACCES] {
+            var p = SocketErrorPolicy()
+            XCTAssertEqual(p.note(error: e, at: at(0)), .transient(log: true), "\(e)")
+            XCTAssertEqual(p.note(error: e, at: at(500)), .transient(log: false), "\(e)")
+            for ms in stride(from: 1_000, through: 60_000, by: 1_000) {
+                XCTAssertNotEqual(p.note(error: e, at: at(ms)), .fatal, "\(e) at \(ms) ms")
+            }
+            XCTAssertEqual(p.startupBlocked, e, "\(e)")
+            p.noteSuccess()
+            XCTAssertNil(p.startupBlocked, "a working send clears the block")
+        }
+    }
+
+    /// Once datagrams have arrived, EPIPE is a transient routing-class error:
+    /// fatal only after > 3 s with no successful send or receive.
+    func testEPIPEAfterEstablishmentFollowsTheRoutingGrace() {
+        let t0 = ContinuousClock.now
+        func at(_ ms: Int) -> ContinuousClock.Instant { t0.advanced(by: .milliseconds(ms)) }
+        var p = SocketErrorPolicy()
+        p.noteReceive()
+        XCTAssertTrue(p.established)
+        XCTAssertEqual(p.note(error: EPIPE, at: at(0)), .transient(log: true))
+        XCTAssertEqual(p.note(error: EPIPE, at: at(2_900)), .transient(log: true))
+        XCTAssertNil(p.startupBlocked, "only a pre-stream condition")
+        XCTAssertEqual(p.note(error: EPIPE, at: at(3_100)), .fatal)
+        var q = SocketErrorPolicy()
+        q.noteReceive()
+        XCTAssertEqual(q.note(error: EACCES, at: at(0)), .transient(log: true))
+        XCTAssertEqual(q.note(error: EACCES, at: at(3_100)), .fatal)
+    }
+
+    /// ECONNREFUSED (ICMP port-unreachable while the server has not bound
+    /// yet) is logged on the 1st and every 50th occurrence only.
+    func testConnectionRefusedIsLoggedFirstAndEveryFiftieth() {
+        let t0 = ContinuousClock.now
+        var p = SocketErrorPolicy()
+        var logged: [Int] = []
+        for i in 1...120 {
+            // 2 s apart: the per-second limit must not be what lets it through.
+            if case .transient(true) = p.note(error: ECONNREFUSED, at: t0.advanced(by: .seconds(2 * i))) { logged.append(i) }
+        }
+        XCTAssertEqual(logged, [1, 50, 100])
+    }
+
+    /// The channel does not count ECONNREFUSED as an error before the server
+    /// starts sending, and EPIPE on the first punch leaves the flow alive.
+    func testChannelStartupEPIPEIsTransientAndRefusalsAreNotCountedBeforeTheStream() async throws {
+        let c = SocketDatagramChannel(label: "s", remoteHost: "127.0.0.1", remotePort: 47_965, localHost: "127.0.0.1", localPort: 47_964)
+        let events = Inbox(), failures = Inbox()
+        try c.start(onReceive: { _ in }, onEvent: events.event, onFailure: failures.event)
+        let t0 = ContinuousClock.now
+        func at(_ ms: Int) -> ContinuousClock.Instant { t0.advanced(by: .milliseconds(ms)) }
+        XCTAssertTrue(c.noteSocketError(EPIPE, op: "send", at: at(0)))
+        XCTAssertTrue(c.noteSocketError(EPERM, op: "send", at: at(5_000)))
+        XCTAssertEqual(c.startupBlockedErrno, EPERM)
+        XCTAssertEqual(failures.eventSnapshot, [])
+        for i in 0..<10 { c.noteSocketError(ECONNREFUSED, op: "receive", at: at(6_000 + i)) }
+        XCTAssertEqual(c.errorCounts.receive, 0, "refusals before the stream are not errors")
+        c.noteSocketReceive()
+        XCTAssertNil(c.startupBlockedErrno)
+        c.noteSocketError(ECONNREFUSED, op: "receive", at: at(7_000))
+        XCTAssertEqual(c.errorCounts.receive, 1)
+        XCTAssertEqual(failures.eventSnapshot, [])
+        await c.cancel()
+    }
+
     /// The channel's error path: a routing error stops the flow only after
     /// 3 s without a successful send/receive; EBADF stops it at once.
     func testChannelErrorPathTransientThenFatal() async throws {
@@ -171,6 +246,7 @@ final class SocketTransportTests: XCTestCase {
         try c.start(onReceive: { _ in }, onEvent: events.event, onFailure: failures.event)
         let t0 = ContinuousClock.now
         func at(_ ms: Int) -> ContinuousClock.Instant { t0.advanced(by: .milliseconds(ms)) }
+        c.noteSocketReceive()   // established
         let before = events.eventSnapshot.count
         c.noteSocketError(EHOSTUNREACH, op: "send", at: at(0))
         c.noteSocketError(EHOSTUNREACH, op: "send", at: at(200))
