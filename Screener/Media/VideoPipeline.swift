@@ -14,10 +14,13 @@
 //   * decoded pictures go straight from VideoToolbox's thread to the frame
 //     store, and MediaTransport.notePublished() is called (throttled) so the
 //     SSRC-adoption stall timer follows real decoded output;
-//   * decode errors → assembler.noteDecodeError (throttled to one per 0.5 s,
-//     as vtdecode._on_decoded), whose keyframe requests are sent at once. An
-//     IRAP that fails, or an invalidated session, rebuilds the decoder (and
-//     on the first IRAP, falls back to the next output mode);
+//   * decode errors → DecoderRecoveryPolicy: assembler.noteDecodeError
+//     (gate + keyframe, throttled to one per 0.5 s as vtdecode._on_decoded),
+//     a rebuild for a failed IRAP or a session-level error, and a fallback to
+//     the next output mode only for format-unsupported errors or after 3 IRAP
+//     failures in a row in the same mode;
+//   * frames are published with the store epoch this pipeline was created
+//     under (late callbacks after a reset are dropped);
 //   * every 2 s: `video fps=… decode_ms=… tiles=[…]`.
 import CoreMedia
 import CoreVideo
@@ -37,8 +40,8 @@ actor VideoPipeline {
     private var assembler: HEVCAssembler?
     private var decoder: VideoDecoder!
     private var stopped = false
-    private var lastErrorReport: ContinuousClock.Instant?
-    private var lastRebuild: ContinuousClock.Instant?
+    private var recovery = DecoderRecoveryPolicy()
+    private var publishedAtLastFailure = 0
     private var lastStatsLog = ContinuousClock.now
     private var fed = 0
     private var dropped = 0
@@ -49,10 +52,11 @@ actor VideoPipeline {
         self.hooks = hooks
         let throttle = publishThrottle
         let weakSelf = WeakBox<VideoPipeline>()
+        let epoch = store.currentEpoch
         self.decoder = VideoDecoder { event in
             switch event {
             case .frame(let f):
-                store.publish(f)
+                store.publish(f, epoch: epoch)
                 if throttle.shouldNotify() { Task { await hooks.notePublished() } }
             case .error(let tile, let don, let status, let irap):
                 store.noteError()
@@ -126,7 +130,7 @@ actor VideoPipeline {
                     + (info.map { "profile=\($0.profileIdc) chroma=\($0.chromaFormatIdc) "
                                   + "\($0.width)x\($0.height) \($0.bitDepthLuma)-bit" } ?? ""))
                 do {
-                    try decoder.configure(vps: vps, sps: sps, pps: pps)
+                    if try decoder.configure(vps: vps, sps: sps, pps: pps) { recovery.noteModeChanged() }
                 } catch {
                     Log.video.error("video: decoder configure failed: \(error)")
                 }
@@ -150,30 +154,36 @@ actor VideoPipeline {
     /// A frame failed (from the output handler, or a synchronous submit error).
     func decodeFailed(tile: Int, don: UInt16, status: OSStatus, isIRAP: Bool) async {
         guard !stopped, let a = assembler else { return }
-        let now = ContinuousClock.now
-        if status == kVTInvalidSessionErr || isIRAP {
-            // Frames already queued on the old session fail too: one rebuild.
-            if let last = lastRebuild, now - last < .milliseconds(500) { return }
-            lastRebuild = now
-            Log.video.error("video: decode failed status=\(status) tile=\(tile) don=\(don) irap=\(isIRAP); rebuilding")
+        let published = store.totalPublished
+        let decodedSince = published > publishedAtLastFailure
+        publishedAtLastFailure = published
+        let action = recovery.decide(status: status, isIRAP: isIRAP, decodedSinceLastFailure: decodedSince,
+                                     now: .now)
+        switch action {
+        case .ignore:
+            return
+        case .requestKeyframe:
+            Log.video.error("video: decode error status=\(status) tile=\(tile) don=\(don); requesting keyframe")
+        case .rebuild:
+            Log.video.error("video: decode failed status=\(status) tile=\(tile) don=\(don) irap=\(isIRAP); "
+                            + "rebuilding (mode \(decoder.mode.map { "\($0)" } ?? "-"), "
+                            + "IRAP failures in a row: \(recovery.consecutiveIRAPFailures))")
+            do { try decoder.rebuild() } catch { Log.video.error("video: decoder rebuild failed: \(error)") }
+        case .fallBack:
+            let from = decoder.mode.map { "\($0)" } ?? "-"
+            Log.video.error("video: !!! OUTPUT MODE FALLBACK from \(from): status=\(status) tile=\(tile) "
+                            + "irap=\(isIRAP) (format unsupported, or \(DecoderRecoveryPolicy.fallbackAfterIRAPFailures) "
+                            + "IRAP failures in a row with nothing decoded) !!!")
             do {
-                // The first IRAP failing on a fresh session = this output mode
-                // cannot decode the stream (e.g. no 4:4:4 support): fall back.
-                if isIRAP && !store.hasDecoded, try decoder.fallBack() {
-                } else {
+                if try !decoder.fallBack() {
+                    Log.video.error("video: no output mode left to fall back to; rebuilding \(from)")
                     try decoder.rebuild()
                 }
             } catch {
-                Log.video.error("video: decoder rebuild failed: \(error)")
+                Log.video.error("video: decoder fallback failed: \(error)")
             }
-            lastErrorReport = now
-            await handle(a.noteDecodeError(tile: tile, don: don))
-            return
+            recovery.noteModeChanged()
         }
-        // Concealment-class error: gate + keyframe, throttled (vtdecode: 0.5 s).
-        if let last = lastErrorReport, now - last < .milliseconds(500) { return }
-        lastErrorReport = now
-        Log.video.error("video: decode error status=\(status) tile=\(tile) don=\(don); requesting keyframe")
         await handle(a.noteDecodeError(tile: tile, don: don))
     }
 

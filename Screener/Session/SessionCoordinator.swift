@@ -268,6 +268,9 @@ final class SessionCoordinator {
         media = nil
         mediaParams = nil
         serverAddress = nil
+        // New epoch: late VideoToolbox callbacks are dropped and the pixel
+        // buffers are freed (the layer keeps showing the last picture).
+        frames.reset()
         let previous = pendingTeardown
         let work = Task { @MainActor [weak self] in
             await previous?.value

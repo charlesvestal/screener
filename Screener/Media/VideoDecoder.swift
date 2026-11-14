@@ -36,6 +36,7 @@
 import CoreMedia
 import CoreVideo
 import Foundation
+import Synchronization
 import VideoToolbox
 
 /// AVCC sample framing: each NAL unit prefixed with its 4-byte big-endian length.
@@ -57,7 +58,8 @@ struct DecodedFrame: @unchecked Sendable {      // CVPixelBuffer is immutable on
     /// Submit → output handler.
     var decodeTime: Duration
     var don: UInt16
-    /// Monotonic submit counter for this decoder (survives rebuilds; DONs do not).
+    /// Monotonic submit counter, process-global (survives rebuilds and
+    /// sessions; DONs do not).
     var seq: Int
 }
 
@@ -105,7 +107,10 @@ final class VideoDecoder {
     private(set) var sessionsBuilt = 0
     /// Frames submitted since the session was (re)built.
     private(set) var submitted = 0
-    private var nextSeq = 0
+    /// Process-global, so frames of two decoders (two sessions) never compare
+    /// out of order in a shared store.
+    private static let sequence = Atomic<Int>(0)
+    static func nextSequence() -> Int { sequence.wrappingAdd(1, ordering: .relaxed).newValue }
 
     init(onEvent: @escaping @Sendable (Event) -> Void) {
         self.onEvent = onEvent
@@ -247,14 +252,14 @@ final class VideoDecoder {
     /// status (noErr when queued; the outcome arrives through `onEvent`).
     @discardableResult
     func decode(_ au: AccessUnit) -> OSStatus {
-        guard let session, let fmt = formatDescription, !au.nalUnits.isEmpty else { return kVTInvalidSessionErr }
+        if let refused = Self.precheck(hasSession: session != nil && formatDescription != nil, au: au) { return refused }
+        guard let session, let fmt = formatDescription else { return kVTInvalidSessionErr }
         guard let sample = Self.makeSample(AVCC.sample(au.nalUnits), format: fmt) else { return kVTParameterErr }
         let tile = au.tile, don = au.don, irap = au.isIDR
         let onEvent = self.onEvent
         let start = ContinuousClock.now
         submitted += 1
-        nextSeq += 1
-        let seq = nextSeq
+        let seq = Self.nextSequence()
         var infoOut = VTDecodeInfoFlags()
         let status = VTDecompressionSessionDecodeFrame(
             session, sampleBuffer: sample, flags: [._EnableAsynchronousDecompression],
@@ -268,6 +273,15 @@ final class VideoDecoder {
             }
         }
         return status
+    }
+
+    /// Why an AU cannot be submitted, or nil. No session → kVTInvalidSessionErr
+    /// (rebuild); an empty AU is a bad AU (kVTParameterErr → keyframe), never
+    /// mistaken for a dead session.
+    static func precheck(hasSession: Bool, au: AccessUnit) -> OSStatus? {
+        if au.nalUnits.isEmpty { return kVTParameterErr }
+        if !hasSession { return kVTInvalidSessionErr }
+        return nil
     }
 
     static func makeSample(_ bytes: Data, format: CMFormatDescription) -> CMSampleBuffer? {

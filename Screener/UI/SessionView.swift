@@ -58,7 +58,7 @@ struct ShareLogButton: View {
     }
 }
 
-/// MTKView driven by MetalRenderer at the screen's maximum refresh rate.
+/// MTKView drawn on demand by MetalRenderer (redrawn when a picture arrives).
 struct VideoView: UIViewRepresentable {
     let store: VideoFrameStore
 
@@ -66,19 +66,10 @@ struct VideoView: UIViewRepresentable {
         var renderer: MetalRenderer?
     }
 
-    final class MaxRateMTKView: MTKView {
-        override func didMoveToWindow() {
-            super.didMoveToWindow()
-            if let screen = window?.windowScene?.screen {
-                preferredFramesPerSecond = screen.maximumFramesPerSecond
-            }
-        }
-    }
-
     func makeCoordinator() -> Coordinator { Coordinator() }
 
     func makeUIView(context: Context) -> MTKView {
-        let view = MaxRateMTKView(frame: .zero)
+        let view = MTKView(frame: .zero)
         view.backgroundColor = .black
         if let renderer = MetalRenderer(store: store) {
             renderer.attach(to: view)
@@ -92,6 +83,7 @@ struct VideoView: UIViewRepresentable {
     static func dismantleUIView(_ view: MTKView, coordinator: Coordinator) {
         view.isPaused = true
         view.delegate = nil
+        coordinator.renderer?.detach()
         coordinator.renderer = nil
     }
 }

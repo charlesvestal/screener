@@ -5,9 +5,19 @@
 // Draws the latest decoded picture of every tile (VideoFrameStore) into an
 // MTKView: each tile's CVPixelBuffer is wrapped as two Metal textures through
 // a CVMetalTextureCache (no copies) and drawn as one strip of the
-// aspect-fitted canvas (CompositeLayout). Driven by the MTKView at the
-// screen's maximum refresh rate; a vsync with nothing new draws nothing (the
-// layer keeps showing the last frame).
+// aspect-fitted canvas (CompositeLayout).
+//
+// Drawing is on demand (power): the MTKView is paused with
+// enableSetNeedsDisplay, and the frame store's `onChange` asks for a redraw
+// through a RedrawCoalescer (at most one pending main-queue hop, however many
+// tiles publish). A static screen therefore costs no GPU work and no
+// drawables. A redraw with nothing drawable marks the version seen and keeps
+// the last presented picture on the layer (e.g. behind "Reconnecting…").
+//
+// The CAMetalLayer's colorspace is set explicitly from the pixel buffers'
+// colour-primaries attachment: Display P3 → displayP3, BT.2020 → itur_2020,
+// BT.709 or absent → sRGB (709 and sRGB share primaries, and desktop pixels
+// are sRGB-encoded, so the sRGB transfer curve is the faithful one).
 //
 // Colour: the YCbCr matrix comes from the pixel buffer's attachment, which
 // VideoToolbox fills from the stream's VUI (Apple's stream: ITU_R_709_2);
@@ -92,6 +102,8 @@ final class MetalRenderer: NSObject, MTKViewDelegate {
     private var lastLayout: CompositeLayout?
     private var lastColorDescription = ""
     private var droppedFormatLogged = false
+    private var layerColorSpace: CFString?
+    private var coalescer: RedrawCoalescer?
     private(set) var framesDrawn = 0
     /// Called on the main actor after the first picture is presented.
     var onFirstDraw: (() -> Void)?
@@ -127,18 +139,47 @@ final class MetalRenderer: NSObject, MTKViewDelegate {
         super.init()
     }
 
-    /// Configures `view` for this renderer.
+    /// Configures `view` for this renderer: on-demand drawing, redrawn when
+    /// the store changes.
     func attach(to view: MTKView) {
         view.device = device
         view.colorPixelFormat = Self.colorPixelFormat
         view.framebufferOnly = true
         view.clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 1)
-        view.enableSetNeedsDisplay = false
-        view.isPaused = false
+        view.enableSetNeedsDisplay = true
+        view.isPaused = true
         view.delegate = self
+        setLayerColorSpace(CGColorSpace.sRGB, on: view)
+        let coalescer = RedrawCoalescer { [weak view] in view?.setNeedsDisplay() }
+        self.coalescer = coalescer
+        store.setOnChange(owner: self) { coalescer.signal() }
+        view.setNeedsDisplay()
     }
 
-    nonisolated func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {}
+    /// Stops redraw requests (the view is going away).
+    func detach() {
+        store.clearOnChange(owner: self)
+        coalescer = nil
+    }
+
+    nonisolated func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {
+        MainActor.assumeIsolated { view.setNeedsDisplay() }
+    }
+
+    /// Layer colorspace for the stream's colour-primaries attachment (see the header).
+    nonisolated static func colorSpaceName(primaries: String?) -> CFString {
+        let p3 = [kCVImageBufferColorPrimaries_P3_D65, kCVImageBufferColorPrimaries_DCI_P3].map { $0 as String }
+        if let primaries, p3.contains(primaries) { return CGColorSpace.displayP3 }
+        if primaries == (kCVImageBufferColorPrimaries_ITU_R_2020 as String) { return CGColorSpace.itur_2020 }
+        return CGColorSpace.sRGB
+    }
+
+    private func setLayerColorSpace(_ name: CFString, on view: MTKView) {
+        guard name != layerColorSpace, let layer = view.layer as? CAMetalLayer else { return }
+        layerColorSpace = name
+        layer.colorspace = CGColorSpace(name: name)
+        Log.video.info("M4 layer colorspace: \(name)")
+    }
 
     nonisolated func draw(in view: MTKView) {
         MainActor.assumeIsolated { drawFrame(in: view) }
@@ -148,12 +189,25 @@ final class MetalRenderer: NSObject, MTKViewDelegate {
         let size = view.drawableSize
         let resized = size != lastDrawableSize
         guard let snap = store.snapshot(ifNewerThan: resized ? nil : lastVersion) else { return }
-        guard !snap.frames.isEmpty, let drawable = view.currentDrawable,
+        guard let ref = snap.frames[0] ?? snap.frames.first?.value else {
+            // Nothing drawable (new session, reconnecting): keep the last
+            // picture on the layer and don't grab a drawable for this version.
+            lastVersion = snap.version
+            lastDrawableSize = size
+            return
+        }
+        let primaries = CVBufferCopyAttachment(ref, kCVImageBufferColorPrimariesKey, nil) as? String
+        setLayerColorSpace(Self.colorSpaceName(primaries: primaries), on: view)
+        guard let drawable = view.currentDrawable,
               let pass = view.currentRenderPassDescriptor,
               let cmd = queue.makeCommandBuffer() else { return }
         pass.colorAttachments[0].loadAction = .clear
         pass.colorAttachments[0].clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 1)
-        guard encode(snap, into: pass, size: size, commandBuffer: cmd) else { return }
+        guard encode(snap, into: pass, size: size, commandBuffer: cmd) else {
+            lastVersion = snap.version
+            lastDrawableSize = size
+            return
+        }
         cmd.present(drawable)
         cmd.commit()
         CVMetalTextureCacheFlush(textureCache, 0)
@@ -234,6 +288,31 @@ final class MetalRenderer: NSObject, MTKViewDelegate {
             kCFAllocatorDefault, textureCache, buffer, nil, format,
             CVPixelBufferGetWidthOfPlane(buffer, plane), CVPixelBufferGetHeightOfPlane(buffer, plane), plane, &out)
         return status == kCVReturnSuccess ? out : nil
+    }
+}
+
+/// Turns any number of `signal()`s (from any thread) into at most one pending
+/// main-queue call of `fire`. A signal that arrives while `fire` runs
+/// schedules another call, so no change is ever missed.
+final class RedrawCoalescer: @unchecked Sendable {   // `pending` behind `lock`
+    private let lock = NSLock()
+    private var pending = false
+    private let fire: @MainActor () -> Void
+    private(set) var fired = 0
+
+    init(fire: @escaping @MainActor () -> Void) { self.fire = fire }
+
+    func signal() {
+        let schedule = lock.withLock { () -> Bool in
+            if pending { return false }
+            pending = true
+            return true
+        }
+        guard schedule else { return }
+        DispatchQueue.main.async { [self] in
+            lock.withLock { pending = false; fired += 1 }
+            MainActor.assumeIsolated { fire() }
+        }
     }
 }
 
