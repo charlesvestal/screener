@@ -89,11 +89,16 @@
     {
       "id": 9,
       "subject": "Task 9: Media offer + MediaStreamOptions (0x1c)",
-      "status": "pending",
+      "status": "completed",
       "description": "**Goal:** Build the AVCMediaStreamNegotiator audio/video offer blobs and the `0x1c` offer message, and parse the server's `0x1c` answer (canvas size, SSRCs), byte-identical to the reference.\n\n**Files:**\n- Create: `Screener/Protocol/MediaOffer.swift`\n- Test: `ScreenerTests/MediaOfferTests.swift`\n\n**Acceptance Criteria:**\n- [ ] `MediaOffer.create(sessionID:timestamp:callID:audioEnabled:)` \u2192 `(audio: Data, video: Data)` equals fixture `audio_offer`/`video_offer` given the fixture's fixed dynamic values (port `create_offers`, `_build_mediablob`, `_build_remote_endpoint_info`, `_build_audio_f9_entry`, protobuf helpers, plist + zlib framing). HEVC only, with `tilesPerFrame = 4`.\n- [ ] `MediaStreamOptions.build(keys:offers:uuid:flags:)` equals fixture `msg_1c` (port `negotiation.build_0x1c`; flags are little-endian at +0x06 per RFC \u00a710.3)\n- [ ] `MediaStreamOptions.parseAnswer(_:)` \u2192 `(canvasWidth, canvasHeight, tiles)` matches `extract_canvas_dims` on the fixture answer\n- [ ] `NegotiationKeys.random()` produces 6 \u00d7 46-byte blobs from `SecureRandom`\n\n**Verify:** `xcodebuild test ... -only-testing:ScreenerTests/MediaOfferTests` \u2192 `** TEST SUCCEEDED **`\n\n```json:metadata\n{\"files\": [\"Screener/Protocol/MediaOffer.swift\", \"ScreenerTests/MediaOfferTests.swift\"], \"verifyCommand\": \"`xcodebuild test ... -only-testing:ScreenerTests/MediaOfferTests` \\u2192 `** TEST SUCCEEDED **`\", \"acceptanceCriteria\": [\"`MediaOffer.create(sessionID:timestamp:callID:audioEnabled:)` \\u2192 `(audio: Data, video: Data)` equals fixture `audio_offer`/`video_offer` given the fixture's fixed dynamic values (port `create_offers`, `_build_mediablob`, `_build_remote_endpoint_info`, `_build_audio_f9_entry`, protobuf helpers, plist + zlib framing). HEVC only, with `tilesPerFrame = 4`.\", \"`MediaStreamOptions.build(keys:offers:uuid:flags:)` equals fixture `msg_1c` (port `negotiation.build_0x1c`; flags are little-endian at +0x06 per RFC \\u00a710.3)\", \"`MediaStreamOptions.parseAnswer(_:)` \\u2192 `(canvasWidth, canvasHeight, tiles)` matches `extract_canvas_dims` on the fixture answer\", \"`NegotiationKeys.random()` produces 6 \\u00d7 46-byte blobs from `SecureRandom`\"], \"modelTier\": \"standard\"}\n```",
       "blockedBy": [
         1,
         2
+      ],
+      "followUps": [
+        "parseAnswer: cap scan work on hostile input (single backward trailer search / max payload)",
+        "build(): precondition on UInt16 sizes instead of truncatingIfNeeded",
+        "BinaryPlist: comment Int64 range limitation"
       ]
     },
     {
@@ -240,5 +245,5 @@
       ]
     }
   ],
-  "lastUpdated": "2026-11-14T12:18:30.684053"
+  "lastUpdated": "2026-11-14T12:44:33.431540"
 }

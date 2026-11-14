@@ -1099,7 +1099,7 @@ final class ByteStreamTests: XCTestCase {
 - [ ] `MediaOffer.create(sessionID:timestamp:callID:audioEnabled:)` → `(audio: Data, video: Data)` equals fixture `audio_offer`/`video_offer` given the fixture's fixed dynamic values (port `create_offers`, `_build_mediablob`, `_build_remote_endpoint_info`, `_build_audio_f9_entry`, protobuf helpers, plist + zlib framing). HEVC only, with `tilesPerFrame = 4`.
 - [ ] `MediaStreamOptions.build(keys:offers:uuid:flags:)` equals fixture `msg_1c` (port `negotiation.build_0x1c`). **Flags at +0x06 are written big-endian (`00 00 00 07`), as the reference does deliberately (see its comment in `negotiation.py` ~L196). This contradicts RFC §10.3's little-endian claim; the reference/fixture is authoritative.**
 - [ ] `MediaStreamOptions.parseAnswer(_:)` → `(canvasWidth, canvasHeight, tiles)` matches `extract_canvas_dims` on the fixture answer
-- [ ] `NegotiationKeys.random()` produces 6 × 46-byte blobs from `SecureRandom`
+- [ ] `NegotiationKeys.random()` produces **4** × 46-byte blobs from `SecureRandom` (audioKeyV/S, videoKeyV/S; the plan originally said 6, but the reference and the 0x1c layout have 4)
 
 **Verify:** `xcodebuild test ... -only-testing:ScreenerTests/MediaOfferTests` → `** TEST SUCCEEDED **`
 
@@ -1225,7 +1225,7 @@ Port the ROC guessing (`decrypt`'s candidate list), `_update_state`, the RTP hea
 
 **Acceptance Criteria:**
 - [ ] RTCP builders match `rtcp.json` (`firLegacy`, `fir`, `pli`, `nack`, `receiverReport`, `appLTR`)
-- [ ] `MediaTransport` opens `NWConnection(host, port: P+1, using: .udp)` for video and `P` for audio. It uses the `key2` blobs for receive decryption and `key1` for send (RFC §10.3). It distinguishes RTCP (PT 200–207 in the 2nd byte & 0x7f range 72–79) from RTP and routes RTCP to `SRTCPDecryptor`.
+- [ ] `MediaTransport` opens `NWConnection(host, port: P+1, using: .udp)` for video and `P` for audio. It decrypts received media with the server→viewer **`S`** blobs (`videoKeyS` on P+1, `audioKeyS` on P) and protects what it sends (keepalive/RTCP) with the viewer→server **`V`** blobs (`videoKeyV`/`audioKeyV`); see reference `negotiation.py:818`. It distinguishes RTCP (PT 200–207 in the 2nd byte & 0x7f range 72–79) from RTP and routes RTCP to `SRTCPDecryptor`.
 - [ ] It sends the keepalive the reference sends (port the keepalive logic from `session.py`: search for `SRTPEncryptor` usage) and periodic RRs, using the reference cadence
 - [ ] `requestKeyframe(ssrc:)` sends the same FIR variant the reference uses by default
 - [ ] SSRC-group adoption: track the 4-consecutive-SSRC video group with the most packets (port `get_primary_ssrc_group` / `forget_ssrcs_except` logic) and expose `activeVideoSSRCs: [UInt32]` sorted (tile order)
@@ -1281,6 +1281,7 @@ Port the ROC guessing (`decrypt`'s candidate list), `_update_state`, the RTP hea
 - Modify: `Screener/UI/ConnectSheet.swift` (on success, present `SessionView` full-screen)
 
 **Acceptance Criteria:**
+- [ ] Codec guard: the offer advertises both an AVC bank and an HEVC bank, and the 0x1c answer has no field saying which one the server picked. Check the first parameter-set NAL. If it isn't HEVC (no type 32/33/34 VPS/SPS/PPS, e.g. an H.264 SPS), fail loudly with a clear log + error ("server chose H.264") instead of feeding garbage to VideoToolbox.
 - [ ] `VideoDecoder` builds a `CMVideoFormatDescription` from VPS/SPS/PPS (`CMVideoFormatDescriptionCreateFromHEVCParameterSets`). It creates a `VTDecompressionSession` requesting `kCVPixelFormatType_444YpCbCr8BiPlanarFullRange` and IOSurface/Metal-compatible buffers. It decodes AVCC-framed (4-byte length) samples, and rebuilds the session and asks for a keyframe on `kVTVideoDecoderBadDataErr` or when the format changes.
 - [ ] The decoder is fed every tile's AUs. Decoded output is stored per tile, and the renderer composites the 4 strips vertically in SSRC order (RFC §10.7). If VideoToolbox outputs the full picture rather than strips, render it directly; log which case occurs.
 - [ ] `MetalRenderer` converts bi-planar 4:4:4 full-range YCbCr to RGB in a fragment shader (BT.709 matrix, unless the stream's color metadata says otherwise; log the metadata), via `CVMetalTextureCache`. It aspect-fits into the view and is driven by `MTKView` at the display's max refresh rate.
