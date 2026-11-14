@@ -40,6 +40,17 @@
 // session view stays up with "Reconnecting…" over the last picture until the
 // resumed session decodes. Errors reach the UI only through
 // UserFacingError.message (never raw errno text).
+//
+// Closing (teardown): the TCP control connection is closed FIRST and its
+// close awaited (FIN out, NWConnection `.cancelled`, capped at
+// `Policy.controlCloseTimeout`), then the media sockets. On backgrounding
+// this is what the UIApplication background task waits for: the Mac must see
+// the close before iOS suspends us, or it keeps sharing (display privacy on).
+//
+// First picture: once `.connected`, a picture must decode within
+// `Policy.firstFrameDeadline` (a keyframe is requested at
+// `firstFrameKeyframeAfter`), else the session fails with
+// `noPictureMessage`; "Connecting…" / "Reconnecting…" never stays up forever.
 import CoreGraphics
 import CoreVideo
 import Observation
@@ -69,6 +80,12 @@ final class SessionCoordinator {
     struct Policy: Sendable {
         var burstRetryAttempts = 3                       // _BURST_RETRY_ATTEMPTS
         var burstRetrySleep: Duration = .milliseconds(800) // _BURST_RETRY_SLEEP_S
+        /// After `.connected`: request a keyframe if no picture yet...
+        var firstFrameKeyframeAfter: Duration = .seconds(5)
+        /// ...and fail the session if there is still none.
+        var firstFrameDeadline: Duration = .seconds(10)
+        /// Longest wait for the TCP close to go out before closing media anyway.
+        var controlCloseTimeout: Duration = .seconds(1)
     }
 
     /// Injection points for tests.
@@ -137,7 +154,12 @@ final class SessionCoordinator {
     private var mediaFailureTask: Task<Void, Never>?
     private var pendingTeardown: Task<Void, Never>?
     private var videoTask: Task<Void, Never>?
+    private var firstFrameTask: Task<Void, Never>?
     private var mediaConsumers: [MediaConsumer] = []
+    /// `generation` as of the last `startVideo`, readable from the frame
+    /// store's callback thread: a first frame is credited only to the session
+    /// that was current when it was decoded.
+    private let videoGeneration = LockedValue(0)
 
     /// Server IPv4s with a live session in this process: the HP ports are fixed
     /// (P/P+1 on both ends), so a second session to the same server would
@@ -147,17 +169,50 @@ final class SessionCoordinator {
     init(policy: Policy = Policy(), seams: Seams = .live) {
         self.policy = policy
         self.seams = seams
+        let videoGeneration = videoGeneration
         frames.onFirstFrame = { [weak self] pb in
+            let gen = videoGeneration.value
             Log.video.info("M4 first frame \(CVPixelBufferGetWidth(pb))x\(CVPixelBufferGetHeight(pb)) "
                            + "pixfmt=\(CVPixelBufferGetPixelFormatType(pb).fourCC)")
-            Task { @MainActor in
-                self?.hasFirstFrame = true
-                self?.isReconnecting = false
-            }
+            Task { @MainActor in self?.firstFrameArrived(gen) }
         }
     }
 
     var isBusy: Bool { state == .connecting }
+
+    /// A picture decoded for session `gen`; ignored if that session is gone
+    /// (a late hop must not clear "Reconnecting…" for the next one).
+    private func firstFrameArrived(_ gen: Int) {
+        guard gen == generation else { return }
+        hasFirstFrame = true
+        isReconnecting = false
+        firstFrameTask?.cancel(); firstFrameTask = nil
+    }
+
+    static let noPictureMessage = "Connected, but no picture arrived from the Mac."
+
+    /// Session `gen` is connected: a picture must follow (see the header).
+    private func startFirstFrameDeadline(_ gen: Int, _ media: MediaTransport) {
+        firstFrameTask?.cancel()
+        guard !hasFirstFrame else { return }
+        let nudge = policy.firstFrameKeyframeAfter, deadline = policy.firstFrameDeadline
+        firstFrameTask = Task { [weak self] in
+            if nudge < deadline {
+                try? await Task.sleep(for: nudge)
+                guard let self, !Task.isCancelled, self.isCurrent(gen), !self.hasFirstFrame else { return }
+                let ssrcs = await media.activeVideoSSRCs
+                var sent = 0
+                for ssrc in ssrcs {
+                    if await media.requestKeyframe(ssrc: ssrc) { sent += 1 }
+                }
+                Log.app.error("no picture \(nudge.ms) ms after connecting; requested a keyframe (\(sent)/\(ssrcs.count) tiles)")
+            }
+            try? await Task.sleep(for: deadline - min(nudge, deadline))
+            guard let self, !Task.isCancelled, self.isCurrent(gen), !self.hasFirstFrame else { return }
+            Log.app.error("no picture \(deadline.ms) ms after connecting; giving up")
+            await self.end(gen, .failed(Self.noPictureMessage))
+        }
+    }
 
     /// Registers a consumer for every future session's MediaTransport.
     func addMediaConsumer(_ consumer: @escaping MediaConsumer) {
@@ -215,7 +270,7 @@ final class SessionCoordinator {
         }
         guard lifecycle.didEnterBackground(session: status) == .suspend else { return }
         Log.app.info("app backgrounded: closing the session (will reconnect when active)")
-        await suspend()
+        await suspend(background: true)
     }
 
     /// The scene is active again: resume a suspended session.
@@ -228,17 +283,24 @@ final class SessionCoordinator {
         }
     }
 
-    private func suspend() async {
+    private func suspend(background: Bool = false) async {
         generation += 1
         connectTask?.cancel()
         connectTask = nil
         state = .suspended
         isReconnecting = true
-        await teardown()
+        await teardown(background: background)
     }
 
     private func reconnect() async {
         guard let r = lastRequest else { return }
+        // A reconnect scheduled by a failure may run after the app left the
+        // foreground: never connect from the background; resume on activation.
+        guard lifecycle.isForeground else {
+            Log.app.info("reconnect deferred: app not in the foreground")
+            lifecycle.deferReconnect()
+            return
+        }
         Log.app.info("reconnecting to \(r.host)")
         isReconnecting = true
         await begin(r)
@@ -259,7 +321,10 @@ final class SessionCoordinator {
             await suspend()
             Task { [weak self] in await self?.reconnect() }
         case .none:
-            await end(gen, .failed(UserFacingError.message(for: error)))
+            // A reset before the session was up is not "the Mac ended the session".
+            let message = kind == .peerEnded && !wasConnected
+                ? UserFacingError.lostMessage : UserFacingError.message(for: error)
+            await end(gen, .failed(message))
         }
     }
 
@@ -325,12 +390,13 @@ final class SessionCoordinator {
                                                ourAudioSSRC: MediaOffer.extractSSRC(params.audioOffer, isVideo: false)))
             } catch {
                 guard isCurrent(gen) else { return }
-                // A handshake that died while our UDP sends were blocked is
-                // almost always Local Network privacy, whatever TCP reported.
+                // A handshake that died while our UDP sends were blocked:
+                // the UDP errno says more than TCP's (EPERM / EACCES: Local
+                // Network denied; routing errors: the Mac isn't reachable).
                 if let blocked = await media.startupBlockedErrno {
                     guard isCurrent(gen) else { return }
                     Log.app.error("control start failed (\(error)) while UDP sends are blocked (errno \(blocked))")
-                    return await end(gen, .failed(MediaTransportError.localNetworkMessage))
+                    return await fail(gen, MediaTransportError.localNetworkBlocked(errno: blocked))
                 }
                 guard isCurrent(gen) else { return }
                 return await fail(gen, error)
@@ -346,6 +412,7 @@ final class SessionCoordinator {
                 frames.configure(canvas: CGSize(width: params.canvas.width, height: params.canvas.height))
                 startInput(session, params)
                 state = .connected(canvasWidth: params.canvas.width, canvasHeight: params.canvas.height)
+                startFirstFrameDeadline(gen, media)
                 return
             case .failed(let error):
                 return await fail(gen, error)
@@ -376,6 +443,8 @@ final class SessionCoordinator {
     private func end(_ gen: Int, _ final: State) async {
         guard gen == generation else { return }
         isReconnecting = false
+        // Nothing will reconnect with them: drop the credentials.
+        if !lifecycle.pendingReconnect { lastRequest = nil }
         generation += 1
         connectTask?.cancel()
         connectTask = nil
@@ -383,10 +452,13 @@ final class SessionCoordinator {
         await teardown()
     }
 
-    /// Detaches everything synchronously, then closes it; the returned await
-    /// completes when the sockets are closed. A later connect waits for it.
-    private func teardown() async {
+    /// Detaches everything synchronously, then closes it: the TCP control
+    /// connection first (its close awaited, capped at
+    /// `policy.controlCloseTimeout`), then the media sockets. The returned
+    /// await completes when all of it is closed. A later connect waits for it.
+    private func teardown(background: Bool = false) async {
         eventsTask?.cancel(); eventsTask = nil
+        firstFrameTask?.cancel(); firstFrameTask = nil
         statsTask?.cancel(); statsTask = nil
         mediaFailureTask?.cancel(); mediaFailureTask = nil
         videoTask?.cancel(); videoTask = nil
@@ -402,14 +474,26 @@ final class SessionCoordinator {
         // buffers are freed (the layer keeps showing the last picture).
         frames.reset()
         let previous = pendingTeardown
+        let closeTimeout = policy.controlCloseTimeout
         let work = Task { @MainActor [weak self] in
             await previous?.value
+            // TCP first: the Mac ends the session (and display privacy) when
+            // it sees this close, so it must go out before anything else.
+            if let c {
+                let started = ContinuousClock.now
+                let confirmed = await c.closeAndWait(timeout: closeTimeout)
+                let what = background ? "background close" : "control close"
+                if confirmed {
+                    Log.app.info("\(what) confirmed (\((ContinuousClock.now - started).ms)ms)")
+                } else {
+                    Log.app.error("\(what) timed out")
+                }
+            }
             if let m {
                 let s = await m.stats
                 self?.mediaStats = s
                 await m.close()
             }
-            if let c { await c.close() }
             if let server { Self.activeServers.remove(server) }
         }
         pendingTeardown = work
@@ -474,6 +558,7 @@ final class SessionCoordinator {
     /// The single consumer of `media.video` for this session (see the header).
     private func startVideo(_ media: MediaTransport, _ gen: Int) {
         frames.reset()
+        videoGeneration.value = gen
         hasFirstFrame = false
         let hooks = VideoPipeline.Hooks(
             activeSSRCs: { await media.activeVideoSSRCs },
@@ -535,5 +620,16 @@ final class SessionCoordinator {
         let logical = screen?.bounds.size ?? CGSize(width: 1376, height: 1032)
         let scale = screen?.nativeScale ?? 2
         return (logical, CGSize(width: logical.width * scale, height: logical.height * scale))
+    }
+}
+
+/// A lock-protected value shared with non-isolated callbacks.
+final class LockedValue<Value: Sendable>: @unchecked Sendable {
+    private let lock = NSLock()
+    private var _value: Value
+    init(_ value: Value) { _value = value }
+    var value: Value {
+        get { lock.lock(); defer { lock.unlock() }; return _value }
+        set { lock.lock(); _value = newValue; lock.unlock() }
     }
 }

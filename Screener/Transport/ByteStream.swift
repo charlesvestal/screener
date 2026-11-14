@@ -45,6 +45,20 @@ protocol ByteStream: Sendable {
     /// `MemoryPipe`, its peer) fail with `TransportError.closed` once any already
     /// buffered data has been drained.
     func close()
+    /// Closes the stream like `close()` and waits, at most `timeout`, until the
+    /// close has actually gone out (for TCP: NWConnection reached `.cancelled`,
+    /// i.e. the FIN was handed to the network). Returns false on timeout.
+    /// Used when the app is backgrounded: iOS may suspend us right after, and
+    /// the Mac only ends sharing (and display privacy) when it sees the close.
+    func closeAndWait(timeout: Duration) async -> Bool
+}
+
+extension ByteStream {
+    /// In-process streams close synchronously.
+    func closeAndWait(timeout: Duration) async -> Bool {
+        close()
+        return true
+    }
 }
 
 // MARK: - MemoryPipe
@@ -301,14 +315,13 @@ final class TCPByteStream: ByteStream, @unchecked Sendable {
                             cont.resume(throwing: TransportError.from(error))
                         }
                     case .waiting(let error):
-                        // NWConnection waits (and retries) on a refused
-                        // connect; nobody is listening, so say so now rather
-                        // than after the timeout. Other waits (no route yet,
-                        // Local Network prompt) run until the timeout.
-                        if case .posix(.ECONNREFUSED) = error, resumeState.markResumed() {
+                        let reason = connection.currentPath?.unsatisfiedReason
+                        if let verdict = waitingVerdict(error, unsatisfiedReason: reason),
+                           resumeState.markResumed() {
+                            Log.control.error("tcp connect waiting (\(error); path \(String(describing: reason))): giving up")
                             connection.stateUpdateHandler = nil
                             connection.cancel()
-                            cont.resume(throwing: TransportError.posix(ECONNREFUSED))
+                            cont.resume(throwing: verdict)
                         }
                     case .cancelled:
                         if resumeState.markResumed() {
@@ -331,6 +344,57 @@ final class TCPByteStream: ByteStream, @unchecked Sendable {
             }
         } onCancel: {
             connection.cancel()
+        }
+    }
+
+    /// What a `.waiting` NWConnection means for a connect in progress: an
+    /// error to fail with now, or nil to keep waiting (until the timeout).
+    ///   * ECONNREFUSED: nobody is listening (Screen Sharing off); NWConnection
+    ///     would retry until the timeout, so say so now.
+    ///   * The path is unsatisfied because the user denied Local Network
+    ///     access: no amount of waiting helps; fail with EPERM, the errno
+    ///     UserFacingError maps to the Local Network message.
+    ///   * Anything else (no route yet, the Local Network prompt still up)
+    ///     waits; a timeout reads as "Can't reach this Mac".
+    static func waitingVerdict(_ error: NWError, unsatisfiedReason: NWPath.UnsatisfiedReason?) -> TransportError? {
+        if unsatisfiedReason == .localNetworkDenied { return .posix(EPERM) }
+        if case .posix(.ECONNREFUSED) = error { return .posix(ECONNREFUSED) }
+        return nil
+    }
+
+    func closeAndWait(timeout: Duration) async -> Bool {
+        let once = ResumeOnce()
+        let connection = connection, queue = queue
+        return await withCheckedContinuation { (cont: CheckedContinuation<Bool, Never>) in
+            // On the connection's queue, so the state check and the handler
+            // install cannot miss a `.cancelled` delivered in between.
+            queue.async {
+                switch connection.state {
+                case .cancelled:
+                    if once.markResumed() { cont.resume(returning: true) }
+                    return
+                default:
+                    break
+                }
+                connection.stateUpdateHandler = { state in
+                    switch state {
+                    case .cancelled, .failed:
+                        if once.markResumed() {
+                            connection.stateUpdateHandler = nil
+                            cont.resume(returning: true)
+                        }
+                    default:
+                        break
+                    }
+                }
+                connection.cancel()   // graceful: FIN, not RST (that is forceCancel)
+                queue.asyncAfter(deadline: .now() + timeout.asDispatchTimeInterval) {
+                    if once.markResumed() {
+                        connection.stateUpdateHandler = nil
+                        cont.resume(returning: false)
+                    }
+                }
+            }
         }
     }
 

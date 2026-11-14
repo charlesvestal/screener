@@ -645,6 +645,15 @@ actor ControlSession {
         teardown(error: nil)
     }
 
+    /// `close()`, then waits (at most `timeout`) until the TCP close has
+    /// actually gone out (ByteStream.closeAndWait). Returns false on timeout.
+    func closeAndWait(timeout: Duration) async -> Bool {
+        let s = stream
+        close()
+        guard let s else { return true }
+        return await s.closeAndWait(timeout: timeout)
+    }
+
     private func teardown(error: Error?) {
         guard !isClosed else { return }
         isClosed = true

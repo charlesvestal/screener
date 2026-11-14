@@ -11,6 +11,18 @@
 //     "Reconnecting…" over the last picture;
 //   * a connection that is aborted while connected and in the foreground is
 //     reconnected too (a few times), and failures never show raw errno text.
+//
+// Review fixes (2026-11-14):
+//   * the Local Network text is shown ONLY when iOS actually denied access
+//     (EPERM / EACCES, or a TCP wait whose path reports .localNetworkDenied,
+//     which TCPByteStream turns into EPERM). No route (EHOSTUNREACH,
+//     EHOSTDOWN, ENETUNREACH, ENETDOWN) and TCP connect timeouts say
+//     "Can't reach this Mac" instead;
+//   * ECONNRESET / EPIPE on the TCP control channel is `.peerEnded`: most
+//     likely the Mac's user clicked Stop (or the Mac dropped us), so it is NOT
+//     auto-reconnected. NEEDS LIVE CONFIRMATION: verify on a real Mac that
+//     "Stop sharing" on the host really surfaces as a reset (and not as a
+//     clean FIN, which is TransportError.closed).
 import Darwin
 import Foundation
 
@@ -19,8 +31,13 @@ enum UserFacingError {
         /// The established connection went away (ECONNABORTED, ENOTCONN, ...):
         /// typically iOS suspended us; handled by reconnecting.
         case connectionLost
-        /// Nobody is listening / no route (ECONNREFUSED, EHOSTUNREACH, ...).
+        /// Nobody is listening (ECONNREFUSED): Screen Sharing is off.
         case unreachable
+        /// No route to the Mac, or the TCP connect timed out: asleep / elsewhere.
+        case noRoute
+        /// The Mac reset the control connection (ECONNRESET / EPIPE on TCP):
+        /// probably its user stopped the session; never auto-reconnected.
+        case peerEnded
         case timeout
         case authRejected
         case localNetwork
@@ -29,15 +46,18 @@ enum UserFacingError {
 
     static let lostMessage = "The connection to the Mac was lost."
     static let unreachableMessage = "Screen Sharing isn't on, or this Mac isn't reachable."
+    static let noRouteMessage = "Can't reach this Mac — check it's awake and on this network."
+    static let peerEndedMessage = "The Mac ended the session."
     static let timeoutMessage = "The Mac didn't respond."
     static let authRejectedMessage = "Wrong username or password."
     static let genericMessage = "Couldn't connect to the Mac."
 
     static func kind(ofErrno e: Int32) -> Kind {
         switch e {
-        case ECONNABORTED, ENOTCONN, ECONNRESET, EPIPE, ENETRESET: return .connectionLost
-        case ECONNREFUSED, EHOSTUNREACH, ENETUNREACH, EHOSTDOWN, ENETDOWN, EADDRNOTAVAIL: return .unreachable
-        case ETIMEDOUT: return .timeout
+        case ECONNABORTED, ENOTCONN, ENETRESET: return .connectionLost
+        case ECONNRESET, EPIPE: return .peerEnded
+        case ECONNREFUSED, EADDRNOTAVAIL: return .unreachable
+        case EHOSTUNREACH, ENETUNREACH, EHOSTDOWN, ENETDOWN, ETIMEDOUT: return .noRoute
         case EPERM, EACCES: return .localNetwork
         default: return .other
         }
@@ -47,12 +67,12 @@ enum UserFacingError {
         switch error {
         case let e as TransportError:
             switch e {
-            case .timeout: return .timeout
+            case .timeout: return .noRoute   // only the TCP connect has a transport timeout
             case .posix(let errno): return kind(ofErrno: errno)
             case .closed, .failed: return .other
             }
         case let e as ControlSessionError:
-            if case .timeout = e { return .timeout }
+            if case .timeout(let step) = e { return step == "connect" ? .noRoute : .timeout }
             return .other
         case let e as AuthError:
             if case .rejected = e { return .authRejected }
@@ -60,7 +80,9 @@ enum UserFacingError {
         case let e as MediaTransportError:
             switch e {
             case .channelFailed: return .connectionLost
-            case .localNetworkBlocked: return .localNetwork
+            // UDP sends blocked before the stream: only a privacy denial is
+            // Local Network; a routing error means the Mac isn't reachable.
+            case .localNetworkBlocked(let e): return e == EPERM || e == EACCES ? .localNetwork : .noRoute
             case .bindFailed: return .other
             }
         default:
@@ -73,6 +95,8 @@ enum UserFacingError {
         switch kind(of: error) {
         case .connectionLost: return lostMessage
         case .unreachable: return unreachableMessage
+        case .noRoute: return noRouteMessage
+        case .peerEnded: return peerEndedMessage
         case .timeout: return timeoutMessage
         case .authRejected: return authRejectedMessage
         case .localNetwork: return MediaTransportError.localNetworkMessage
@@ -134,6 +158,9 @@ struct LifecyclePolicy: Equatable, Sendable {
             pendingReconnect = true
             return .suspend
         }
+        // .peerEnded is deliberately not here: the Mac's user may have
+        // clicked Stop, and reconnecting would restart the session against
+        // their will.
         if kind == .connectionLost, wasConnected, autoReconnects < Self.maxAutoReconnects {
             autoReconnects += 1
             return .reconnect
@@ -147,4 +174,8 @@ struct LifecyclePolicy: Equatable, Sendable {
     }
 
     mutating func userDisconnected() { pendingReconnect = false }
+
+    /// A reconnect was due but the app is no longer in the foreground:
+    /// do it on the next `didBecomeActive` instead.
+    mutating func deferReconnect() { pendingReconnect = true }
 }

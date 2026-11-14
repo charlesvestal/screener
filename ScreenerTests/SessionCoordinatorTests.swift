@@ -1,3 +1,4 @@
+import CoreVideo
 import XCTest
 @testable import Screener
 
@@ -173,6 +174,7 @@ final class SessionCoordinatorTests: XCTestCase {
         rec.channels[0].fail("receive: Network is down (50)")
         await t.value
         XCTAssertEqual(c.state, .failed(UserFacingError.lostMessage))
+        XCTAssertNil(c.lastRequest, "credentials dropped: nothing will reconnect")
         XCTAssertNil(c.control)
         XCTAssertTrue(rec.channels.allSatisfy(\.cancelled))
     }
@@ -222,6 +224,109 @@ final class SessionCoordinatorTests: XCTestCase {
         XCTAssertEqual(c.state, .idle)
         XCTAssertFalse(c.isReconnecting)
         XCTAssertNil(c.lastRequest, "credentials dropped on a user disconnect")
+    }
+
+    /// UDP sends blocked by a routing error (not a privacy denial): the
+    /// handshake failure says the Mac can't be reached, not "Local Network".
+    func testAHandshakeFailureWhileUDPHasNoRouteSaysTheMacCantBeReached() async {
+        let rec = Recorder()
+        var s = seams(rec, resolve: ["mac": "192.0.2.71"])
+        s.channelFactory = { flow, _ in let c = rec.make(flow); c.blocked = EHOSTUNREACH; return c }
+        s.controlSeams = { _ in
+            ControlSession.Seams(connect: { _, _ in throw TransportError.closed },
+                                 authenticate: { _, _, _ in throw TransportError.timeout })
+        }
+        let c = SessionCoordinator(seams: s)
+        await c.connect(host: "mac", port: 5900, username: "u", password: "p")
+        XCTAssertEqual(c.state, .failed(UserFacingError.noRouteMessage))
+        XCTAssertTrue(rec.channels.allSatisfy(\.cancelled))
+    }
+
+    /// The TCP connect timed out (no SYN-ACK): "Can't reach this Mac".
+    func testATCPConnectTimeoutSaysTheMacCantBeReached() async {
+        let rec = Recorder()
+        var s = seams(rec, resolve: ["mac": "192.0.2.72"])
+        s.controlSeams = { _ in
+            ControlSession.Seams(connect: { _, _ in throw ControlSessionError.timeout(step: "connect") },
+                                 authenticate: { _, _, connect in _ = try await connect(); throw TransportError.closed })
+        }
+        let c = SessionCoordinator(seams: s)
+        await c.connect(host: "mac", port: 5900, username: "u", password: "p")
+        XCTAssertEqual(c.state, .failed(UserFacingError.noRouteMessage))
+        XCTAssertNil(c.lastRequest)
+    }
+
+    /// Backgrounding closes TCP first and waits for its close to go out
+    /// (NWConnection `.cancelled`) before the media sockets close and
+    /// `enterBackground` (which the UIApplication background task awaits) returns.
+    func testBackgroundAwaitsTheTCPCloseBeforeClosingMedia() async throws {
+        let rec = Recorder()
+        let (client, server) = MemoryPipe.pair()   // `server` kept alive: the client end writes ClientInit
+        let stream = ScriptedStream(client)
+        stream.closeDelay = .milliseconds(150)
+        let mediaClosedAtTCPClose = LockedValue<Bool?>(nil)
+        stream.beforeCloseConfirmed = { mediaClosedAtTCPClose.value = rec.channels.contains(where: \.cancelled) }
+        var s = seams(rec, resolve: ["mac": "192.0.2.81"])
+        s.controlSeams = { _ in
+            ControlSession.Seams(
+                connect: { _, _ in throw TransportError.closed },
+                authenticate: { _, _, _ in
+                    rec.noteAuth()
+                    return (stream, AuthResult(wrapKey: Data(count: 16), method: .srp, serverRSAPublicKeyDER: nil))
+                })
+        }
+        let c = SessionCoordinator(seams: s)
+        let t = connect(c, "mac")
+        try await waitUntil("server init read") { stream.readStarted }   // the stream is adopted
+
+        let started = ContinuousClock.now
+        await c.enterBackground()
+        let elapsed = ContinuousClock.now - started
+        XCTAssertTrue(stream.closeConfirmed, "the TCP close was awaited")
+        XCTAssertEqual(mediaClosedAtTCPClose.value, false, "TCP closes before media")
+        XCTAssertTrue(rec.channels.allSatisfy(\.cancelled), "media closed before enterBackground returns")
+        XCTAssertGreaterThanOrEqual(elapsed, .milliseconds(140))
+        XCTAssertEqual(c.state, .suspended)
+        await c.disconnect()
+        await t.value
+        withExtendedLifetime(server) {}
+    }
+
+    /// A first picture decoded for a session that has since been closed must
+    /// not clear "Reconnecting…" (or count as the next session's picture).
+    func testALateFirstFrameOfAClosedSessionIsIgnored() async throws {
+        let rec = Recorder()
+        let c = SessionCoordinator(seams: seams(rec, resolve: ["mac": "192.0.2.82"]))
+        let t = connect(c, "mac")
+        try await waitUntil("handshaking") { rec.authCalls == 1 }
+        var pb: CVPixelBuffer?
+        CVPixelBufferCreate(nil, 16, 16, kCVPixelFormatType_32BGRA, nil, &pb)
+        c.frames.onFirstFrame?(try XCTUnwrap(pb))   // its main-actor hop runs after the suspend below
+        await c.enterBackground()
+        await t.value
+        try await Task.sleep(for: .milliseconds(30))
+        XCTAssertTrue(c.isReconnecting)
+        XCTAssertFalse(c.hasFirstFrame)
+        await c.disconnect()
+    }
+
+    /// The user disconnects while the session is suspended in the
+    /// background: coming back does not reconnect.
+    func testNoReconnectAfterAUserDisconnect() async throws {
+        let rec = Recorder()
+        let c = SessionCoordinator(seams: seams(rec, resolve: ["mac": "192.0.2.83"]))
+        let t = connect(c, "mac")
+        try await waitUntil("handshaking") { rec.authCalls == 1 }
+        await c.enterBackground()
+        await t.value
+        XCTAssertEqual(c.state, .suspended)
+        await c.disconnect()
+        await c.becomeActive()
+        try await Task.sleep(for: .milliseconds(50))
+        XCTAssertEqual(c.state, .idle)
+        XCTAssertEqual(rec.authCalls, 1, "no reconnect")
+        XCTAssertNil(c.lastRequest)
+        XCTAssertFalse(c.isSessionActive)
     }
 
     func testBackgroundWithoutASessionDoesNothing() async {

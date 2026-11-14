@@ -109,9 +109,13 @@ enum IPv4Resolver {
         /// The name resolves, but only to IPv6.
         case noIPv4(host: String)
         case unresolvable(host: String, detail: String)
+        /// The lookup did not finish within `IPv4Resolver.timeout`.
+        case timedOut(host: String)
 
         var errorDescription: String? {
             switch self {
+            case .timedOut(let h):
+                return "Couldn't look up \(h)."
             case .noIPv4(let h):
                 return "This Mac has no IPv4 address on this network (\(h) resolves only to IPv6). "
                     + "High Performance screen sharing needs IPv4."
@@ -125,12 +129,25 @@ enum IPv4Resolver {
     /// off Swift's cooperative pool.
     private static let queue = DispatchQueue(label: "IPv4Resolver", qos: .userInitiated, attributes: .concurrent)
 
+    /// How long a lookup may take before the connect gives up (mDNS for an
+    /// absent `.local` name can otherwise block for a long time).
+    static let timeout: Duration = .seconds(10)
+
     /// The first IPv4 address of `host` as a dotted-quad literal. IPv4
-    /// literals pass straight through.
-    static func resolve(_ host: String) async throws -> String {
-        try await withCheckedThrowingContinuation { (cont: CheckedContinuation<String, Error>) in
+    /// literals pass straight through. Throws `.timedOut` after `timeout`
+    /// (the blocking lookup is abandoned; its late result is dropped).
+    static func resolve(_ host: String, timeout: Duration = timeout,
+                        using blocking: @escaping @Sendable (String) throws -> String = resolveBlocking)
+        async throws -> String {
+        let once = ResumeOnceFlag()
+        return try await withCheckedThrowingContinuation { (cont: CheckedContinuation<String, Error>) in
             queue.async {
-                cont.resume(with: Result { try resolveBlocking(host) })
+                let result = Result { try blocking(host) }
+                if once.claim() { cont.resume(with: result) }
+            }
+            let nanos = timeout.components.seconds * 1_000_000_000 + timeout.components.attoseconds / 1_000_000_000
+            queue.asyncAfter(deadline: .now() + .nanoseconds(Int(nanos))) {
+                if once.claim() { cont.resume(throwing: Failure.timedOut(host: host)) }
             }
         }
     }
@@ -154,6 +171,18 @@ enum IPv4Resolver {
             throw Failure.noIPv4(host: host)
         }
         throw Failure.unresolvable(host: host, detail: String(cString: gai_strerror(rc)))
+    }
+}
+
+/// A lock-protected one-shot flag: the first `claim()` wins.
+private final class ResumeOnceFlag: @unchecked Sendable {
+    private let lock = NSLock()
+    private var claimed = false
+    func claim() -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        if claimed { return false }
+        claimed = true
+        return true
     }
 }
 
