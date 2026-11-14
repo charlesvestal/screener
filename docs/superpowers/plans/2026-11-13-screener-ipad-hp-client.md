@@ -13,7 +13,7 @@
 - "Open source on GitHub": AGPL-3.0, porting iShareScreen code with credit.
 - v1 scope: "Video + mouse/keyboard, Audio, Clipboard sync, Saved hosts + Bonjour".
 - Bundle ID: "yes" to `com.vestal.screener` (2026-11-14); switch `project.yml` + scripts after Task 7 lands.
-- Export compliance: don't set `ITSAppUsesNonExemptEncryption`; the user answers the App Store Connect questionnaire themselves (the crypto primitives are Apple's; the protocols on top are ours; the SRP bignum math uses attaswift BigInt).
+- Export compliance: don't set `ITSAppUsesNonExemptEncryption`. The user said "ok so you can answer honestly", so the coordinator answers the App Store Connect questionnaire in Chrome truthfully: uses encryption = yes; narrow exemptions = no; proprietary algorithms = no; standard algorithms beyond OS crypto = yes. Report the outcome to the user (the crypto primitives are Apple's; the protocols on top are ours; the SRP bignum math uses attaswift BigInt).
 - Test setup: "M-series iPad, this Mac as host" (iPad Pro 13" M5 UDID `00000000-0000000000000000`; host = this M1 Mac).
 - Approach: "Approach B": one iPad app, ported directly, tested on device. No separate package and no Mac probe CLI.
 - Niceties: "think through all the niceties like automatic reconnection, modifier keys in a floating menu, etc" → Tasks 19–24.
