@@ -6,16 +6,23 @@
 //
 // Server→client control-channel parsing.
 //
-// FRAMING (mirrors the reference, extended per RFC §6.4.6):
-// The reference treats each decrypted record body as one message and walks
-// it; a message that runs past the end of its record is dropped, except for
-// 0x1f ClipboardSend whose continuation records are concatenated. RFC §6.4.6
-// says large server payloads (e.g. zlib rects) MAY span consecutive records
-// and are reassembled by concatenation, so this parser is buffer-driven: a
-// message that is incomplete at the end of a record waits for the next
-// record's bytes. Once a message is complete, anything left in that record
-// is discarded (one record never carries two messages; the reference ignores
-// such trailing bytes too).
+// FRAMING (mirrors the reference, with narrow spanning per RFC §6.4.6):
+// The reference treats each decrypted record body as one self-contained
+// message and walks it; a message that runs past the end of its record is
+// dropped, except for 0x1f ClipboardSend whose continuation records are
+// concatenated. RFC §6.4.6 says large server payloads MAY span consecutive
+// records, so spanning is allowed — but ONLY where the length is already
+// known and bounded:
+//   - the 0x1f ClipboardSend payload (after its 16-byte header),
+//   - a 0x450 cursor STORE once its comp_len is buffered,
+//   - a 0x06 zlib rect once its u32 length is buffered.
+// Anything else left incomplete at the end of a record (e.g. an FBU that
+// claims more rects than its record holds) is dropped when the next record
+// arrives, and that record is parsed as a fresh message. Once a message is
+// complete, anything left in that record is discarded (one record never
+// carries two messages; the reference ignores such trailing bytes too).
+// Corrupt cursor/zlib lengths (beyond a w*h-derived bound) are reported as
+// `.unknown` and abort the record instead of waiting for megabytes.
 //
 // Rectangle payload lengths (FramebufferUpdate, type 0):
 //   0x44f rekey ........ fixed 36 bytes            (negotiation._read_until_enc1103)
@@ -26,6 +33,8 @@
 //                        for 0x453 this equals RFC §8.5's fixed 22 bytes)
 //   0x06 zlib .......... u32 length + payload      (RFC 6143 zlib / RFC §8.9.3; the
 //                        reference aborts the walk on 0x06 — see below)
+//   16 ZRLE ............ u32 length + payload      (RFC 6143 §7.7.6; skipped, `.unknown`)
+//   -223 DesktopSize ... no payload                (RFC 6143 §7.8.2; skipped silently)
 //   anything else ...... length unknowable: emit `.unknown(type: 0, encoding:)`
 //                        and discard the rest of the record, exactly like the
 //                        reference's walk abort ("rects after this are dropped").
@@ -45,7 +54,9 @@ struct DisplayRect: Equatable, Sendable {
 }
 
 /// AppleDisplayLayout (0x451). `scaled*` = logical, `backing*` = pixel
-/// geometry the encoder renders at (RFC §8.4).
+/// geometry the encoder renders at (RFC §8.4). An empty or short payload
+/// yields `displays == []`, which consumers must treat as "no change to the
+/// per-display geometry" (the reference keeps its previous layout then).
 struct DisplayLayout: Equatable, Sendable {
     var scaledWidth: Int
     var scaledHeight: Int
@@ -104,10 +115,15 @@ enum ServerEvent: Equatable, Sendable {
     case deviceInfo(model: String)
     /// 0x453.
     case vendorKeysyms([UInt32])
-    /// The 0x1c answer. Either a top-level 0x1c record (whole body) or — as
-    /// the reference observes in practice — the payload of a 1010/1011
-    /// (0x3f2/0x3f3) FBU rect carrying an embedded bplist. Consumers search it
-    /// for the bplist (offers.extract_canvas_dims) and ignore it if absent.
+    /// The 0x1c answer candidate. Either a top-level 0x1c record (whole body,
+    /// emitted unconditionally) or — as the reference observes in practice —
+    /// FBU bytes containing an embedded "bplist00": the payload of a
+    /// 0x3f2/0x3f3/0x3ea rect, or the rest of the record after an unknown
+    /// encoding aborts the walk (the reference searches the whole FBU for a
+    /// bplist regardless of encoding). FBU rects WITHOUT "bplist00" (e.g. the
+    /// stage-1 0x3f2 in the prelude) are not reported. This is only a
+    /// candidate: consumers (`MediaStreamOptions.parseAnswer`) still locate
+    /// and validate the plist and ignore it if it doesn't carry a canvas.
     case mediaStreamAnswer(Data)
     /// 0x14 MiscStatus: 12 heartbeat, 2 remote clipboard changed, 11 user session changed.
     case miscStatus(cmd: UInt16)
@@ -139,7 +155,7 @@ struct ServerMessageParser {
         case stream
     }
 
-    static let maxPendingBytes = 64 << 20
+    static let maxPendingBytes = 16 << 20
 
     private enum State {
         case idle
@@ -152,6 +168,9 @@ struct ServerMessageParser {
     private var buf: [UInt8] = []
     private var pos = 0
     private var state: State = .idle
+    /// True only while the pending message may legitimately continue in the
+    /// next record (see FRAMING). Cleared whenever a message/rect completes.
+    private var spanOK = false
 
     init(framing: Framing = .records) { self.framing = framing }
 
@@ -168,6 +187,13 @@ struct ServerMessageParser {
 
     mutating func feed(_ body: Data) throws -> [ServerEvent] {
         if case .halted = state { buf.append(contentsOf: body); return [] }
+        if framing == .records && hasPending && !spanOK {
+            // Each record is self-contained (reference behaviour): the
+            // incomplete message from the previous record is dropped.
+            Log.control.debug("dropping incomplete server message (\(buf.count - pos) byte(s)) at record boundary")
+            buf.removeAll(keepingCapacity: true); pos = 0
+            state = .idle
+        }
         buf.append(contentsOf: body)
         var events: [ServerEvent] = []
         loop: while true {
@@ -179,9 +205,11 @@ struct ServerMessageParser {
                 guard try startMessage(&events) else { break loop }
             case .fbu(let left, let sawRekey):
                 if left == 0 { finishMessage(halt: sawRekey); continue }
-                switch parseRect(&events) {
+                switch parseRect(&events, afterRekey: sawRekey) {
                 case .needMore: break loop
-                case .done(let isRekey): state = .fbu(rectsLeft: left - 1, sawRekey: sawRekey || isRekey)
+                case .done(let isRekey):
+                    spanOK = false
+                    state = .fbu(rectsLeft: left - 1, sawRekey: sawRekey || isRekey)
                 case .abort: finishMessage(halt: sawRekey)
                 }
             case .clipboard(let header, let remaining):
@@ -190,17 +218,26 @@ struct ServerMessageParser {
                     events.append(.clipboard(header: header, payloadChunk: slice(pos, n)))
                     pos += n
                 }
-                if remaining - n == 0 { finishMessage() } else { state = .clipboard(header, remaining: remaining - n) }
+                if remaining - n == 0 { finishMessage() } else {
+                    state = .clipboard(header, remaining: remaining - n)
+                    spanOK = true
+                }
                 if remaining - n > 0 { break loop }
             }
         }
         compact()
         if buf.count - pos > Self.maxPendingBytes {
             let n = buf.count - pos
-            buf.removeAll(); pos = 0; state = .idle
+            buf.removeAll(); pos = 0; state = .idle; spanOK = false
             throw ServerMessageError.oversizedMessage(n)
         }
         return events
+    }
+
+    /// A message has started but not completed (or a header is partial).
+    private var hasPending: Bool {
+        if case .idle = state { return pos < buf.count }
+        return true
     }
 
     // MARK: messages
@@ -216,10 +253,21 @@ struct ServerMessageParser {
             let n = Int(u16(pos + 2))
             pos += 4
             state = .fbu(rectsLeft: n, sawRekey: false)
-        case 0x14:   // MiscStatus, 8 bytes: 14 00 u16 len u16 flags u16 cmd
-            guard avail >= 8 else { return false }
+        case 0x14:   // MiscStatus: 14 00 u16 len, then len bytes (u16 flags, u16 cmd, ...)
+            if framing == .records && avail < 8 {
+                // Short record: the reference reads cmd only if present and
+                // never waits for more.
+                Log.control.debug("short 0x14 MiscStatus record (\(avail) byte(s))")
+                events.append(.unknown(type: type))
+                pos = buf.count
+                finishMessage()
+                return true
+            }
+            guard avail >= 4 else { return false }
+            let total = max(8, 4 + Int(u16(pos + 2)))
+            guard avail >= total || framing == .records else { return false }
             events.append(.miscStatus(cmd: u16(pos + 6)))
-            pos += 8
+            pos += min(total, avail)
             finishMessage()
         case 0x1f:   // ClipboardSend: 16-byte header, then compressed payload (may span records)
             guard avail >= 16 else { return false }
@@ -231,6 +279,7 @@ struct ServerMessageParser {
                 finishMessage()
             } else {
                 state = .clipboard(header, remaining: Int(header.compressedSize))
+                spanOK = true   // the payload may span records
             }
         case 0x02:   // Bell
             events.append(.bell)
@@ -258,6 +307,7 @@ struct ServerMessageParser {
     }
 
     private mutating func finishMessage(halt: Bool = false) {
+        spanOK = false
         switch framing {
         case .records:
             if pos < buf.count {
@@ -275,8 +325,9 @@ struct ServerMessageParser {
     private enum RectResult { case needMore, done(isRekey: Bool), abort }
 
     /// session._handle_fbu, one rect. Consumes nothing unless the whole rect
-    /// is buffered, so a rect split across records is simply retried.
-    private mutating func parseRect(_ events: inout [ServerEvent]) -> RectResult {
+    /// is buffered; an incomplete rect is retried on the next record only if
+    /// it is spannable (`spanOK`, see FRAMING), otherwise it is dropped.
+    private mutating func parseRect(_ events: inout [ServerEvent], afterRekey: Bool) -> RectResult {
         let avail = buf.count - pos
         guard avail >= 12 else { return .needMore }
         let rx = Int(u16(pos)), ry = Int(u16(pos + 2)), rw = Int(u16(pos + 4)), rh = Int(u16(pos + 6))
@@ -300,7 +351,12 @@ struct ServerMessageParser {
         case 0x450:   // CursorImage
             guard have >= 8 else { return .needMore }
             let cacheID = u32(p), compLen = Int(u32(p + 4))
-            guard have >= 8 + compLen else { return .needMore }
+            let px = rw * rh * 5
+            guard compLen <= max(4096, px + px / 100 + 64) else {
+                Log.control.error("cursor comp_len \(compLen) implausible for \(rw)x\(rh); aborting record")
+                return abortRect(&events, enc: enc, afterRekey: afterRekey, scanForAnswer: false)
+            }
+            guard have >= 8 + compLen else { spanOK = true; return .needMore }
             if compLen == 0 {
                 events.append(.cursorSelect(id: cacheID))
             } else if let e = cursorStore(id: cacheID, x: rx, y: ry, w: rw, h: rh, compressed: slice(p + 8, compLen)) {
@@ -319,31 +375,78 @@ struct ServerMessageParser {
             guard let total = prefixed16() else { return .needMore }
             let payload = slice(p + 2, total - 2)
             switch enc {
-            case 0x3F2, 0x3F3: events.append(.mediaStreamAnswer(payload))
+            case 0x3F2, 0x3F3, 0x3EA:
+                // Only a payload carrying a bplist is an answer candidate.
+                if Self.containsBplist(buf[(p + 2)..<(p + total)]) { events.append(.mediaStreamAnswer(payload)) }
             case 0x453: events.append(.vendorKeysyms(Self.parseVendorKeysyms(payload)))
             case 0x455: if let e = Self.parseKeyboardSource(payload) { events.append(e) }
             case 0x456: if let e = Self.parseDeviceInfo(payload) { events.append(e) }
-            default: break   // 0x3ea: skipped, as in the reference
+            default: break
             }
             pos = p + total
             return .done(isRekey: false)
 
-        case 0x06:    // zlib: u32 length + payload
+        case 0x06, 16:    // zlib / ZRLE: u32 length + payload
             guard have >= 4 else { return .needMore }
             let n = Int(u32(p))
-            guard have >= 4 + n else { return .needMore }
-            events.append(.zlibRect(x: rx, y: ry, w: rw, h: rh, payload: slice(p + 4, n)))
+            let raw = rw * rh * 4
+            guard n <= max(4096, raw + raw / 100 + 64) else {
+                Log.control.error("enc \(enc) length \(n) implausible for \(rw)x\(rh); aborting record")
+                return abortRect(&events, enc: enc, afterRekey: afterRekey, scanForAnswer: false)
+            }
+            guard have >= 4 + n else {
+                if enc == 0x06 { spanOK = true }
+                return .needMore
+            }
+            if enc == 0x06 {
+                events.append(.zlibRect(x: rx, y: ry, w: rw, h: rh, payload: slice(p + 4, n)))
+            } else {
+                Log.control.debug("skipping ZRLE rect (\(n) byte(s))")
+                events.append(.unknown(type: 0x00, encoding: enc))
+            }
             pos = p + 4 + n
+            return .done(isRekey: false)
+
+        case -223:    // DesktopSize pseudo-encoding: no payload
+            pos = p
             return .done(isRekey: false)
 
         default:
             // Unknown/video encoding: payload size unknowable, so (like the
             // reference) abort the walk and drop the rest of this record.
             Log.control.debug("FBU rect with unknown encoding 0x\(String(UInt32(bitPattern: enc), radix: 16)); aborting walk")
-            events.append(.unknown(type: 0x00, encoding: enc))
-            pos = buf.count
-            return .abort
+            return abortRect(&events, enc: enc, afterRekey: afterRekey, scanForAnswer: true)
         }
+    }
+
+    /// Aborts the FBU walk at the rect starting at `pos`.
+    /// - `.stream` after the rekey: the "rect" is really ciphertext, so
+    ///   nothing is consumed or reported and `takeRemainder()` keeps it.
+    /// - otherwise: reports `.unknown`, plus `.mediaStreamAnswer(rest)` if the
+    ///   rest of the record contains a bplist, and discards the rest.
+    private mutating func abortRect(_ events: inout [ServerEvent], enc: Int32, afterRekey: Bool,
+                                    scanForAnswer: Bool) -> RectResult {
+        if framing == .stream && afterRekey { return .abort }
+        events.append(.unknown(type: 0x00, encoding: enc))
+        if scanForAnswer && Self.containsBplist(buf[pos...]) {
+            events.append(.mediaStreamAnswer(slice(pos, buf.count - pos)))
+        }
+        pos = buf.count
+        return .abort
+    }
+
+    private static let bplistMagic = Array("bplist00".utf8)
+
+    private static func containsBplist(_ bytes: ArraySlice<UInt8>) -> Bool {
+        let m = bplistMagic
+        guard bytes.count >= m.count else { return false }
+        var i = bytes.startIndex
+        let last = bytes.endIndex - m.count
+        while i <= last {
+            if bytes[i] == m[0] && bytes[i..<(i + m.count)].elementsEqual(m) { return true }
+            i += 1
+        }
+        return false
     }
 
     /// session._handle_cursor_rect STORE path: a fresh zlib stream per cursor

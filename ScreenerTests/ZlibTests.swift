@@ -48,6 +48,30 @@ final class ZlibTests: XCTestCase {
         XCTAssertEqual(try Zlib.Deflater().compress(inner).hex, compressed.hex)
     }
 
+    func testInflaterGrowsOutputForHighRatioInput() throws {
+        // 1 MB of zeros compresses to ~1 KB, so a single inflate call has to
+        // loop over many output chunks.
+        let raw = Data(count: 1 << 20)
+        let z = try Zlib.Deflater().compress(raw)
+        XCTAssertLessThan(z.count, 4096)
+        let out = try Zlib.Inflater().inflate(z)
+        XCTAssertEqual(out.count, raw.count)
+        XCTAssertEqual(out, raw)
+    }
+
+    func testInputAfterStreamEndIsIgnored() throws {
+        // Final stored block + Adler-32 trailer (Z_STREAM_END), then junk.
+        let raw = Data("hello".utf8)
+        var z = Data([0x78, 0x01, 0x01, 0x05, 0x00, 0xfa, 0xff]) + raw
+        var a: UInt32 = 1, b: UInt32 = 0
+        for byte in raw { a = (a + UInt32(byte)) % 65521; b = (b + a) % 65521 }
+        let adler = b << 16 | a
+        z += Data([UInt8(adler >> 24), UInt8(adler >> 16 & 0xff), UInt8(adler >> 8 & 0xff), UInt8(adler & 0xff)])
+        let inflater = try Zlib.Inflater()
+        XCTAssertEqual(try inflater.inflate(z + Data([0xde, 0xad, 0xbe, 0xef])), raw)
+        XCTAssertEqual(try inflater.inflate(Data([1, 2, 3])), Data(), "stream already ended")
+    }
+
     func testInflateRejectsGarbage() {
         XCTAssertThrowsError(try Zlib.inflate(Data([0x12, 0x34, 0x56, 0x78])))
     }

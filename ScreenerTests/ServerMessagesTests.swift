@@ -65,6 +65,32 @@ final class ServerMessagesTests: XCTestCase {
                                                      width: disp["w"]!, height: disp["h"]!)])
     }
 
+    func testDisplayLayoutTwoDisplays() throws {
+        var w = ByteWriter()
+        w.u16(1); w.u16(3840); w.u16(1080); w.u16(7680); w.u16(2160)
+        w.bytes(Data(count: 8)); w.u16(2)
+        func disp(_ id: UInt32, _ x0: UInt16, _ y0: UInt16, _ x1: UInt16, _ y1: UInt16) {
+            w.bytes(Data(count: 16)); w.u32(id); w.bytes(Data(count: 8))
+            w.u16(y0); w.u16(x0); w.u16(y1); w.u16(x1)
+            w.bytes(Data(count: 20))
+        }
+        disp(1, 0, 0, 3840, 2160)
+        disp(2, 3840, 0, 7680, 2160)
+        XCTAssertEqual(w.data.count, 20 + 2 * 56)
+        var p = ServerMessageParser()
+        guard case .displayLayout(let l)? = try p.feed(fbu([rect(0x451, prefixed(w.data))])).first else { return XCTFail() }
+        XCTAssertEqual(l.scaledWidth, 3840)
+        XCTAssertEqual(l.backingWidth, 7680)
+        XCTAssertEqual(l.displays, [DisplayRect(displayID: 1, x: 0, y: 0, width: 3840, height: 2160),
+                                    DisplayRect(displayID: 2, x: 3840, y: 0, width: 3840, height: 2160)])
+    }
+
+    func testShortDisplayLayoutHasNoDisplays() throws {
+        var p = ServerMessageParser()
+        guard case .displayLayout(let l)? = try p.feed(fbu([rect(0x451, prefixed(Data([0, 1])))])).first else { return XCTFail() }
+        XCTAssertEqual(l.displays, [], "empty displays = no change for consumers")
+    }
+
     // MARK: metadata rects
 
     func testKeyboardInputSource() throws {
@@ -133,12 +159,45 @@ final class ServerMessagesTests: XCTestCase {
         XCTAssertEqual(try p.feed(Data(hex: "1400000400010002")), [.miscStatus(cmd: 2)])
     }
 
-    func testRectHeaderSplitAcrossFeeds() throws {
+    func testRectHeaderSplitAcrossRecordsIsDropped() throws {
+        // Only cursor/zlib payloads (length known) and clipboard payloads may
+        // span records; a rect cut inside its 12-byte header is dropped and
+        // the next record is parsed as a fresh message.
         let msg = fbu([rect(0x455, Self.keyboardPayload)])
         var p = ServerMessageParser()
-        XCTAssertEqual(try p.feed(msg.prefix(2)), [])
-        XCTAssertEqual(try p.feed(msg.dropFirst(2).prefix(7)), [])
-        XCTAssertEqual(try p.feed(msg.dropFirst(9)), [.keyboardSource("com.apple.keylayout.ABC", secureInput: false)])
+        XCTAssertEqual(try p.feed(msg.prefix(9)), [])
+        XCTAssertEqual(try p.feed(Data(hex: "1400000400010002")), [.miscStatus(cmd: 2)])
+    }
+
+    func testCursorStoreSpanningThreeRecords() throws {
+        let bgra = Data((0..<16).map { UInt8($0) }), alpha = Data([0xff, 0x80, 0x40, 0x00])
+        let z = zlibStored(bgra + alpha)
+        var body = ByteWriter(); body.u32(1001); body.u32(UInt32(z.count)); body.bytes(z)
+        let msg = fbu([rect(0x450, x: 3, y: 4, w: 2, h: 2, body.data)])
+        var p = ServerMessageParser()
+        let c1 = 4 + 12 + 8 + 3, c2 = c1 + 10
+        XCTAssertEqual(try p.feed(msg.prefix(c1)), [])
+        XCTAssertEqual(try p.feed(msg[c1..<c2]), [])
+        XCTAssertEqual(try p.feed(msg.dropFirst(c2)),
+                       [.cursorStore(id: 1001, hotspot: PixelPoint(x: 3, y: 4), size: PixelSize(width: 2, height: 2),
+                                     bgra: bgra, alpha: alpha)])
+    }
+
+    func testCursorCutBeforeLengthIsDropped() throws {
+        // compLen not yet known (have < 8): not spannable.
+        var body = ByteWriter(); body.u32(1001); body.u32(20); body.bytes(Data(count: 20))
+        let msg = fbu([rect(0x450, w: 2, h: 2, body.data)])
+        var p = ServerMessageParser()
+        XCTAssertEqual(try p.feed(msg.prefix(4 + 12 + 6)), [])
+        XCTAssertEqual(try p.feed(Data([0x02])), [.bell])
+    }
+
+    func testOversizedCursorLengthIsUnknownAndAbortsRecord() throws {
+        // 2x2 cursor can't need ~1 MB of compressed data: treat as corrupt.
+        var body = ByteWriter(); body.u32(1001); body.u32(1_000_000); body.bytes(Data(count: 16))
+        var p = ServerMessageParser()
+        XCTAssertEqual(try p.feed(fbu([rect(0x450, w: 2, h: 2, body.data)])), [.unknown(type: 0x00, encoding: 0x450)])
+        XCTAssertEqual(try p.feed(Data(hex: "1400000400010002")), [.miscStatus(cmd: 2)])
     }
 
     func testCursorSelect() throws {
@@ -170,6 +229,57 @@ final class ServerMessagesTests: XCTestCase {
         XCTAssertEqual(try p.feed(msg.dropFirst(200)), [.zlibRect(x: 10, y: 20, w: 30, h: 40, payload: payload)])
     }
 
+    func testZlibRectSpanningTwoRecords() throws {
+        let payload = Data((0..<300).map { UInt8($0 & 0xff) })
+        var body = ByteWriter(); body.u32(UInt32(payload.count)); body.bytes(payload)
+        let msg = fbu([rect(6, x: 1, y: 2, w: 30, h: 40, body.data)])
+        var p = ServerMessageParser()
+        XCTAssertEqual(try p.feed(msg.prefix(4 + 12 + 4 + 50)), [])
+        XCTAssertEqual(try p.feed(msg.dropFirst(4 + 12 + 4 + 50)), [.zlibRect(x: 1, y: 2, w: 30, h: 40, payload: payload)])
+    }
+
+    func testOversizedZlibLengthIsUnknownAndAbortsRecord() throws {
+        var body = ByteWriter(); body.u32(50_000_000); body.bytes(Data(count: 8))
+        var p = ServerMessageParser()
+        XCTAssertEqual(try p.feed(fbu([rect(6, w: 2, h: 2, body.data)])), [.unknown(type: 0x00, encoding: 6)])
+        XCTAssertEqual(try p.feed(Data([0x02])), [.bell])
+    }
+
+    func testZRLESkippedByLength() throws {
+        var z = ByteWriter(); z.u32(5); z.bytes([1, 2, 3, 4, 5])
+        var sel = ByteWriter(); sel.u32(1000); sel.u32(0)
+        var p = ServerMessageParser()
+        XCTAssertEqual(try p.feed(fbu([rect(16, z.data), rect(0x450, sel.data)])),
+                       [.unknown(type: 0x00, encoding: 16), .cursorSelect(id: 1000)])
+    }
+
+    func testDesktopSizeHasNoPayload() throws {
+        var sel = ByteWriter(); sel.u32(1000); sel.u32(0)
+        var p = ServerMessageParser()
+        XCTAssertEqual(try p.feed(fbu([rect(-223, w: 800, h: 600, Data()), rect(0x450, sel.data)])),
+                       [.cursorSelect(id: 1000)])
+    }
+
+    // MARK: record boundaries
+
+    func testShortFBUThenSeparateMiscStatusRecord() throws {
+        // FBU claims 2 rects but its record holds 1: the reference drops the
+        // missing rect; the next record must parse as a fresh 0x14.
+        var data = fbu([rect(0x455, Self.keyboardPayload)])
+        data[3] = 2
+        var p = ServerMessageParser()
+        XCTAssertEqual(try p.feed(data), [.keyboardSource("com.apple.keylayout.ABC", secureInput: false)])
+        XCTAssertEqual(try p.feed(Data(hex: "1400000400010002")), [.miscStatus(cmd: 2)])
+    }
+
+    func testKeyboardSourceCutMidPayloadThenFreshRecord() throws {
+        let msg = fbu([rect(0x455, Self.keyboardPayload)])
+        var p = ServerMessageParser()
+        XCTAssertEqual(try p.feed(msg.prefix(4 + 12 + 10)), [])
+        XCTAssertEqual(try p.feed(fbu([rect(0x455, Self.keyboardPayload)])),
+                       [.keyboardSource("com.apple.keylayout.ABC", secureInput: false)])
+    }
+
     // MARK: rekey
 
     func testRekeyRect() throws {
@@ -186,7 +296,20 @@ final class ServerMessagesTests: XCTestCase {
         let wire = Data(hex: "1400000400010004") + fbu([rect(0x44f, blob), rect(0x3f2, prefixed(Data([1, 2])))]) + tail
         var p = ServerMessageParser(framing: .stream)
         let events = try p.feed(wire)
-        XCTAssertEqual(events, [.miscStatus(cmd: 4), .rekey(blob), .mediaStreamAnswer(Data([1, 2]))])
+        XCTAssertEqual(events, [.miscStatus(cmd: 4), .rekey(blob)], "stage-1 0x3f2 without a bplist is not an answer")
+        XCTAssertEqual(p.takeRemainder(), tail)
+    }
+
+    func testStreamModeUnknownRectAfterRekeyKeepsCiphertext() throws {
+        // FBU claims 2 rects but only the rekey is plaintext; the "second
+        // rect" is ciphertext and must stay in the remainder untouched.
+        let blob = Data(repeating: 0xab, count: 36)
+        let tail = Data(repeating: 0xcd, count: 50)
+        var head = fbu([rect(0x44f, blob)])
+        head[3] = 2
+        var p = ServerMessageParser(framing: .stream)
+        XCTAssertEqual(try p.feed(head + tail), [.rekey(blob)])
+        XCTAssertTrue(p.isHalted)
         XCTAssertEqual(p.takeRemainder(), tail)
     }
 
@@ -195,6 +318,19 @@ final class ServerMessagesTests: XCTestCase {
     func testMiscStatus() throws {
         var p = ServerMessageParser()
         XCTAssertEqual(try p.feed(Data(hex: "1400000400010002")), [.miscStatus(cmd: 2)])
+    }
+
+    func testMiscStatusConsumesDeclaredLength() throws {
+        // 14 00 u16 len, then len bytes (flags, cmd, extra) — stream framing
+        // continues right after it.
+        var p = ServerMessageParser(framing: .stream)
+        XCTAssertEqual(try p.feed(Data(hex: "140000060001000caabb") + Data([0x02])), [.miscStatus(cmd: 12), .bell])
+    }
+
+    func testShortMiscStatusRecordDoesNotWait() throws {
+        var p = ServerMessageParser()
+        XCTAssertEqual(try p.feed(Data(hex: "14000004")), [.unknown(type: 0x14)])
+        XCTAssertEqual(try p.feed(Data([0x02])), [.bell])
     }
 
     func testBell() throws {
@@ -214,6 +350,26 @@ final class ServerMessagesTests: XCTestCase {
         let blob = Data("bplist00xyz".utf8)
         var p = ServerMessageParser()
         XCTAssertEqual(try p.feed(fbu([rect(0x3f2, prefixed(blob))])), [.mediaStreamAnswer(blob)])
+    }
+
+    func testMediaAnswerIn0x3eaRectWithBplist() throws {
+        let blob = Data("..bplist00xyz".utf8)
+        var p = ServerMessageParser()
+        XCTAssertEqual(try p.feed(fbu([rect(0x3ea, prefixed(blob))])), [.mediaStreamAnswer(blob)])
+    }
+
+    func testFBURectWithoutBplistIsNotAnswer() throws {
+        var p = ServerMessageParser()
+        XCTAssertEqual(try p.feed(fbu([rect(0x3f2, prefixed(Data([1, 2, 3])))])), [])
+        XCTAssertEqual(try p.feed(fbu([rect(0x3f3, prefixed(Data([1, 2, 3])))])), [])
+    }
+
+    func testUnknownEncodingAbortStillFindsBplist() throws {
+        // The reference searches the whole FBU for a bplist regardless of
+        // encoding; the abort path reports the rest of the record if it has one.
+        let r = rect(0x7777, Data("zzbplist00abc".utf8))
+        var p = ServerMessageParser()
+        XCTAssertEqual(try p.feed(fbu([r])), [.unknown(type: 0x00, encoding: 0x7777), .mediaStreamAnswer(r)])
     }
 
     func testClipboardSendSpanningRecords() throws {
