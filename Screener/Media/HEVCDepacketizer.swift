@@ -148,12 +148,15 @@ enum HEVCDepacketizer {
     }
 
     /// nalu.first_donl: the DONL of the first payload that carries one
-    /// (offset 2 for single/AP, offset 3 for FU).
+    /// (offset 2 for single/AP, offset 3 for FU). Length thresholds match
+    /// `parse` (the reference takes an FU's DONL at 5 bytes but drops the
+    /// same FU at < 6 in reassemble_group; here both use 6), so a payload
+    /// `parse` rejects never supplies a group's DON.
     static func firstDONL<S: Sequence>(_ payloads: S) -> UInt16? where S.Element == Data {
         for payload in payloads where payload.count >= 2 {
             let p = payload.startIndex
             if HEVCNAL.type(payload[p]) == HEVCNAL.fragmentation {
-                if payload.count >= 5 { return u16(payload, p + 3) }
+                if payload.count >= 6 { return u16(payload, p + 3) }
             } else if payload.count >= 4 {
                 return u16(payload, p + 2)
             }

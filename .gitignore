@@ -9,3 +9,4 @@ build-sim/
 # reference captures carry session keys (.key sidecar) — never commit
 *.pcap
 *.key
+build-hevc/

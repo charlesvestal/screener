@@ -91,6 +91,14 @@ final class HEVCDepacketizerTests: XCTestCase {
                        ["0201aabbccdd"])
     }
 
+    func testFirstDONLMatchesParseThresholdForFU() {
+        // A 5-byte FU has no fragment byte; parse rejects it, so firstDONL
+        // must not take its DONL either.
+        let fu5 = Data([0x62, 0x01, 0x93, 0x00, 0x01])
+        XCTAssertThrowsError(try HEVCDepacketizer.parse(fu5))
+        XCTAssertEqual(HEVCDepacketizer.firstDONL([fu5, Data(hex: "02010007aabbccdd")]), 7)
+    }
+
     func testSlicedDataWithNonZeroStartIndex() throws {
         let backing = Data(hex: "ffffff02010007aabbccdd")
         let slice = backing[3...]

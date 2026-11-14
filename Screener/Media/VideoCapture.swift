@@ -63,27 +63,36 @@ enum VideoCaptureFile {
 }
 
 /// Appends captured packets to a file. Not thread-safe; owned by one task.
+/// A failed write (disk full, file gone) is logged once and ends the
+/// capture; later packets are ignored.
 final class VideoCaptureWriter {
     private let handle: FileHandle
     private var start: ContinuousClock.Instant?
     private(set) var count = 0
+    private(set) var failed = false
 
     init?(path: String) {
         guard FileManager.default.createFile(atPath: path, contents: VideoCaptureFile.magic),
-              let h = FileHandle(forWritingAtPath: path) else { return nil }
-        h.seekToEndOfFile()
+              let h = FileHandle(forWritingAtPath: path),
+              (try? h.seekToEnd()) != nil else { return nil }
         handle = h
     }
 
     func write(_ p: MediaPacket) {
+        guard !failed else { return }
         let t0 = start ?? p.arrival
         start = t0
         let ns = max(0, (p.arrival - t0).components.seconds * 1_000_000_000
                      + (p.arrival - t0).components.attoseconds / 1_000_000_000)
-        handle.write(VideoCaptureFile.encode(.init(ssrc: p.ssrc, seq: p.seq, timestamp: p.timestamp, marker: p.marker,
-                                                   payloadType: p.payloadType, arrivalNanos: UInt64(ns),
-                                                   payload: p.payload)))
-        count += 1
+        do {
+            try handle.write(contentsOf: VideoCaptureFile.encode(.init(
+                ssrc: p.ssrc, seq: p.seq, timestamp: p.timestamp, marker: p.marker,
+                payloadType: p.payloadType, arrivalNanos: UInt64(ns), payload: p.payload)))
+            count += 1
+        } catch {
+            failed = true
+            Log.video.error("DEBUG capture: write failed after \(self.count) packets, capture stopped: \(error)")
+        }
     }
 
     func close() { try? handle.close() }
@@ -102,6 +111,11 @@ extension VideoCaptureFile {
         model.addMediaConsumer { media in run(media, path: path) }
     }
 
+    // TODO(Task 14): MediaTransport.video is an AsyncStream, which supports
+    // ONE consumer. This tap reads it directly, so it cannot run alongside
+    // the real decode path; Task 14 must move the capture tap into the
+    // coordinator's single video consumer (write each packet there before
+    // handing it to the assembler) instead of subscribing here.
     private static func run(_ media: MediaTransport, path: String) {
         guard let writer = VideoCaptureWriter(path: path) else {
             Log.video.error("DEBUG capture: cannot open \(path)")
