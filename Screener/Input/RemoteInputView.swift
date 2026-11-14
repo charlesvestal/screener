@@ -25,27 +25,47 @@
 //   (0.4 s) then drag = left-button drag; two-finger pan = scroll. The host
 //   cursor follows the touch.
 // Keyboard:
-//   - Hardware keys via pressesBegan/Ended (UIKey.keyCode + modifierFlags →
-//     HardwareKeyState / Keysyms); key repeat is left to the Mac. Held keys
-//     are released when focus is lost so nothing sticks on the host.
-//   - On-screen keyboard: a hidden UIKeyInput view becomes first responder
-//     when `softwareKeyboardVisible`; typed characters go as keysym down/up
-//     (Shift added for uppercase / shifted symbols), delete as BackSpace.
+//   - Hardware keys via pressesBegan/Ended (UIKey.keyCode + modifierFlags +
+//     characters → HardwareKeyState / Keysyms: layout-aware character when
+//     no Cmd/Ctrl/Opt is held, US table otherwise).
+//   - Auto-repeat: iPadOS sends no repeats, so the most recently pressed
+//     non-modifier key re-sends its key-down (no key-up between) after 500 ms,
+//     then every ~33 ms, as the reference forwards glfw.REPEAT (KeyRepeater).
+//   - On-screen keyboard: a transparent (alpha 0, not isHidden — an
+//     invisible-but-unhidden view is a plain, fully supported responder)
+//     UIKeyInput view becomes first responder when `softwareKeyboardVisible`;
+//     typed characters go as keysym down/up (Shift added for uppercase /
+//     shifted symbols), delete as BackSpace.
+// Nothing sticks on the host: held keys (key-ups) and pointer buttons
+// (buttons 0 at the last host position) are released when focus is lost,
+// the app resigns active or the view's scene deactivates, before `input` is
+// switched (on the OLD controller), and on `releaseAll()` (session teardown).
 // iPadOS system shortcuts (⌘H, ⌘Tab, …) are not captured here (Task 22).
 import UIKit
 
 @MainActor
 final class RemoteInputView: UIView, UIPointerInteractionDelegate, UIGestureRecognizerDelegate {
-    /// Points of wheel translation per wheel notch (GLFW reports 1.0 per
-    /// notch; UIKit reports discrete scrolls as a translation). Tune on device.
-    static let pointsPerWheelNotch: CGFloat = 10
+    /// Device-tunable input constants, in one place.
+    enum Tuning {
+        /// Points of wheel translation per wheel notch (GLFW reports 1.0 per
+        /// notch; UIKit reports discrete scrolls as a translation). Tune on device.
+        static let pointsPerWheelNotch: CGFloat = 10
+        /// Hardware key auto-repeat: delay before the first repeat, then the
+        /// interval between repeats (≈ macOS defaults).
+        static let keyRepeatDelay: TimeInterval = 0.5
+        static let keyRepeatInterval: TimeInterval = 0.033
+    }
 
     var input: InputController? {
+        willSet {
+            guard newValue !== input else { return }
+            // Release on the controller that saw the downs, before switching.
+            releaseAll()
+        }
         didSet {
             guard input !== oldValue else { return }
             buttons = 0
             lastHost = nil
-            _ = keys.releaseAll()
         }
     }
 
@@ -74,6 +94,7 @@ final class RemoteInputView: UIView, UIPointerInteractionDelegate, UIGestureReco
     private var buttons = 0
     private var lastHost: (x: Int, y: Int)?
     private var keys = HardwareKeyState()
+    private let repeater: KeyRepeater
     private var wheel = WheelScroll()
     private var trackpadScroll = PixelScroll()
     private var touchScroll = PixelScroll()
@@ -81,11 +102,23 @@ final class RemoteInputView: UIView, UIPointerInteractionDelegate, UIGestureReco
     private var pointerInteraction: UIPointerInteraction?
     private let keyboardProxy = SoftKeyboardProxy(frame: CGRect(x: 0, y: 0, width: 1, height: 1))
 
-    override init(frame: CGRect) {
+    override convenience init(frame: CGRect) {
+        self.init(frame: frame, repeatSchedule: KeyRepeater.runLoopTimer)
+    }
+
+    /// `repeatSchedule`: the key-repeat timer (injected by tests).
+    init(frame: CGRect, repeatSchedule: @escaping KeyRepeater.Schedule) {
+        repeater = KeyRepeater(schedule: repeatSchedule)
         super.init(frame: frame)
         backgroundColor = .clear
         isMultipleTouchEnabled = true
         setUp()
+        repeater.onRepeat = { [weak self] ks in self?.input?.key(down: true, keysym: ks) }
+        let nc = NotificationCenter.default
+        nc.addObserver(self, selector: #selector(appWillResignActive(_:)),
+                       name: UIApplication.willResignActiveNotification, object: nil)
+        nc.addObserver(self, selector: #selector(sceneWillDeactivate(_:)),
+                       name: UIScene.willDeactivateNotification, object: nil)
     }
 
     required init?(coder: NSCoder) { fatalError("init(coder:) is not used") }
@@ -132,7 +165,9 @@ final class RemoteInputView: UIView, UIPointerInteractionDelegate, UIGestureReco
         twoFingerPan.allowedScrollTypesMask = []
         addGestureRecognizer(twoFingerPan)
 
-        keyboardProxy.isHidden = true
+        // alpha 0 rather than isHidden: the proxy must stay an ordinary,
+        // focusable responder; it is 1×1 and invisible either way.
+        keyboardProxy.alpha = 0
         keyboardProxy.onText = { [weak self] in self?.typeText($0) }
         keyboardProxy.onDelete = { [weak self] in self?.tapKey(Keysyms.backSpace) }
         keyboardProxy.onPresses = { [weak self] presses, down in self?.handle(presses, down: down) ?? presses }
@@ -154,6 +189,31 @@ final class RemoteInputView: UIView, UIPointerInteractionDelegate, UIGestureReco
     override func resignFirstResponder() -> Bool {
         releaseHeldKeys()
         return super.resignFirstResponder()
+    }
+
+    // MARK: releasing held input
+
+    /// Sends key-ups for every held key and, if pointer buttons are down,
+    /// buttons 0 at the last host position; stops key repeat. Safe to call
+    /// repeatedly. The session calls this before tearing the controller down.
+    func releaseAll() {
+        releaseHeldKeys()
+        releaseButtons()
+    }
+
+    private func releaseButtons() {
+        guard buttons != 0 else { return }
+        buttons = 0
+        sendButtons()
+    }
+
+    @objc private func appWillResignActive(_ note: Notification) {
+        releaseAll()
+    }
+
+    @objc private func sceneWillDeactivate(_ note: Notification) {
+        guard let scene = note.object as? UIScene, scene === window?.windowScene else { return }
+        releaseAll()
     }
 
     // MARK: pointer movement
@@ -204,8 +264,13 @@ final class RemoteInputView: UIView, UIPointerInteractionDelegate, UIGestureReco
     override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
         guard let t = pointerTouch(touches) else { return super.touchesBegan(touches, with: event) }
         let m = Self.mask(event?.buttonMask ?? .primary)
-        buttons = m == 0 ? InputController.Button.left : m
-        movePointer(to: t.location(in: self), coalescable: false)
+        pointerDown(buttons: m == 0 ? InputController.Button.left : m, at: t.location(in: self))
+    }
+
+    /// A pointer button press at `point` (view coordinates).
+    func pointerDown(buttons mask: Int, at point: CGPoint) {
+        buttons = mask
+        movePointer(to: point, coalescable: false)
     }
 
     override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent?) {
@@ -258,7 +323,7 @@ final class RemoteInputView: UIView, UIPointerInteractionDelegate, UIGestureReco
     @objc private func wheelScroll(_ g: UIPanGestureRecognizer) {
         let d = delta(g)
         guard d.y != 0 else { return }
-        let ticks = wheel.ticks(wheelDelta: d.y / Self.pointsPerWheelNotch,
+        let ticks = wheel.ticks(wheelDelta: d.y / Tuning.pointsPerWheelNotch,
                                 atMilliseconds: ProcessInfo.processInfo.systemUptime * 1000)
         scrollAtPointer(ticks, fallback: g.location(in: self))
     }
@@ -347,22 +412,38 @@ final class RemoteInputView: UIView, UIPointerInteractionDelegate, UIGestureReco
     /// Sends the keys among `presses`; returns the presses that are not
     /// keyboard keys we map.
     private func handle(_ presses: Set<UIPress>, down: Bool) -> Set<UIPress> {
-        guard let input else { return presses }
+        guard input != nil else { return presses }
         var rest = Set<UIPress>()
         for press in presses {
             guard let key = press.key else { rest.insert(press); continue }
-            if down {
-                guard let ks = keys.press(key.keyCode, modifiers: key.modifierFlags) else { rest.insert(press); continue }
-                input.key(down: true, keysym: ks)
-            } else {
-                guard let ks = keys.release(key.keyCode) else { rest.insert(press); continue }
-                input.key(down: false, keysym: ks)
-            }
+            let handled = down
+                ? keyDown(key.keyCode, modifiers: key.modifierFlags, characters: key.characters)
+                : keyUp(key.keyCode)
+            if !handled { rest.insert(press) }
         }
         return rest
     }
 
+    /// A hardware key went down; false if it has no keysym (passed on).
+    @discardableResult
+    func keyDown(_ usage: UIKeyboardHIDUsage, modifiers: UIKeyModifierFlags, characters: String) -> Bool {
+        guard let input, let ks = keys.press(usage, modifiers: modifiers, characters: characters) else { return false }
+        input.key(down: true, keysym: ks)
+        if !Keysyms.isModifier(usage) { repeater.keyDown(usage: usage.rawValue, keysym: ks) }
+        return true
+    }
+
+    /// A hardware key went up; false if it never went down here.
+    @discardableResult
+    func keyUp(_ usage: UIKeyboardHIDUsage) -> Bool {
+        repeater.keyUp(usage: usage.rawValue)
+        guard let ks = keys.release(usage) else { return false }
+        input?.key(down: false, keysym: ks)
+        return true
+    }
+
     private func releaseHeldKeys() {
+        repeater.cancel()
         for ks in keys.releaseAll() { input?.key(down: false, keysym: ks) }
     }
 

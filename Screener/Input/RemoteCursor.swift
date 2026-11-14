@@ -6,8 +6,10 @@
 // at the pointer position the client last sent, minus the hotspot.
 // - STORE: w×h BGRA pixmap + separate w×h alpha plane (the BGRA 4th byte is
 //   ignored; the reference overwrites A with the mask). Converted once to
-//   premultiplied RGBA for the GPU. Cached by id, at most 64 entries,
-//   oldest dropped first (Apple uses ~16).
+//   premultiplied RGBA for the GPU. Cached by id, at most 64 entries;
+//   beyond that the oldest-INSERTED id is dropped (oldest-first by first
+//   store, as the reference's insertion-ordered dict: re-storing an id keeps
+//   its place and selecting does not refresh it — not LRU). Apple uses ~16.
 // - SELECT: re-apply a cached id. An id we never received selects nothing
 //   (the reference notifies None and falls back to the local OS cursor; the
 //   input view shows the system pointer then).

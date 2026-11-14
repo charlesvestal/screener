@@ -81,13 +81,55 @@ final class KeysymsTests: XCTestCase {
 
     func testHardwareKeyStateUsesUnshiftedKeysymWhileACommandModifierIsHeld() {
         var s = HardwareKeyState()
-        // app.py on_key: with Ctrl/Super/Alt held, letters go as the raw lowercase keysym.
-        XCTAssertEqual(s.press(.keyboardC, modifiers: [.command, .shift]), 0x63)
+        // app.py on_key: with Ctrl/Super/Alt held, letters go as the raw lowercase keysym
+        // (US position; the layout's character is ignored, as GLFW key codes are).
+        XCTAssertEqual(s.press(.keyboardC, modifiers: [.command, .shift], characters: "C"), 0x63)
         XCTAssertEqual(s.release(.keyboardC), 0x63)
-        XCTAssertEqual(s.press(.keyboardC, modifiers: [.shift]), 0x43)
-        XCTAssertEqual(s.press(.keyboardA, modifiers: [.alphaShift]), 0x41)
-        XCTAssertEqual(s.press(.keyboardB, modifiers: [.alphaShift, .shift]), 0x62)
-        XCTAssertEqual(s.press(.keyboard1, modifiers: [.alphaShift]), 0x31)   // caps lock: letters only
+        XCTAssertEqual(s.press(.keyboardQ, modifiers: [.command], characters: "a"), 0x71)   // AZERTY A-key
+        XCTAssertEqual(s.press(.keyboardE, modifiers: [.alternate], characters: "\u{b4}"), 0x65)
+        XCTAssertEqual(s.press(.keyboardC, modifiers: [.shift]), 0x43)                     // no characters: US table
+    }
+
+    func testHardwareKeyStateSendsTheLayoutCharacterWithoutCommandModifiers() {
+        // app.py on_char: unmodified printable keys send the layout's final character.
+        var s = HardwareKeyState()
+        XCTAssertEqual(s.press(.keyboardQ, modifiers: [], characters: "a"), 0x61)          // AZERTY
+        XCTAssertEqual(s.press(.keyboardY, modifiers: [], characters: "z"), 0x7a)          // QWERTZ
+        XCTAssertEqual(s.press(.keyboard2, modifiers: [.shift], characters: "\""), 0x22)   // UK Shift-2
+        XCTAssertEqual(s.press(.keyboardSemicolon, modifiers: [], characters: "\u{f6}"), 0xf6) // German ö
+        // Beyond Latin-1: the raw code point, as on_char sends it.
+        XCTAssertEqual(s.press(.keyboardF, modifiers: [], characters: "\u{430}"), 0x430)  // Russian а
+        // Specials keep the table even though UIKit reports a character for them.
+        XCTAssertEqual(s.press(.keyboardReturnOrEnter, modifiers: [], characters: "\r"), 0xff0d)
+        XCTAssertEqual(s.press(.keyboardTab, modifiers: [], characters: "\t"), 0xff09)
+        // Dead key / empty / control character: fall back to the US table.
+        XCTAssertEqual(s.press(.keyboardEqualSign, modifiers: [], characters: ""), 0x3d)
+        XCTAssertEqual(s.press(.keyboardH, modifiers: [], characters: "\u{8}"), 0x68)
+    }
+
+    func testCapsLockIsForwardedAndLettersAreNotPreCased() {
+        var s = HardwareKeyState()
+        XCTAssertEqual(s.press(.keyboardCapsLock, modifiers: [.alphaShift]), 0xffe5)
+        // The iPad reports the cased character; it is sent as is.
+        XCTAssertEqual(s.press(.keyboardA, modifiers: [.alphaShift], characters: "A"), 0x41)
+        // Without a character no local caps-lock casing is applied.
+        XCTAssertEqual(s.press(.keyboardB, modifiers: [.alphaShift]), 0x62)
+    }
+
+    func testISOKeyIsMapped() {
+        XCTAssertEqual(Keysyms.keysym(for: .keyboardNonUSBackslash, shifted: false), 0x5c)
+        XCTAssertEqual(Keysyms.keysym(for: .keyboardNonUSBackslash, shifted: true), 0x7c)
+    }
+
+    func testModifierClassification() {
+        for m: UIKeyboardHIDUsage in [.keyboardLeftShift, .keyboardRightShift, .keyboardLeftControl,
+                                      .keyboardRightControl, .keyboardLeftAlt, .keyboardRightAlt,
+                                      .keyboardLeftGUI, .keyboardRightGUI, .keyboardCapsLock] {
+            XCTAssertTrue(Keysyms.isModifier(m), "\(m.rawValue)")
+        }
+        for k: UIKeyboardHIDUsage in [.keyboardA, .keyboardDeleteOrBackspace, .keyboardLeftArrow, .keyboardF1] {
+            XCTAssertFalse(Keysyms.isModifier(k), "\(k.rawValue)")
+        }
     }
 
     func testReleaseSendsTheKeysymThatWentDown() {

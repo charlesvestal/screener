@@ -15,12 +15,24 @@
 // - Printable keys send the FINAL character keysym ("Apple's RFB key handler
 //   expects the final character keysym, not base-char + Shift",
 //   keyboard_grab.py), with the physical Shift also sent as its own key, as
-//   the reference's on_key + on_char do. The iPad has no layout-aware char
-//   callback for hardware keys, so a US layout is assumed (as keyboard_grab's
-//   VK table does: "the keysym we send is the US base value").
+//   the reference's on_key + on_char do. With no Command/Control/Option held
+//   the keysym comes from UIKey.characters — the layout-aware final character
+//   (AZERTY, Dvorak, UK Shift-2 = ", German ö, …), the counterpart of GLFW's
+//   on_char. Specials (Return, Tab, arrows, …) always use the table, and an
+//   empty/control `characters` (dead key) falls back to the US table.
+// - Code points: Latin-1 keysyms equal their code points. Beyond Latin-1 the
+//   reference's on_char sends the RAW code point (`key_event(True,
+//   codepoint)`), not X11's 0x01000000|cp Unicode keysym; we match it
+//   (`Keysyms.character(_:)` is the single place to change that if the host
+//   turns out to want the 0x01000000 form — untested on screensharingd).
 // - While Command/Control/Option is held, letters/digits go as the raw
-//   unshifted keysym (app.py on_key: on_char doesn't fire under a modifier,
-//   so it synthesises the lowercase ASCII keysym).
+//   unshifted keysym from the US table (app.py on_key: on_char doesn't fire
+//   under a modifier, so it synthesises the lowercase ASCII keysym from the
+//   GLFW key code, which is a US-position code).
+// - Caps Lock is forwarded to the Mac as its own key (0xffe5) and letters are
+//   NOT pre-cased locally from the caps state: the character the iPad reports
+//   is sent as is. macOS's Caps Lock doesn't invert Shift, so a Mac that also
+//   has Caps Lock on still types the reported case (no double application).
 import UIKit
 
 enum Keysyms {
@@ -41,6 +53,20 @@ enum Keysyms {
         return nil
     }
 
+    /// The keysym for a typed code point: the raw code point (Latin-1 keysyms
+    /// equal their code points; beyond that the reference's on_char also sends
+    /// the raw code point rather than 0x01000000 | cp).
+    static func character(_ s: Unicode.Scalar) -> UInt32 { s.value }
+
+    /// The layout-aware keysym for UIKey.characters, or nil when it isn't a
+    /// single printable character (empty for a dead key, control characters).
+    static func character(in characters: String) -> UInt32? {
+        let scalars = characters.unicodeScalars
+        guard scalars.count == 1, let s = scalars.first else { return nil }
+        guard s.value >= 0x20, s.value != 0x7f, !(0xf700...0xf8ff).contains(s.value) else { return nil }
+        return character(s)
+    }
+
     /// One key press for typed text (the on-screen keyboard).
     struct Typed: Equatable {
         var keysym: UInt32
@@ -57,7 +83,7 @@ enum Keysyms {
             switch s {
             case "\n", "\r": Typed(keysym: returnKey, shift: false)
             case "\t": Typed(keysym: tab, shift: false)
-            default: Typed(keysym: s.value, shift: shiftedCharacters.contains(s))
+            default: Typed(keysym: character(s), shift: shiftedCharacters.contains(s))
             }
         }
     }
@@ -68,10 +94,18 @@ enum Keysyms {
         return s
     }()
 
-    /// Letters (a–z) are the keys Caps Lock affects.
-    static func isLetter(_ usage: UIKeyboardHIDUsage) -> Bool {
-        (UIKeyboardHIDUsage.keyboardA.rawValue...UIKeyboardHIDUsage.keyboardZ.rawValue).contains(usage.rawValue)
+    /// Shift/Control/Option/Command (left and right) and Caps Lock: never
+    /// auto-repeated.
+    static func isModifier(_ usage: UIKeyboardHIDUsage) -> Bool {
+        usage == .keyboardCapsLock
+            || (UIKeyboardHIDUsage.keyboardLeftControl.rawValue...UIKeyboardHIDUsage.keyboardRightGUI.rawValue)
+                .contains(usage.rawValue)
     }
+
+    /// Keys with a fixed (non-character) keysym: Return, arrows, F-keys,
+    /// modifiers, … Every other key may produce a layout character
+    /// (including keys outside the US table, e.g. JIS ろ / ¥).
+    static func isSpecial(_ usage: UIKeyboardHIDUsage) -> Bool { special[usage] != nil }
 
     private static let special: [UIKeyboardHIDUsage: UInt32] = {
         var m: [UIKeyboardHIDUsage: UInt32] = [
@@ -111,6 +145,9 @@ enum Keysyms {
             (.keyboardHyphen, "-", "_"), (.keyboardEqualSign, "=", "+"),
             (.keyboardOpenBracket, "[", "{"), (.keyboardCloseBracket, "]", "}"),
             (.keyboardBackslash, "\\", "|"), (.keyboardNonUSPound, "\\", "|"),
+            // ISO key next to left Shift (HID 0x64): US-layout value \ | (the
+            // layout's real character comes from UIKey.characters when unmodified).
+            (.keyboardNonUSBackslash, "\\", "|"),
             (.keyboardSemicolon, ";", ":"), (.keyboardQuote, "'", "\""),
             (.keyboardGraveAccentAndTilde, "`", "~"),
             (.keyboardComma, ",", "<"), (.keyboardPeriod, ".", ">"), (.keyboardSlash, "/", "?"),
@@ -128,18 +165,27 @@ enum Keysyms {
 
 /// Turns hardware key presses into keysyms and remembers what went down, so
 /// every key-up carries the keysym of its key-down (Shift may be released
-/// first) and held keys can be released when focus is lost. Key repeat is
-/// the Mac's job: only down/up are sent.
+/// first) and held keys can be released when focus is lost. Auto-repeat is
+/// driven by RemoteInputView (KeyRepeater): iPadOS delivers one press per
+/// physical press.
 struct HardwareKeyState {
     private var held: [Int: UInt32] = [:]
 
     /// The keysym to send as key-down, or nil if the key has none.
-    mutating func press(_ usage: UIKeyboardHIDUsage, modifiers: UIKeyModifierFlags) -> UInt32? {
+    /// `characters`: UIKey.characters (layout-aware), used for printable keys
+    /// when no Command/Control/Option is held (on_char vs on_key).
+    mutating func press(_ usage: UIKeyboardHIDUsage, modifiers: UIKeyModifierFlags,
+                        characters: String = "") -> UInt32? {
         let commandHeld = !modifiers.isDisjoint(with: [.command, .control, .alternate])
-        var shifted = modifiers.contains(.shift)
-        if Keysyms.isLetter(usage), modifiers.contains(.alphaShift) { shifted.toggle() }
-        if commandHeld { shifted = false }
-        guard let ks = Keysyms.keysym(for: usage, shifted: shifted) else { return nil }
+        let ks: UInt32?
+        if commandHeld {
+            ks = Keysyms.keysym(for: usage, shifted: false)
+        } else if !Keysyms.isSpecial(usage), let ch = Keysyms.character(in: characters) {
+            ks = ch
+        } else {
+            ks = Keysyms.keysym(for: usage, shifted: modifiers.contains(.shift))
+        }
+        guard let ks else { return nil }
         held[usage.rawValue] = ks
         return ks
     }
