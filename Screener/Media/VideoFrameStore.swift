@@ -21,11 +21,14 @@
 // the last strip lands up to ~20 ms after the first. Showing each strip as it
 // decodes put strips of two different pictures on screen (a dragged window
 // sheared at the strip seams). So a frame that carries its RTP timestamp is
-// STAGED and the presentable set (`snapshot`) changes once per picture: when
-// all `tileCount` strips of the timestamp are in, when a newer timestamp
-// starts (a strip was gated / never came), or when `flushStaged` finds the
+// STAGED, per picture (up to `picturesInFlight` pictures at once), and the
+// presentable set (`snapshot`) changes once per picture: when a picture has
+// all `tileCount` strips (it and any older staged picture leave the stage),
+// when more than `picturesInFlight` pictures are staged (the oldest lost a
+// strip for good: its tile is gated), or when `flushStaged` finds the oldest
 // staged picture older than `stagingTimeout` (the pipeline ticker calls it,
-// so the last picture before the screen goes static is never held back).
+// so the last picture before the screen goes static is never held back). A
+// strip arriving after its picture was shown incomplete fills it in.
 // Frames without a timestamp (tests, single-tile streams) commit at once.
 //
 // `onChange` (the renderer's redraw trigger) is called, outside the lock,
@@ -49,13 +52,26 @@ final class VideoFrameStore: @unchecked Sendable {   // all state behind `lock`
     }
 
     /// How long a partly-decoded picture may stay staged (see the header).
-    static let stagingTimeout: Duration = .milliseconds(50)
+    /// Only a strip that is really gone (its tile gated, and no newer picture
+    /// coming) should hit it: the paced stream stalls ALL tiles for up to
+    /// ~100 ms about once a second, and a 50 ms timeout tore every one of them.
+    static let stagingTimeout: Duration = .milliseconds(250)
+
+    /// Staged pictures beyond this many commit their oldest as incomplete.
+    static let picturesInFlight = 2
 
     private let lock = NSLock()
     private var frames: [Int: (buffer: CVPixelBuffer, seq: Int)] = [:]
-    private var staged: [Int: (buffer: CVPixelBuffer, seq: Int)] = [:]
-    private var stagedTimestamp: UInt32?
-    private var stagedSince: ContinuousClock.Instant?
+    private struct StagedPicture {
+        var ts: UInt32
+        var strips: [Int: (buffer: CVPixelBuffer, seq: Int)]
+        var since: ContinuousClock.Instant
+    }
+    /// Pictures being assembled, oldest RTP timestamp first.
+    private var pending: [StagedPicture] = []
+    /// The picture on screen and the tiles it was shown without.
+    private var shownTimestamp: UInt32?
+    private var shownMissing: Set<Int> = []
     private var partialCommits = 0
     private var version = 0
     private var tileCount = 4
@@ -65,6 +81,11 @@ final class VideoFrameStore: @unchecked Sendable {   // all state behind `lock`
     private var epoch = 0
     private var published = 0
     private var staleDropped = 0
+    #if DEBUG
+    // Tear diagnostics: recent publishes and partial commits awaiting their missing strips.
+    private var trace: [(tile: Int, ts: UInt32?, seq: Int, at: ContinuousClock.Instant)] = []
+    private var pendingMissing: [(ts: UInt32, tiles: Set<Int>, at: ContinuousClock.Instant)] = []
+    #endif
 
     /// Called once per session, from a VideoToolbox thread, with the first picture.
     var onFirstFrame: (@Sendable (CVPixelBuffer) -> Void)? {
@@ -101,7 +122,7 @@ final class VideoFrameStore: @unchecked Sendable {   // all state behind `lock`
     func reset() -> Int {
         let (e, cb) = lock.withLock {
             frames = [:]; version += 1; canvas = nil; tileCount = 4
-            staged = [:]; stagedTimestamp = nil; stagedSince = nil
+            pending = []; shownTimestamp = nil; shownMissing = []
             counters = Counters(); firstFrameSeen = false
             epoch += 1
             return (epoch, _onChange)
@@ -119,7 +140,7 @@ final class VideoFrameStore: @unchecked Sendable {   // all state behind `lock`
             if let tileCount, tileCount > 0, tileCount != self.tileCount {
                 self.tileCount = tileCount
                 frames = frames.filter { $0.key < tileCount }
-                staged = staged.filter { $0.key < tileCount }
+                pending = []; shownTimestamp = nil; shownMissing = []
                 version += 1
             }
             if let canvas, canvas != self.canvas { self.canvas = canvas; version += 1 }
@@ -134,27 +155,22 @@ final class VideoFrameStore: @unchecked Sendable {   // all state behind `lock`
     func publish(_ f: DecodedFrame, epoch: Int, now: ContinuousClock.Instant = .now) {
         let (first, changed): ((@Sendable (CVPixelBuffer) -> Void)?, (@Sendable () -> Void)?) = lock.withLock {
             guard epoch == self.epoch else { staleDropped += 1; return (nil, nil) }   // a previous session
-            let newest = max(frames[f.tile]?.seq ?? Int.min, staged[f.tile]?.seq ?? Int.min)
+            #if DEBUG
+            traceLocked(f, now: now)
+            #endif
+            let stagedSeq = pending.compactMap { $0.strips[f.tile]?.seq }.max() ?? Int.min
+            let newest = max(frames[f.tile]?.seq ?? Int.min, stagedSeq)
             if f.seq < newest { return (nil, nil) }                                   // older than stored
             published += 1
             counters.frames[f.tile, default: 0] += 1
             counters.decodeNanos += f.decodeTime.components.seconds * 1_000_000_000
                 + f.decodeTime.components.attoseconds / 1_000_000_000
-            var committed = false
+            let committed: Bool
             if let ts = f.rtpTimestamp, tileCount > 1 {
-                // A newer picture (or a repeat of a staged strip) ends the staged one.
-                if stagedTimestamp != nil, stagedTimestamp != ts || staged[f.tile] != nil {
-                    commitStagedLocked(partial: staged.count < tileCount)
-                    committed = true
-                }
-                if staged.isEmpty { stagedTimestamp = ts; stagedSince = now }
-                staged[f.tile] = (f.pixelBuffer, f.seq)
-                if staged.count >= tileCount {
-                    commitStagedLocked(partial: false)
-                    committed = true
-                }
+                committed = stageLocked(f, ts: ts, now: now)
             } else {
                 frames[f.tile] = (f.pixelBuffer, f.seq)
+                shownTimestamp = nil; shownMissing = []
                 version += 1
                 committed = true
             }
@@ -167,12 +183,51 @@ final class VideoFrameStore: @unchecked Sendable {   // all state behind `lock`
         changed?()
     }
 
+    /// `a` is after `b` in RTP timestamp order (wrap-safe).
+    private static func isAfter(_ a: UInt32, _ b: UInt32) -> Bool { Int32(bitPattern: a &- b) > 0 }
+
+    /// Returns whether the presentable set changed.
+    private func stageLocked(_ f: DecodedFrame, ts: UInt32, now: ContinuousClock.Instant) -> Bool {
+        let entry = (buffer: f.pixelBuffer, seq: f.seq)
+        if let shown = shownTimestamp, !Self.isAfter(ts, shown) {
+            // A strip of the picture on screen (shown incomplete after a
+            // timeout) completes it in place; anything older is superseded.
+            guard ts == shown, shownMissing.contains(f.tile) else { return false }
+            frames[f.tile] = entry
+            shownMissing.remove(f.tile)
+            version += 1
+            return true
+        }
+        if let i = pending.firstIndex(where: { $0.ts == ts }) {
+            pending[i].strips[f.tile] = entry
+        } else {
+            let at = pending.firstIndex { Self.isAfter($0.ts, ts) } ?? pending.endIndex
+            pending.insert(StagedPicture(ts: ts, strips: [f.tile: entry], since: now), at: at)
+        }
+        // The newest complete picture wins; older staged ones are never shown.
+        if let done = pending.lastIndex(where: { $0.strips.count >= tileCount }) {
+            commitLocked(through: done, now: now, reason: "complete")
+            return true
+        }
+        // More pictures in flight than a decode/arrival hiccup explains: the
+        // oldest lost a strip for good (its tile is gated), show it as it is.
+        var changed = false
+        while pending.count > Self.picturesInFlight {
+            commitLocked(through: 0, now: now, reason: "superseded")
+            changed = true
+        }
+        return changed
+    }
+
     /// Commits a staged picture older than `timeout` (the pipeline ticker).
     func flushStaged(now: ContinuousClock.Instant = .now, timeout: Duration = VideoFrameStore.stagingTimeout) {
         let cb: (@Sendable () -> Void)? = lock.withLock {
-            guard let since = stagedSince, now - since >= timeout, !staged.isEmpty else { return nil }
-            commitStagedLocked(partial: staged.count < tileCount)
-            return _onChange
+            var changed = false
+            while let oldest = pending.first, now - oldest.since >= timeout {
+                commitLocked(through: 0, now: now, reason: "timeout")
+                changed = true
+            }
+            return changed ? _onChange : nil
         }
         cb?()
     }
@@ -180,12 +235,47 @@ final class VideoFrameStore: @unchecked Sendable {   // all state behind `lock`
     /// Pictures shown with fewer than `tileCount` new strips (since the last call).
     func takePartialCommits() -> Int { lock.withLock { defer { partialCommits = 0 }; return partialCommits } }
 
-    private func commitStagedLocked(partial: Bool) {
-        for (tile, entry) in staged { frames[tile] = entry }
-        staged = [:]; stagedTimestamp = nil; stagedSince = nil
+    /// Shows staged picture `index`: its strips go over the older stored ones
+    /// (merged with the strips of the older staged pictures it supersedes, so
+    /// a tile missing from it keeps its newest strip), and it and every older
+    /// staged picture leave the stage.
+    private func commitLocked(through index: Int, now: ContinuousClock.Instant, reason: String) {
+        let picture = pending[index]
+        let partial = picture.strips.count < tileCount
+        #if DEBUG
+        if partial {
+            let missing = Set(0..<tileCount).subtracting(picture.strips.keys)
+            let recent = trace.suffix(12).map { e in
+                "t\(e.tile):\(e.ts.map(String.init) ?? "-")/\(e.seq)@\((now - e.at).ms)"
+            }.joined(separator: " ")
+            Log.video.info("tear: partial ts=\(picture.ts) reason=\(reason) missing=\(missing.sorted()) "
+                           + "staged_age_ms=\((now - picture.since).ms) recent(tile:ts/seq@ms_ago)=[\(recent)]")
+            pendingMissing.append((picture.ts, missing, now))
+            if pendingMissing.count > 16 { pendingMissing.removeFirst() }
+        }
+        #endif
+        for p in pending[...index] { for (tile, entry) in p.strips { frames[tile] = entry } }
+        shownTimestamp = picture.ts
+        shownMissing = Set(0..<tileCount).subtracting(picture.strips.keys)
+        pending.removeFirst(index + 1)
         if partial { partialCommits += 1 }
         version += 1
     }
+
+    #if DEBUG
+    private func traceLocked(_ f: DecodedFrame, now: ContinuousClock.Instant) {
+        if let prev = trace.last, f.seq < prev.seq {
+            Log.video.info("tear: out-of-order output seq=\(f.seq) tile=\(f.tile) after seq=\(prev.seq) tile=\(prev.tile)")
+        }
+        trace.append((f.tile, f.rtpTimestamp, f.seq, now))
+        if trace.count > 32 { trace.removeFirst(trace.count - 32) }
+        guard let ts = f.rtpTimestamp,
+              let i = pendingMissing.firstIndex(where: { $0.ts == ts && $0.tiles.contains(f.tile) }) else { return }
+        Log.video.info("tear: missing strip ts=\(ts) tile=\(f.tile) arrived \((now - pendingMissing[i].at).ms) ms after its partial commit")
+        pendingMissing[i].tiles.remove(f.tile)
+        if pendingMissing[i].tiles.isEmpty { pendingMissing.remove(at: i) }
+    }
+    #endif
 
     /// Pictures stored since the store was created (all sessions).
     var totalPublished: Int { lock.withLock { published } }

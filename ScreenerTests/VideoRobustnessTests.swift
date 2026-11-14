@@ -44,21 +44,114 @@ final class VideoRobustnessTests: XCTestCase {
         XCTAssertEqual(store.takeCounters().frames, [0: 1, 1: 1, 2: 1, 3: 1], "fps counts every decoded strip")
     }
 
-    /// A strip that never comes (its tile is gated) does not hold the picture
-    /// back past the next picture's first strip, which stays staged.
-    func testANewerPictureCommitsTheIncompleteOne() throws {
+    /// A strip that never comes (its tile is gated) does not hold pictures
+    /// back for long: once more than `picturesInFlight` pictures are staged
+    /// the oldest is shown as it is, and the newer ones stay staged.
+    func testAGatedTileCommitsTheOldestIncompletePicture() throws {
         let store = VideoFrameStore()
         let e = store.reset()
         store.configure(tileCount: 4)
         let t0 = try frame(tile: 0, seq: 20, ts: 1000)
         store.publish(t0, epoch: e)
-        store.publish(try frame(tile: 1, seq: 21, ts: 1000), epoch: e)   // tiles 2 and 3 missing
-        let next = try frame(tile: 0, seq: 22, ts: 2500)
-        store.publish(next, epoch: e)
+        store.publish(try frame(tile: 1, seq: 21, ts: 1000), epoch: e)   // tiles 2 and 3 gated
+        store.publish(try frame(tile: 0, seq: 22, ts: 2500), epoch: e)
+        store.publish(try frame(tile: 1, seq: 23, ts: 2500), epoch: e)
+        XCTAssertEqual(store.snapshot(ifNewerThan: nil)?.frames.count, 0, "two pictures may be in flight")
+        store.publish(try frame(tile: 0, seq: 24, ts: 4000), epoch: e)
         let snap = try XCTUnwrap(store.snapshot(ifNewerThan: nil))
         XCTAssertEqual(snap.frames.count, 2)
-        XCTAssertTrue(snap.frames[0] === t0.pixelBuffer, "the newer picture's strip is still staged")
+        XCTAssertTrue(snap.frames[0] === t0.pixelBuffer, "only the oldest picture is shown")
         XCTAssertEqual(store.takePartialCommits(), 1)
+    }
+
+    // MARK: strip tears (live: ~1 partial picture/s with zero loss)
+
+    /// The paced stream stalls every tile for up to ~100 ms about once a
+    /// second. A picture whose last strips are merely late must not be shown
+    /// with the previous picture's strips (the old 50 ms timeout did).
+    func testAStallShorterThanTheTimeoutDoesNotTear() throws {
+        let store = VideoFrameStore()
+        let e = store.reset()
+        store.configure(tileCount: 4)
+        let start = ContinuousClock.now
+        for t in 0..<2 { store.publish(try frame(tile: t, seq: 50 + t, ts: 300), epoch: e, now: start) }
+        store.flushStaged(now: start + .milliseconds(60))
+        store.flushStaged(now: start + .milliseconds(100))
+        XCTAssertEqual(store.snapshot(ifNewerThan: nil)?.frames.count, 0, "late strips are waited for")
+        for t in 2..<4 {
+            store.publish(try frame(tile: t, seq: 50 + t, ts: 300), epoch: e, now: start + .milliseconds(110))
+        }
+        XCTAssertEqual(store.snapshot(ifNewerThan: nil)?.frames.count, 4)
+        XCTAssertEqual(store.takePartialCommits(), 0)
+    }
+
+    /// The next picture's first strip may decode before this picture's last
+    /// one: both pictures stay staged and each is shown whole.
+    func testANextPictureStartingEarlyDoesNotTear() throws {
+        let store = VideoFrameStore()
+        let e = store.reset()
+        store.configure(tileCount: 4)
+        for t in 0..<3 { store.publish(try frame(tile: t, seq: 60 + t, ts: 400), epoch: e) }
+        let early = try frame(tile: 0, seq: 64, ts: 800)
+        store.publish(early, epoch: e)
+        XCTAssertEqual(store.snapshot(ifNewerThan: nil)?.frames.count, 0)
+        let last = try frame(tile: 3, seq: 63, ts: 400)
+        store.publish(last, epoch: e)
+        var snap = try XCTUnwrap(store.snapshot(ifNewerThan: nil))
+        XCTAssertEqual(snap.frames.count, 4)
+        XCTAssertFalse(snap.frames[0] === early.pixelBuffer, "the next picture is still staged")
+        XCTAssertTrue(snap.frames[3] === last.pixelBuffer)
+        var next = [early]
+        for t in 1..<4 { next.append(try frame(tile: t, seq: 64 + t, ts: 800)); store.publish(next[t], epoch: e) }
+        snap = try XCTUnwrap(store.snapshot(ifNewerThan: snap.version))
+        for t in 0..<4 { XCTAssertTrue(snap.frames[t] === next[t].pixelBuffer) }
+        XCTAssertEqual(store.takePartialCommits(), 0)
+    }
+
+    /// A complete newer picture wins over an incomplete older one, whose
+    /// late strips are then ignored.
+    func testTheNewestCompletePictureIsShown() throws {
+        let store = VideoFrameStore()
+        let e = store.reset()
+        store.configure(tileCount: 4)
+        for t in 0..<2 { store.publish(try frame(tile: t, seq: 70 + t, ts: 100), epoch: e) }
+        var newer: [DecodedFrame] = []
+        for t in 0..<4 { newer.append(try frame(tile: t, seq: 72 + t, ts: 200)); store.publish(newer[t], epoch: e) }
+        let snap = try XCTUnwrap(store.snapshot(ifNewerThan: nil))
+        for t in 0..<4 { XCTAssertTrue(snap.frames[t] === newer[t].pixelBuffer) }
+        store.publish(try frame(tile: 2, seq: 76, ts: 100), epoch: e)   // the old picture's late strip
+        XCTAssertNil(store.snapshot(ifNewerThan: snap.version))
+        XCTAssertEqual(store.takePartialCommits(), 0)
+    }
+
+    /// A strip that arrives after its picture was shown incomplete (timeout)
+    /// fills that picture in at once.
+    func testALateStripCompletesTheShownPicture() throws {
+        let store = VideoFrameStore()
+        let e = store.reset()
+        store.configure(tileCount: 4)
+        let start = ContinuousClock.now
+        for t in 0..<3 { store.publish(try frame(tile: t, seq: 80 + t, ts: 500), epoch: e, now: start) }
+        store.flushStaged(now: start + VideoFrameStore.stagingTimeout)
+        let before = try XCTUnwrap(store.snapshot(ifNewerThan: nil))
+        XCTAssertEqual(before.frames.count, 3)
+        let late = try frame(tile: 3, seq: 83, ts: 500)
+        store.publish(late, epoch: e)
+        let after = try XCTUnwrap(store.snapshot(ifNewerThan: before.version))
+        XCTAssertTrue(after.frames[3] === late.pixelBuffer)
+        XCTAssertEqual(store.takePartialCommits(), 1)
+    }
+
+    /// RTP timestamps wrap: a picture just past the wrap is newer.
+    func testTimestampWrapKeepsPictureOrder() throws {
+        let store = VideoFrameStore()
+        let e = store.reset()
+        store.configure(tileCount: 2)
+        for t in 0..<2 { store.publish(try frame(tile: t, seq: 90 + t, ts: UInt32.max - 100), epoch: e) }
+        var wrapped: [DecodedFrame] = []
+        for t in 0..<2 { wrapped.append(try frame(tile: t, seq: 92 + t, ts: 200)); store.publish(wrapped[t], epoch: e) }
+        let snap = try XCTUnwrap(store.snapshot(ifNewerThan: nil))
+        for t in 0..<2 { XCTAssertTrue(snap.frames[t] === wrapped[t].pixelBuffer) }
     }
 
     /// The ticker commits the last picture before the screen goes static.
