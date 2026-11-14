@@ -10,17 +10,26 @@ settings:
     DEVELOPMENT_TEAM: YOURTEAMID
     CODE_SIGN_STYLE: Automatic
     TARGETED_DEVICE_FAMILY: "2"
-packages:
-  BigInt:
-    url: https://github.com/attaswift/BigInt
-    from: "5.4.0"
 targets:
+  # attaswift/BigInt, vendored (Vendor/BigInt/README.md) so it is optimized
+  # even in Debug: the SRP modexps are ~17x slower at -Onone.
+  BigInt:
+    type: library.static
+    platform: iOS
+    sources: [Vendor/BigInt/Sources]
+    settings:
+      base:
+        SWIFT_VERSION: "5.0"
+        SWIFT_OPTIMIZATION_LEVEL: "-O"
+        SWIFT_COMPILATION_MODE: wholemodule
+        ENABLE_TESTABILITY: NO
+        SWIFT_STRICT_CONCURRENCY: complete
   Screener:
     type: application
     platform: iOS
     sources: [Screener]
     dependencies:
-      - package: BigInt
+      - target: BigInt
     info:
       path: Screener/Info.plist
       properties:

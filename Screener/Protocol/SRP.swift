@@ -75,6 +75,8 @@ struct SRPClient {
     let x: BigUInt
     private let a: BigUInt
     private let salt: Data
+    /// Time spent in PBKDF2 inside `init` (for the auth timing log).
+    let pbkdf2Duration: Duration
 
     /// Maximum PBKDF2 iteration count we are willing to run (M-2). Apple's
     /// real server sends counts in the low thousands; anything above this is
@@ -96,8 +98,10 @@ struct SRPClient {
         guard iterations <= Self.maxIterations else { throw SRPError.invalidServerValue }
         self.salt = salt
         let itersInt = iterations > UInt64(Int.max) ? Int.max : Int(iterations)
+        let started = ContinuousClock.now
         let pPrime = try PBKDF2.sha512(password: Data(password.utf8), salt: salt,
                                         iterations: itersInt, keyLength: 128)
+        pbkdf2Duration = ContinuousClock.now - started
         // inner = SHA512("" ":" P'); x = SHA512(salt || inner). Reference's
         // empty identity ("") means the leading H(I) collapses to just ":" + P'.
         let inner = Hash.sha512(Data(":".utf8) + pPrime)

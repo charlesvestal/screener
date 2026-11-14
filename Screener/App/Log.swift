@@ -53,3 +53,8 @@ final class FileMirror: @unchecked Sendable {
         }
     }
 }
+
+extension Duration {
+    /// Whole milliseconds, for timing logs.
+    var ms: Int { Int(components.seconds * 1000 + components.attoseconds / 1_000_000_000_000_000) }
+}

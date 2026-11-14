@@ -132,6 +132,8 @@ actor ControlSession {
         var degenerateRetryInterval: Duration = .milliseconds(200) // _DEGENERATE_RETRY_INTERVAL_S
         var degenerateRetryLimit = 16                              // _DEGENERATE_RETRY_LIMIT
         var retryAnswerWait: Duration = .seconds(5)                // _read_video_answer settimeout(5.0)
+        /// How often start() logs "still waiting for <step>" (diagnostics).
+        var progressLogInterval: Duration = .seconds(5)
     }
 
     /// Injection points for tests.
@@ -202,6 +204,10 @@ actor ControlSession {
     private var rxTask: Task<Void, Never>?
     private var pollTask: Task<Void, Never>?
     private var loggedRecordActive = false
+    // start() progress (diagnostics): the step in flight and when it began.
+    private(set) var currentStep = "connect"
+    private var stepStarted = ContinuousClock.now
+    private var startBegan = ContinuousClock.now
     #if DEBUG
     private var rxRecordCount = 0
     #endif
@@ -232,8 +238,21 @@ actor ControlSession {
     func start() async throws -> MediaParams {
         guard !started else { throw ControlSessionError.alreadyStarted }
         started = true
+        startBegan = .now
+        stepStarted = .now
+        let interval = tuning.progressLogInterval
+        let watchdog = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: interval)
+                guard !Task.isCancelled, let self else { return }
+                await self.logStillWaiting()
+            }
+        }
+        defer { watchdog.cancel() }
         do {
-            return try await run()
+            let params = try await run()
+            Log.control.info("start completed in \((ContinuousClock.now - startBegan).ms) ms")
+            return params
         } catch {
             // Prefer the receive loop's recorded cause (e.g. an integrity failure)
             // over the secondary `.closed` a pending send then saw.
@@ -242,6 +261,21 @@ actor ControlSession {
             teardown(error: mapped)
             throw mapped
         }
+    }
+
+    /// Logs how long the previous step took and starts timing `step`.
+    private func beginStep(_ step: String) {
+        let now = ContinuousClock.now
+        Log.control.info("step \(currentStep) done in \((now - stepStarted).ms) ms; now \(step)")
+        currentStep = step
+        stepStarted = now
+    }
+
+    private func logStillWaiting() {
+        guard !isClosed, started else { return }
+        let now = ContinuousClock.now
+        Log.control.info("still waiting for \(currentStep) (\((now - stepStarted).ms) ms in step, "
+                         + "\((now - startBegan).ms) ms since start)")
     }
 
     private func run() async throws -> MediaParams {
@@ -260,16 +294,19 @@ actor ControlSession {
             guard let self, await self.adopt(s) else { s.close(); throw ControlSessionError.closed }
             return s
         }
+        currentStep = "connect+handshake+auth"
         let (stream, auth) = try await withStepTimeout("auth", limit * 2) {
             try await seams.authenticate(cfg.username, cfg.password, connect)
         }
         guard adopt(stream) else { throw ControlSessionError.closed }
         Log.control.info("M1 auth ok")
+        beginStep("server init")
 
         // 2) ClientInit / ServerInit (_phase_client_init).
         let serverInit = try await withStepTimeout("server init", limit) { try await RFBHandshake.clientInit(stream) }
 
         // 3) Cleartext prelude.
+        beginStep("cleartext prelude")
         let scale = cfg.logicalSize.width > 0 ? Double(cfg.backingSize.width / cfg.logicalSize.width) : 2.0
         let sdc = ClientMessage.setDisplayConfiguration(logicalWidth: Int(cfg.logicalSize.width.rounded()),
                                                         logicalHeight: Int(cfg.logicalSize.height.rounded()),
@@ -286,6 +323,7 @@ actor ControlSession {
 
         // 4) Rekey (_read_until_enc1103), with session-select detection.
         let wrapKey = auth.wrapKey
+        beginStep("rekey")
         let rekey = try await withStepTimeout("rekey", limit) {
             try await Self.readUntilRekey(stream, wrapKey: wrapKey)
         }
@@ -296,6 +334,7 @@ actor ControlSession {
         rxTask = Task { [weak self] in await self?.rxLoop(initial: initial) }
 
         // 5) Encrypted preface + 0x1c offer (_phase_enable_enc1103 / _phase_media_offer).
+        beginStep("media offer")
         let offers = try MediaOffer.create(audioEnabled: cfg.audioEnabled)
         let keys = NegotiationKeys.random()
         let msg1c = MediaStreamOptions.build(keys: keys, audioOffer: offers.audio, videoOffer: offers.video)
@@ -324,6 +363,7 @@ actor ControlSession {
         // re-sends the same 0x1c in both cases. The server does not reliably
         // answer the first offer: a reference capture (conn 2) shows the first
         // 0x1c unanswered for 3 s and the re-sent one answered in 67 ms.
+        beginStep("media answer")
         var outcome = try await awaitAnswer(timeout: tuning.retryAnswerWait)
         var attempt = 0
         var lastTimedOut = false
@@ -342,6 +382,7 @@ actor ControlSession {
             outcome = try await awaitAnswer(timeout: tuning.retryAnswerWait)
         }
         collectingAnswers = false
+        beginStep("done")
         guard case .answer(let answer) = outcome, let record else { throw ControlSessionError.closed }
         Log.control.info("M2 media answer canvas=\(answer.canvasWidth)x\(answer.canvasHeight) tiles=\(answer.tiles)")
 

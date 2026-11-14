@@ -233,12 +233,16 @@ extension Authenticator {
     /// `do_nonsrp_auth`.
     static func doNonSRPAuth(_ s: ByteStream, username: String, password: String,
                              seams: AuthSeams) async throws -> AuthResult {
+        var lap = Lap()
         let server = try await rsa1Init(s)
+        lap.log("RSA1 init")
         let aesKey = seams.random(K.nonSRPAESKeyLen)
         try await sendNonSRPCredentials(s, server: server.key, aesKey: aesKey,
                                         username: username, password: password, random: seams.random)
+        lap.log("non-SRP credentials send")
         try await readNonSRPResult(s)
-        Log.auth.info("AUTH OK (non-SRP)")
+        lap.log("non-SRP result read")
+        Log.auth.info("AUTH OK (non-SRP) in \(lap.total.ms) ms")
         return AuthResult(wrapKey: aesKey, method: .nonSRP, serverRSAPublicKeyDER: server.der)
     }
 
@@ -295,14 +299,21 @@ extension Authenticator {
     /// `do_srp_auth`.
     static func doSRPAuth(_ s: ByteStream, username: String, password: String,
                           seams: AuthSeams) async throws -> AuthResult {
+        var lap = Lap()
         let server = try await rsa1Init(s)
+        lap.log("RSA1 init")
         try await sendSRPModulus(s, server: server.key, username: username)
         let challenge = try await readSRPChallenge(s)
+        lap.log("SRP modulus sent + challenge read")
+        Log.auth.info("SRP: computing proof (PBKDF2 \(challenge.iterations) iters + 4096-bit modexps)…")
         let (publicA, proof) = try await solveSRP(challenge, password: password, privateA: seams.privateA)
+        lap.log("SRP solve total")
         try await s.write(try buildSRPPacket2(publicA: publicA, M1: proof.M1,
                                               options: challenge.options, clientRandom: seams.random(16)))
+        lap.log("SRP proof send")
         try await readSRPResult(s, proof: proof)
-        Log.auth.info("AUTH OK (SRP)")
+        lap.log("SRP result read")
+        Log.auth.info("AUTH OK (SRP) in \(lap.total.ms) ms")
         return AuthResult(wrapKey: proof.wrapKey, method: .srp, serverRSAPublicKeyDER: server.der)
     }
 
@@ -402,13 +413,19 @@ extension Authenticator {
         let task = Task.detached(priority: .userInitiated) { () -> Result<(Data, SRPProof), Error> in
             Result {
                 try Task.checkCancellation()
+                let started = ContinuousClock.now
                 let client = if let privateA {
                     try SRPClient(password: password, salt: ch.salt, iterations: ch.iterations, privateA: privateA)
                 } else {
                     try SRPClient(password: password, salt: ch.salt, iterations: ch.iterations)
                 }
+                let initDone = ContinuousClock.now
                 try Task.checkCancellation()
-                return (client.publicA, try client.respond(to: ch.B))
+                let proof = try client.respond(to: ch.B)
+                let pbkdf2 = client.pbkdf2Duration
+                Log.auth.info("SRP timing: PBKDF2=\(pbkdf2.ms) ms, g^a=\((initDone - started - pbkdf2).ms) ms, "
+                              + "respond(g^x, S)=\((ContinuousClock.now - initDone).ms) ms")
+                return (client.publicA, proof)
             }
         }
         let result = await withTaskCancellationHandler {
@@ -507,6 +524,20 @@ extension Authenticator {
             return v
         }
         return nil
+    }
+}
+
+// MARK: - Timing
+
+/// Phase timer for the auth log: `log` prints the time since the previous lap.
+struct Lap {
+    private let start = ContinuousClock.now
+    private var last = ContinuousClock.now
+    var total: Duration { ContinuousClock.now - start }
+    mutating func log(_ phase: String) {
+        let now = ContinuousClock.now
+        Log.auth.info("auth timing: \(phase) \((now - last).ms) ms")
+        last = now
     }
 }
 
