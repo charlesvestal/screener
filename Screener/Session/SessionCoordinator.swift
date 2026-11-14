@@ -13,6 +13,13 @@
 // them; only the TCP is torn down). Later tasks extend this (decoder, input,
 // reconnect policy).
 //
+// Video (Task 14): the coordinator owns the ONE consumer of
+// MediaTransport.video: a VideoPipeline task (packets → DEBUG capture tap →
+// HEVCAssembler → VideoDecoder → `frames`), started right after the
+// transport is created, before open(). Keyframe requests, notePublished and
+// the assembler's 20 ms tick are wired inside it. A stream that turns out to
+// be H.264 fails the session ("server chose H.264").
+//
 // Concurrency: every connect runs in `connectTask` under a generation number.
 // `disconnect()` and any session failure bump the generation, cancel the task
 // and tear down; the connect task re-checks its generation after every await
@@ -20,6 +27,7 @@
 // sockets' close, and the next connect waits for a pending teardown, so the
 // UDP ports are never bound twice by this app at once.
 import CoreGraphics
+import CoreVideo
 import Observation
 import UIKit
 
@@ -64,6 +72,16 @@ final class SessionCoordinator {
     private(set) var mediaParams: ControlSession.MediaParams?
     /// The server IPv4 the current session uses.
     private(set) var serverAddress: String?
+    /// Latest decoded picture per tile; the session view's renderer reads it.
+    let frames = VideoFrameStore()
+    /// The current session decoded its first picture.
+    private(set) var hasFirstFrame = false
+    /// Connected: the session view is up.
+    var isSessionActive: Bool { if case .connected = state { true } else { false } }
+    #if DEBUG
+    /// Per-session DEBUG packet tap (video capture), created on the video task.
+    var makeVideoTap: (@Sendable () -> (any VideoPacketTap)?)?
+    #endif
 
     private let policy: Policy
     private let seams: Seams
@@ -73,6 +91,7 @@ final class SessionCoordinator {
     private var statsTask: Task<Void, Never>?
     private var mediaFailureTask: Task<Void, Never>?
     private var pendingTeardown: Task<Void, Never>?
+    private var videoTask: Task<Void, Never>?
     private var mediaConsumers: [MediaConsumer] = []
 
     /// Server IPv4s with a live session in this process: the HP ports are fixed
@@ -83,6 +102,11 @@ final class SessionCoordinator {
     init(policy: Policy = Policy(), seams: Seams = .live) {
         self.policy = policy
         self.seams = seams
+        frames.onFirstFrame = { [weak self] pb in
+            Log.video.info("M4 first frame \(CVPixelBufferGetWidth(pb))x\(CVPixelBufferGetHeight(pb)) "
+                           + "pixfmt=\(CVPixelBufferGetPixelFormatType(pb).fourCC)")
+            Task { @MainActor in self?.hasFirstFrame = true }
+        }
     }
 
     var isBusy: Bool { state == .connecting }
@@ -146,6 +170,7 @@ final class SessionCoordinator {
         let media = MediaTransport(config: .init(host: ip, controlPort: port, localAddress: localAddress),
                                    tuning: seams.mediaTuning, channelFactory: seams.channelFactory)
         self.media = media
+        startVideo(media, gen)
         for consume in mediaConsumers { consume(media) }
         watchFailures(media, gen)
         do {
@@ -185,6 +210,7 @@ final class SessionCoordinator {
             guard isCurrent(gen) else { return }
             switch outcome {
             case .started:
+                frames.configure(canvas: CGSize(width: params.canvas.width, height: params.canvas.height))
                 state = .connected(canvasWidth: params.canvas.width, canvasHeight: params.canvas.height)
                 return
             case .failed(let why):
@@ -228,6 +254,7 @@ final class SessionCoordinator {
         eventsTask?.cancel(); eventsTask = nil
         statsTask?.cancel(); statsTask = nil
         mediaFailureTask?.cancel(); mediaFailureTask = nil
+        videoTask?.cancel(); videoTask = nil
         let (c, m, server) = (control, media, serverAddress)
         control = nil
         media = nil
@@ -259,6 +286,34 @@ final class SessionCoordinator {
             guard let self, !Task.isCancelled, self.control === session else { return }
             await self.end(gen, failure.map { .failed(ControlSession.describe($0)) } ?? .idle)
         }
+    }
+
+    /// The single consumer of `media.video` for this session (see the header).
+    private func startVideo(_ media: MediaTransport, _ gen: Int) {
+        frames.reset()
+        hasFirstFrame = false
+        let hooks = VideoPipeline.Hooks(
+            activeSSRCs: { await media.activeVideoSSRCs },
+            requestKeyframe: { _ = await media.requestKeyframe(ssrc: $0) },
+            notePublished: { await media.notePublished() },
+            onNotHEVC: { [weak self] in await self?.videoIsNotHEVC(gen) })
+        let pipeline = VideoPipeline(store: frames, hooks: hooks)
+        #if DEBUG
+        let makeTap = makeVideoTap
+        #else
+        let makeTap: (@Sendable () -> (any VideoPacketTap)?)? = nil
+        #endif
+        videoTask?.cancel()
+        videoTask = Task.detached { await pipeline.run(media.video, tap: makeTap?()) }
+    }
+
+    static let notHEVCMessage = "The Mac sent H.264 video (server chose H.264); Screener needs HEVC. "
+        + "Make sure High Performance mode is available on the Mac (Apple silicon, macOS 14 or later)."
+
+    private func videoIsNotHEVC(_ gen: Int) async {
+        guard gen == generation else { return }
+        Log.app.error(Self.notHEVCMessage)
+        await end(gen, .failed(Self.notHEVCMessage))
     }
 
     /// A media socket died: the whole session fails.

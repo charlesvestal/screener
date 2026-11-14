@@ -12,8 +12,16 @@ struct HostListView: View {
                     ToolbarItem(placement: .primaryAction) {
                         Button { showingConnect = true } label: { Label("Connect", systemImage: "plus") }
                     }
+                    ToolbarItem(placement: .secondaryAction) { ShareLogButton() }
                 }
                 .sheet(isPresented: $showingConnect) { ConnectSheet(model: model) }
+        }
+        // A connected session (from ConnectSheet, or the DEBUG autoConnect)
+        // is shown full-screen; it goes away when the session ends.
+        .fullScreenCover(isPresented: Binding(
+            get: { model.isSessionActive },
+            set: { shown in if !shown, model.isSessionActive { Task { await model.disconnect() } } })) {
+            SessionView(model: model)
         }
         #if DEBUG
         .task { await DebugLaunch.runIfRequested(model) }
@@ -23,12 +31,8 @@ struct HostListView: View {
     @ViewBuilder private var content: some View {
         switch model.state {
         case .connected(let w, let h):
-            // Placeholder until SessionView (Task 14).
-            VStack(spacing: 16) {
-                Text("Connected — canvas \(w)×\(h)").font(.title2)
-                Button("Disconnect", role: .destructive) { Task { await model.disconnect() } }
-                    .buttonStyle(.borderedProminent)
-            }
+            // Behind the full-screen SessionView.
+            Text("Connected — canvas \(w)×\(h)").font(.title2)
         case .connecting:
             ProgressView("Connecting…")
         case .failed(let message):

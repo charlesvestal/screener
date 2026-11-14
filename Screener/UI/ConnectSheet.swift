@@ -60,6 +60,8 @@ struct ConnectSheet: View {
                         .disabled(!canConnect)
                 }
             }
+            // On success the sheet closes and HostListView presents the
+            // SessionView full-screen (it follows model.isSessionActive).
             .onChange(of: model.state) { _, new in
                 if case .connected = new { dismiss() }
             }

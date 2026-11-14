@@ -95,59 +95,32 @@ final class VideoCaptureWriter {
         }
     }
 
-    func close() { try? handle.close() }
+    func close() {
+        try? handle.close()
+        Log.video.info("DEBUG capture: \(count) packets written")
+    }
 }
 #endif
 
 #if DEBUG
+extension VideoCaptureWriter: VideoPacketTap {}
+
 extension VideoCaptureFile {
-    /// When $SCREENER_CAPTURE_VIDEO is set: registers a media consumer, so
-    /// each session's video packets are dumped there (subscribed before the
-    /// UDP bind, start burst included) and run through an HEVCAssembler
-    /// (keyframe requests included), logging a summary.
+    /// When $SCREENER_CAPTURE_VIDEO is set: every session's video packets are
+    /// dumped there by the coordinator's single video consumer loop
+    /// (VideoPipeline.run writes each packet to the tap before the
+    /// assembler sees it, start burst included). MediaTransport.video has
+    /// ONE consumer, so the capture never subscribes to it itself.
     @MainActor
     static func attachIfRequested(to model: SessionCoordinator) {
         guard let path = ProcessInfo.processInfo.environment[envKey], !path.isEmpty else { return }
-        model.addMediaConsumer { media in run(media, path: path) }
-    }
-
-    // TODO(Task 14): MediaTransport.video is an AsyncStream, which supports
-    // ONE consumer. This tap reads it directly, so it cannot run alongside
-    // the real decode path; Task 14 must move the capture tap into the
-    // coordinator's single video consumer (write each packet there before
-    // handing it to the assembler) instead of subscribing here.
-    private static func run(_ media: MediaTransport, path: String) {
-        guard let writer = VideoCaptureWriter(path: path) else {
-            Log.video.error("DEBUG capture: cannot open \(path)")
-            return
-        }
-        Log.video.info("DEBUG capture: writing video RTP to \(path)")
-        Task.detached {
-            var assembler: HEVCAssembler?
-            var aus = 0, idrs = 0, params = 0
-            for await p in media.video {
-                writer.write(p)
-                if assembler == nil || !(assembler!.tileSSRCs.contains(p.ssrc)) {
-                    let group = await media.activeVideoSSRCs
-                    if assembler == nil { assembler = HEVCAssembler(tileSSRCs: group) }
-                    else if group != assembler!.tileSSRCs { assembler!.resetForNewGroup(tileSSRCs: group) }
-                }
-                for o in assembler!.ingest(p) {
-                    switch o {
-                    case .accessUnit(let au): aus += 1; if au.isIDR { idrs += 1 }
-                    case .needKeyframe(let ssrc): await media.requestKeyframe(ssrc: ssrc)
-                    case .parameterSets(_, let sps, let pps):
-                        params += 1
-                        let i = HEVCSPSInfo(sps: sps)
-                        Log.video.info("DEBUG capture: parameter sets SPS \(sps.count)B PPS x\(pps.count) "
-                            + (i.map { "profile=\($0.profileIdc) chroma=\($0.chromaFormatIdc) \($0.width)x\($0.height)" } ?? ""))
-                    case .notHEVC: Log.video.error("DEBUG capture: stream is not HEVC")
-                    }
-                }
+        model.makeVideoTap = {
+            guard let writer = VideoCaptureWriter(path: path) else {
+                Log.video.error("DEBUG capture: cannot open \(path)")
+                return nil
             }
-            writer.close()
-            Log.video.info("DEBUG capture: \(writer.count) packets written; AUs=\(aus) IDRs=\(idrs) paramSets=\(params) "
-                + "stats=\(assembler.map { "\($0.stats)" } ?? "-")")
+            Log.video.info("DEBUG capture: writing video RTP to \(path)")
+            return writer
         }
     }
 }
