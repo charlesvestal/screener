@@ -80,7 +80,7 @@ final class MemoryPipeEnd: ByteStream, @unchecked Sendable {
             switch takeExactlyIfPossible(count) {
             case .data(let result): return result
             case .closed: throw TransportError.closed
-            case .wouldBlock: try await waitForMore()
+            case .wouldBlock: try await waitForMore(isReady: { self.buffer.count >= count })
             }
         }
     }
@@ -90,7 +90,7 @@ final class MemoryPipeEnd: ByteStream, @unchecked Sendable {
             switch takeSomeIfPossible() {
             case .data(let result): return result
             case .closed: throw TransportError.closed
-            case .wouldBlock: try await waitForMore()
+            case .wouldBlock: try await waitForMore(isReady: { !self.buffer.isEmpty })
             }
         }
     }
@@ -169,21 +169,32 @@ final class MemoryPipeEnd: ByteStream, @unchecked Sendable {
         return all
     }
 
-    /// Synchronous, lock-protected: registers a waiter continuation and returns it.
-    private func registerWaiter(_ id: UUID, _ cont: CheckedContinuation<Void, Never>) {
-        lock.lock()
-        waiters[id] = cont
-        lock.unlock()
-    }
-
-    /// Suspends until new data arrives or the pipe closes. Throws `CancellationError`
-    /// if the calling task is cancelled while suspended, leaving this end open.
-    private func waitForMore() async throws {
+    /// Suspends until new data arrives, the pipe closes, or the calling task is
+    /// cancelled. `isReady` is evaluated *under `lock`*, in the very same critical
+    /// section that registers the waiter continuation, so there is no gap between
+    /// "nothing to read yet" and "now registered to be woken up": any `deliver`/
+    /// `markClosed` that lands before this check sees it (because `isReady`/`closed`
+    /// now holds), and any that lands after sees the registered waiter (because
+    /// `drainWaitersLocked` runs under the same lock). Without this, a reader could
+    /// observe an empty buffer, then have data (or close, or cancellation) delivered
+    /// in the gap before it registers — a lost wakeup that hangs forever.
+    ///
+    /// Throws `CancellationError` if the calling task is cancelled while suspended
+    /// (or was already cancelled when this was called), leaving this end open.
+    /// `isReady` must only read state guarded by `lock` (e.g. `buffer`), never
+    /// re-enter any of this type's locking methods.
+    private func waitForMore(isReady: @escaping () -> Bool) async throws {
         let id = UUID()
         try await withTaskCancellationHandler {
-            try Task.checkCancellation()
-            await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
-                registerWaiter(id, cont)
+            try await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+                lock.lock()
+                if isReady() || closed || Task.isCancelled {
+                    lock.unlock()
+                    cont.resume()
+                } else {
+                    waiters[id] = cont
+                    lock.unlock()
+                }
             }
             try Task.checkCancellation()
         } onCancel: { [weak self] in
@@ -256,25 +267,26 @@ final class TCPByteStream: ByteStream, @unchecked Sendable {
                 // self-contained and only ever resumes if it wins the race (guarded
                 // by `resumeState`), so there is nothing to explicitly cancel when
                 // the *other* path wins instead.
+                // Cleared on every resume path below (ready/failed/cancelled/timeout):
+                // once connect has resumed (one way or another), there's no
+                // reader-facing need for further state updates, and clearing it
+                // breaks the connection↔handler reference cycle this closure forms.
                 connection.stateUpdateHandler = { state in
                     switch state {
                     case .ready:
                         if resumeState.markResumed() {
-                            // Clear the handler now that connect has resumed: reads
-                            // already surface errors via `receive`'s completion, so
-                            // there's no reader-facing need for state updates past
-                            // this point, and clearing it breaks the
-                            // connection↔handler reference cycle this closure forms.
                             connection.stateUpdateHandler = nil
                             cont.resume(returning: TCPByteStream(connection: connection, queue: queue))
                         }
                     case .failed(let error):
                         if resumeState.markResumed() {
+                            connection.stateUpdateHandler = nil
                             connection.cancel()
                             cont.resume(throwing: TransportError.failed("\(error)"))
                         }
                     case .cancelled:
                         if resumeState.markResumed() {
+                            connection.stateUpdateHandler = nil
                             cont.resume(throwing: TransportError.closed)
                         }
                     default:
@@ -285,6 +297,7 @@ final class TCPByteStream: ByteStream, @unchecked Sendable {
                 connection.start(queue: queue)
                 queue.asyncAfter(deadline: .now() + timeout.asDispatchTimeInterval) {
                     if resumeState.markResumed() {
+                        connection.stateUpdateHandler = nil
                         connection.cancel()
                         cont.resume(throwing: TransportError.timeout)
                     }
@@ -340,7 +353,16 @@ final class TCPByteStream: ByteStream, @unchecked Sendable {
         try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
             connection.send(content: data, completion: .contentProcessed { error in
                 if let error {
-                    cont.resume(throwing: TransportError.failed("\(error)"))
+                    // Matches `receiveChunk`: a connection cancelled via `close()` or a
+                    // different in-flight read's cancellation surfaces a pending send's
+                    // failure as POSIX ECANCELED. Report that as `.closed` rather than
+                    // `.failed`, since "the stream is closed" is the accurate, documented
+                    // outcome callers should be matching on.
+                    if case .posix(.ECANCELED) = error {
+                        cont.resume(throwing: TransportError.closed)
+                    } else {
+                        cont.resume(throwing: TransportError.failed("\(error)"))
+                    }
                 } else {
                     cont.resume(returning: ())
                 }

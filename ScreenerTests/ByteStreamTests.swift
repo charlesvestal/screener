@@ -50,6 +50,42 @@ final class ByteStreamTests: XCTestCase {
         catch TransportError.closed {}
     }
 
+    /// Stress test for the lost-wakeup race in `MemoryPipeEnd.waitForMore`: before
+    /// the fix, a reader could observe an empty buffer, unlock, and then register as
+    /// a waiter *after* the writer had already delivered and drained waiters in that
+    /// gap, hanging forever. Each iteration uses a fresh pipe and a tight per-read
+    /// timeout so a regression fails the test instead of hanging the whole suite.
+    func testPipeReadWriteStressDoesNotHang() async throws {
+        for i in 0..<2000 {
+            let (a, b) = MemoryPipe.pair()
+            let writer = Task { try await a.write(Data([UInt8(truncatingIfNeeded: i)])) }
+            let got = try await withTimeout(seconds: 2) { try await b.read(exactly: 1) }
+            XCTAssertEqual(got, Data([UInt8(truncatingIfNeeded: i)]), "iteration \(i)")
+            _ = try await writer.value
+        }
+    }
+
+    /// Stress test for cancellation racing the same lost-wakeup window: cancelling a
+    /// task right as it starts a blocking read must always resolve (either throwing
+    /// `CancellationError` or `TransportError.closed`), never hang.
+    func testPipeReadCancelRaceStressDoesNotHang() async throws {
+        for i in 0..<2000 {
+            let (_, b) = MemoryPipe.pair()
+            let task = Task { try await b.read(exactly: 1) }
+            task.cancel()
+            try await withTimeout(seconds: 2) {
+                do {
+                    _ = try await task.value
+                    XCTFail("iteration \(i): expected an error")
+                } catch is CancellationError {
+                } catch TransportError.closed {
+                } catch {
+                    XCTFail("iteration \(i): unexpected error \(error)")
+                }
+            }
+        }
+    }
+
     func testPipeReadSomeReturnsWhateverIsBuffered() async throws {
         let (a, b) = MemoryPipe.pair()
         try await a.write(Data([1, 2, 3]))
@@ -171,6 +207,32 @@ final class ByteStreamTests: XCTestCase {
         }
     }
 
+    func testTCPWriteAfterCloseMapsToClosed() async throws {
+        let listener = try NWListener(using: .tcp)
+        defer { listener.cancel() }
+        let ready = expectation(description: "listener ready")
+        listener.newConnectionHandler = { conn in conn.start(queue: .main) }
+        listener.stateUpdateHandler = { state in
+            if case .ready = state { ready.fulfill() }
+        }
+        listener.start(queue: .main)
+        await fulfillment(of: [ready], timeout: 5)
+
+        guard let port = listener.port else { XCTFail("no port"); return }
+        let client = try await TCPByteStream.connect(host: "127.0.0.1", port: port.rawValue, timeout: .seconds(5))
+
+        client.close()
+
+        do {
+            try await client.write(Data([0x01]))
+            XCTFail("expected write after close to throw")
+        } catch TransportError.closed {
+        } catch TransportError.failed {
+            // Also acceptable: some simulator network stacks surface a cancelled
+            // connection's send failure as a different NWError.
+        }
+    }
+
     func testTCPConcurrentReadsThrowFailed() async throws {
         let listener = try NWListener(using: .tcp)
         defer { listener.cancel() }
@@ -214,6 +276,24 @@ final class ByteStreamTests: XCTestCase {
         }
     }
 }
+
+/// Runs `operation`, failing the test (rather than hanging) if it doesn't complete
+/// within `seconds`. Used by the stress tests so a lost-wakeup regression surfaces as
+/// a fast, deterministic failure instead of a suite-wide hang/timeout.
+private func withTimeout<T: Sendable>(seconds: TimeInterval, _ operation: @Sendable @escaping () async throws -> T) async throws -> T {
+    try await withThrowingTaskGroup(of: T.self) { group in
+        group.addTask { try await operation() }
+        group.addTask {
+            try await Task.sleep(for: .seconds(seconds))
+            throw TimeoutError()
+        }
+        let result = try await group.next()!
+        group.cancelAll()
+        return result
+    }
+}
+
+private struct TimeoutError: Error {}
 
 /// Accumulates bytes across repeated `NWConnection.receive` calls until `target`
 /// bytes are collected. A plain `@unchecked Sendable` class: every mutation and the
