@@ -177,16 +177,24 @@
       ],
       "evidence": "Sim live 2026-11-14 14:53: 'M4 first frame 1600x304 pixfmt=444f', 'video fps=59.3 decode_ms=4.41 errors=0 mode=hw/444f'; coordinator viewed screenshot: Mac desktop rendered correctly. Device confirmation pending (USB install, ask user first). | DEVICE 2026-11-14: iPad Pro M5 log 'VT session ready mode=hw/444f', 'M4 composite: 4 strips of 2752x528 \u2192 2752x2064', 'video fps=59.4 decode_ms=1.10 errors=0'; user confirmed: 'yes picture looked right'.",
       "followUps": [
-        "fix agent in progress: VideoFrameStore epoch, decoder fallback policy, on-demand drawing/colorspace, startup EPIPE transient, SRP timing, background/foreground reconnect"
+        "fix agent in progress: VideoFrameStore epoch, decoder fallback policy, on-demand drawing/colorspace, startup EPIPE transient, SRP timing, background/foreground reconnect",
+        "QUALITY: user reports low bitrate/artifact flashing/choppy drags; network clean (loss\u22480, decode 1.3ms). Investigating LTR acks (never sent), RR contents, quality_gate.py \u2014 agent in progress."
       ]
     },
     {
       "id": 15,
       "subject": "Task 15: Input: pointer, touch, keyboard, cursor (Milestone 5)",
-      "status": "pending",
+      "status": "completed_pending_review",
       "description": "**Goal:** Full remote control from trackpad/mouse, touch and hardware keyboard, with the server cursor rendered at the local pointer position.\n\n> **USER-ORDERED GATE: NON-SKIPPABLE.** This task was requested by the user in the current conversation. It MUST NOT be closed by walking around it, by declaring it \"verified inline\", or by substituting a cheaper check. Close only after every item in `acceptanceCriteria` has been re-validated independently, with output captured.\n\n**Files:**\n- Create: `Screener/Input/Keysyms.swift`, `Screener/Input/InputController.swift`, `Screener/Input/RemoteInputView.swift`\n- Modify: `Screener/Media/MetalRenderer.swift` (cursor overlay quad from the `0x450` cache)\n- Modify: `Screener/UI/SessionView.swift` (host `RemoteInputView` over the Metal view; keyboard toolbar button)\n- Test: `ScreenerTests/KeysymsTests.swift`, `ScreenerTests/InputControllerTests.swift`\n\n**Acceptance Criteria:**\n- [ ] `InputController` maps view points \u2192 host coordinates using the latest `DisplayLayout`. Pointer events go in the coordinate space the reference uses: read `InputController.set_server_dims` / `pointer_event` in `input.py`, which decides between scaled and backing geometry. It sends whichever message type the reference sends (standard `0x05` pointer vs `0x10` encrypted), port `input.py` exactly. Scroll uses the reference's `scroll_event` (button 4/5/6/7 press-release pairs with its step scaling).\n- [ ] `RemoteInputView` (UIKit): `UIPointerInteraction` hides the local pointer; `UIHoverGestureRecognizer` handles movement; it also handles `pressesBegan/Ended` with `UIKey.keyCode` and modifiers, and trackpad two-finger scroll via `UIPanGestureRecognizer(allowedScrollTypesMask: .continuous)`. Touch mode: tap = left click; two-finger tap = right click; long-press + drag = drag; two-finger pan = scroll. A hidden `UITextField` becomes first responder for the on-screen keyboard (text insertion \u2192 keysym down/up per character).\n- [ ] `Keysyms.keysym(for: UIKeyboardHIDUsage, shifted: Bool) -> UInt32?` covers letters, digits, punctuation, F1\u2013F12, arrows, Home/End/PgUp/PgDn, Return, Tab, Escape, Backspace, Delete, and Shift/Control/Option/Command (Command \u2192 `0xffe7` Meta_L, or whatever the reference's keyboard path maps Command to: check `frontend/desktop/keyboard_grab.py`)\n- [ ] The cursor STORE/SELECT cache renders the BGRA+alpha-plane pixmap (RFC \u00a78.3) as a texture at the local pointer position minus the hotspot\n- [ ] Tests: keysym table spot checks (a \u2192 0x61, Shift+a \u2192 0x41, Return \u2192 0xff0d, Left \u2192 0xff51); InputController coordinate mapping for a 1376\u00d71032 view onto 1920\u00d71080 scaled with aspect-fit letterboxing (centre point \u2192 (960,540); a point in the letterbox clamps to the edge)\n- [ ] **On device:** the user confirms they can move the pointer, click, right-click, scroll, drag a window, and type into TextEdit on the Mac from the iPad's Magic Keyboard/trackpad and from touch\n\n**Verify:** `xcodebuild test ... -only-testing:ScreenerTests/KeysymsTests -only-testing:ScreenerTests/InputControllerTests` \u2192 `** TEST SUCCEEDED **`; then a live check with the user's confirmation for each listed action\n\n```json:metadata\n{\"files\": [\"Screener/Input/Keysyms.swift\", \"Screener/Input/InputController.swift\", \"Screener/Input/RemoteInputView.swift\", \"Screener/Media/MetalRenderer.swift\", \"Screener/UI/SessionView.swift\", \"ScreenerTests/KeysymsTests.swift\", \"ScreenerTests/InputControllerTests.swift\"], \"verifyCommand\": \"`xcodebuild test ... -only-testing:ScreenerTests/KeysymsTests -only-testing:ScreenerTests/InputControllerTests` \\u2192 `** TEST SUCCEEDED **`; then a live check with the user's confirmation for each listed action\", \"acceptanceCriteria\": [\"`InputController` maps view points \\u2192 host coordinates using the latest `DisplayLayout`. Pointer events go in the coordinate space the reference uses: read `InputController.set_server_dims` / `pointer_event` in `input.py`, which decides between scaled and backing geometry. It sends whichever message type the reference sends (standard `0x05` pointer vs `0x10` encrypted), port `input.py` exactly. Scroll uses the reference's `scroll_event` (button 4/5/6/7 press-release pairs with its step scaling).\", \"`RemoteInputView` (UIKit): `UIPointerInteraction` hides the local pointer; `UIHoverGestureRecognizer` handles movement; it also handles `pressesBegan/Ended` with `UIKey.keyCode` and modifiers, and trackpad two-finger scroll via `UIPanGestureRecognizer(allowedScrollTypesMask: .continuous)`. Touch mode: tap = left click; two-finger tap = right click; long-press + drag = drag; two-finger pan = scroll. A hidden `UITextField` becomes first responder for the on-screen keyboard (text insertion \\u2192 keysym down/up per character).\", \"`Keysyms.keysym(for: UIKeyboardHIDUsage, shifted: Bool) -> UInt32?` covers letters, digits, punctuation, F1\\u2013F12, arrows, Home/End/PgUp/PgDn, Return, Tab, Escape, Backspace, Delete, and Shift/Control/Option/Command (Command \\u2192 `0xffe7` Meta_L, or whatever the reference's keyboard path maps Command to: check `frontend/desktop/keyboard_grab.py`)\", \"The cursor STORE/SELECT cache renders the BGRA+alpha-plane pixmap (RFC \\u00a78.3) as a texture at the local pointer position minus the hotspot\", \"Tests: keysym table spot checks (a \\u2192 0x61, Shift+a \\u2192 0x41, Return \\u2192 0xff0d, Left \\u2192 0xff51); InputController coordinate mapping for a 1376\\u00d71032 view onto 1920\\u00d71080 scaled with aspect-fit letterboxing (centre point \\u2192 (960,540); a point in the letterbox clamps to the edge)\", \"**On device:** the user confirms they can move the pointer, click, right-click, scroll, drag a window, and type into TextEdit on the Mac from the iPad's Magic Keyboard/trackpad and from touch\"], \"modelTier\": \"standard\", \"userGate\": true, \"tags\": [\"user-gate\"]}\n```",
       "blockedBy": [
         14
+      ],
+      "evidence": "DEVICE 2026-11-14: user 'it is working how i would expect' (pointer, click, keyboard, touch).",
+      "pendingFixes": [
+        "key repeat: timer re-sends key-down (500ms delay, ~33ms) like reference app.py:639; cancel on up/release",
+        "release held keys + pointer buttons on willResignActive/sceneWillDeactivate and before teardown (await bounded flush); input.didSet must not silently clear",
+        "0x451 backing \u2192 frames.configure(canvas:) so video/input/cursor share one canvas; drawCursor fits layout.canvas; test",
+        "minor: layout-aware chars via key.characters when no Cmd/Ctrl/Opt; Caps Lock double-apply; ISO key; non-Latin1 keysym 0x01000000|cp; keyboardProxy alpha=0 if hidden fails; cursor cache doc; hide system pointer only over video rect; scroll inertia; pointsPerWheelNotch tune; coalesce scroll bursts"
       ]
     },
     {
@@ -224,6 +232,16 @@
       "blockedBy": [
         14,
         15
+      ],
+      "pendingFixes": [
+        "Local Network msg only on EPERM/EACCES or NWPath unsatisfiedReason==.localNetworkDenied (fail fast); routing errnos \u2192 'Can't reach this Mac\u2026'; route via fail()",
+        "background close: close TCP FIRST and await .cancelled (\u22641 s) before ending background task; log confirmation",
+        "first-frame deadline ~10 s after .connected \u2192 keyframe/rebuild \u2192 friendly failure",
+        "onFirstFrame generation check; reconnect() checks foreground; ECONNRESET on Mac 'Stop' must not auto-reconnect (verify live)",
+        "nil drawable \u2192 setNeedsDisplay again; clear lastRequest creds on failed end",
+        "THIRD_PARTY_NOTICES + Acknowledgements screen + README credit for BigInt (MIT)",
+        "IPv4Resolver timeout ~10 s",
+        "tests: foreground-loss reconnect cap, no reconnect after user disconnect, EHOSTUNREACH+timeout message, TCP closed before teardown completes"
       ]
     },
     {
@@ -274,5 +292,5 @@
       ]
     }
   ],
-  "lastUpdated": "2026-11-14T15:18:45.297217"
+  "lastUpdated": "2026-11-14T16:08:11.246881"
 }
