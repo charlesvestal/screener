@@ -27,7 +27,11 @@ targets:
   Screener:
     type: application
     platform: iOS
-    sources: [Screener]
+    sources:
+      - Screener
+      # Shown by the in-app Acknowledgements sheet (UI/AcknowledgementsView).
+      - path: THIRD_PARTY_NOTICES
+        buildPhase: resources
     dependencies:
       - target: BigInt
     info:

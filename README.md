@@ -16,6 +16,13 @@ xcodegen generate
 open Screener.xcodeproj
 ```
 
+## Third-party code
+
+- [iShareScreen](https://github.com/renegadelink/iShareScreen) (AGPL-3.0): the High Performance protocol logic is ported in part from it.
+- [BigInt](https://github.com/attaswift/BigInt) by Károly Lőrentey (MIT): vendored in `Vendor/BigInt` for the SRP arithmetic.
+
+The full notices are in [THIRD_PARTY_NOTICES](THIRD_PARTY_NOTICES) and in the app (Hosts › About › Acknowledgements).
+
 ## Notes
 
 High Performance mode forces display privacy on the host Mac: the host's screen goes dark while a session is active.

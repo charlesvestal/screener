@@ -4,6 +4,7 @@ import UIKit
 struct HostListView: View {
     @State private var model = SessionCoordinator()
     @State private var showingConnect = false
+    @State private var showingAbout = false
     @Environment(\.scenePhase) private var scenePhase
 
     var body: some View {
@@ -15,8 +16,12 @@ struct HostListView: View {
                         Button { showingConnect = true } label: { Label("Connect", systemImage: "plus") }
                     }
                     ToolbarItem(placement: .secondaryAction) { ShareLogButton() }
+                    ToolbarItem(placement: .topBarLeading) {
+                        Button { showingAbout = true } label: { Label("About", systemImage: "info.circle") }
+                    }
                 }
                 .sheet(isPresented: $showingConnect) { ConnectSheet(model: model) }
+                .sheet(isPresented: $showingAbout) { AcknowledgementsView() }
         }
         // A connected session (from ConnectSheet, or the DEBUG autoConnect)
         // is shown full-screen; it goes away when the session ends.
@@ -27,6 +32,8 @@ struct HostListView: View {
         }
         // Background: close the session at once (the Mac stops sharing);
         // active again: reconnect (SessionCoordinator / LifecyclePolicy).
+        // The background task ends only after enterBackground returns, i.e.
+        // after the TCP close went out (awaited, ≤ 1 s) and media closed.
         .onChange(of: scenePhase) { _, phase in
             switch phase {
             case .background:
