@@ -5,3 +5,4 @@ build/
 xcuserdata/
 Tools/fixtures/.venv/
 .build/
+build-sim/
