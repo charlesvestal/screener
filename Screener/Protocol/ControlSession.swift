@@ -42,6 +42,9 @@
 //     (the reference itself later added `leftover_msgs` for the same reason).
 //   * `_read_video_answer` returns "degenerate" when the first ~100 bytes it
 //     reads lack the answer; we wait for an actual answer candidate instead.
+//     A silent `retryAnswerWait` (5 s, its socket timeout) still counts as
+//     degenerate and re-sends the same 0x1c, exactly like the reference —
+//     the server does not reliably answer the first offer.
 //   * `rfb.warmup_tcp` is not ported (plan: only if the live test needs it).
 //     The reference runs it by default (SessionConfig.warmup_tcp=True) before
 //     every session: a throwaway TCP that exchanges banners + the type list,
@@ -118,7 +121,9 @@ actor ControlSession {
 
     /// Timing knobs; defaults are the reference's values.
     struct Tuning: Sendable {
-        /// Per handshake step (connect, handshake, server init, rekey, media answer).
+        /// Per handshake step (connect, handshake, server init, rekey). The media
+        /// answer instead waits `retryAnswerWait` per offer, up to
+        /// `degenerateRetryLimit` re-sends.
         /// Auth gets twice this (primary + fallback attempt).
         var stepTimeout: Duration = .seconds(10)
         var postViewerInfoSettle: Duration = .milliseconds(100)   // _POST_VIEWERINFO_SETTLE_S
@@ -180,6 +185,9 @@ actor ControlSession {
     private var rxTask: Task<Void, Never>?
     private var pollTask: Task<Void, Never>?
     private var loggedRecordActive = false
+    #if DEBUG
+    private var rxRecordCount = 0
+    #endif
 
     // Serialises every wire write (seal + write is one step; RecordLayer contract).
     private var writing = false
@@ -293,17 +301,27 @@ actor ControlSession {
             Log.control.info("0x1c sent (encrypted)")
         }
 
-        // 6) Answer, re-querying on a degenerate canvas.
-        var outcome = try await awaitAnswer(timeout: limit)
-        if case .timedOut = outcome { throw ControlSessionError.timeout(step: "media answer") }
+        // 6) Answer, re-querying on a degenerate canvas OR on silence.
+        // negotiation._read_video_answer returns (0,0,0) both for a
+        // canvas-less answer and for a 5 s read timeout, and _phase_media_offer
+        // re-sends the same 0x1c in both cases. The server does not reliably
+        // answer the first offer: a reference capture (conn 2) shows the first
+        // 0x1c unanswered for 3 s and the re-sent one answered in 67 ms.
+        var outcome = try await awaitAnswer(timeout: tuning.retryAnswerWait)
         var attempt = 0
+        var lastTimedOut = false
         while true {
             if case .answer = outcome { break }
-            guard attempt < tuning.degenerateRetryLimit else { throw ControlSessionError.mediaNegotiationFailed }
+            if case .timedOut = outcome { lastTimedOut = true } else { lastTimedOut = false }
+            guard attempt < tuning.degenerateRetryLimit else {
+                if lastTimedOut { throw ControlSessionError.timeout(step: "media answer") }
+                throw ControlSessionError.mediaNegotiationFailed
+            }
             attempt += 1
             try await Task.sleep(for: tuning.degenerateRetryInterval)
             try await send(msg1c)
-            Log.control.info("0x1c re-query \(attempt)/\(tuning.degenerateRetryLimit) (degenerate canvas)")
+            let why = lastTimedOut ? "no answer" : "degenerate canvas"
+            Log.control.info("0x1c re-query \(attempt)/\(tuning.degenerateRetryLimit) (\(why))")
             outcome = try await awaitAnswer(timeout: tuning.retryAnswerWait)
         }
         collectingAnswers = false
@@ -357,7 +375,13 @@ actor ControlSession {
         var others: [ServerEvent] = []
         var chunk = first
         while true {
+            #if DEBUG
+            wireLog("rx plain chunk", chunk, prefix: 48)
+            #endif
             for e in try parser.feed(chunk) {
+                #if DEBUG
+                Log.control.info("wire rx plain event \(Self.eventSummary(e))")
+                #endif
                 if case .rekey(let body) = e { rekeyBody = body } else { others.append(e) }
             }
             if parser.isHalted { break }
@@ -369,7 +393,11 @@ actor ControlSession {
         }
         guard let rekeyBody else { throw ControlSessionError.noRekey }
         let record = try RecordLayer(rekeyBody: rekeyBody, wrapKey: wrapKey)
-        return RekeyResult(record: record, tail: parser.takeRemainder(), events: others)
+        let tail = parser.takeRemainder()
+        #if DEBUG
+        Log.control.info("wire rekey parsed; ciphertext tail \(tail.count)B")
+        #endif
+        return RekeyResult(record: record, tail: tail, events: others)
     }
 
     // MARK: answer hand-off
@@ -412,6 +440,9 @@ actor ControlSession {
         await acquireWrite()
         defer { releaseWrite() }
         guard !isClosed, let stream, let record else { throw ControlSessionError.closed }
+        #if DEBUG
+        Self.wireLog("tx enc", body, prefix: 32)
+        #endif
         try await stream.write(try record.seal(body))
     }
 
@@ -419,6 +450,9 @@ actor ControlSession {
         await acquireWrite()
         defer { releaseWrite() }
         guard !isClosed, let stream else { throw ControlSessionError.closed }
+        #if DEBUG
+        Self.wireLog("tx plain", data, prefix: 32)
+        #endif
         try await stream.write(data)
     }
 
@@ -441,13 +475,22 @@ actor ControlSession {
         do {
             while !Task.isCancelled {
                 if !chunk.isEmpty {
+                    #if DEBUG
+                    Log.control.info("wire rx chunk \(chunk.count)B")
+                    #endif
                     for frame in try splitter.push(chunk) {
                         let body = try record.open(ciphertext: frame)
                         if !loggedRecordActive {
                             loggedRecordActive = true
                             Log.control.info("M2 record layer active")
                         }
-                        try await handle(try parser.feed(body))
+                        let events = try parser.feed(body)
+                        #if DEBUG
+                        rxRecordCount += 1
+                        Self.wireLog("rx rec#\(rxRecordCount) ct=\(frame.count)B", body, prefix: 48)
+                        Log.control.info("wire   events: [\(events.map(Self.eventSummary).joined(separator: ", "))]")
+                        #endif
+                        try await handle(events)
                     }
                 }
                 chunk = try await stream.readSome()
@@ -508,6 +551,33 @@ actor ControlSession {
             }
         }
     }
+
+    #if DEBUG
+    // MARK: wire instrumentation (DEBUG only; never called with auth material)
+
+    static func wireLog(_ what: String, _ d: Data, prefix: Int) {
+        let hex = d.prefix(prefix).map { String(format: "%02x", $0) }.joined()
+        Log.control.info("wire \(what) len=\(d.count) type=0x\(String(format: "%02x", d.first ?? 0)) \(hex)")
+    }
+
+    static func eventSummary(_ e: ServerEvent) -> String {
+        switch e {
+        case .rekey: return "rekey"
+        case .displayLayout(let l): return "layout(\(l.backingWidth)x\(l.backingHeight),\(l.displays.count)d)"
+        case .cursorStore(let id, _, let s, _, _): return "cursorStore(\(id),\(s.width)x\(s.height))"
+        case .cursorSelect(let id): return "cursorSelect(\(id))"
+        case .keyboardSource(let s, let sec): return "kbdSource(\(s),\(sec))"
+        case .deviceInfo(let m): return "deviceInfo(\(m))"
+        case .vendorKeysyms(let k): return "keysyms(\(k.count))"
+        case .mediaStreamAnswer(let d): return "answerCandidate(\(d.count)B)"
+        case .miscStatus(let c): return "misc(\(c))"
+        case .clipboard(let h, let c): return "clipboard(\(h.compressedSize),chunk \(c.count))"
+        case .bell: return "bell"
+        case .zlibRect(_, _, let w, let h, let p): return "zlib(\(w)x\(h),\(p.count)B)"
+        case .unknown(let t, let enc): return "unknown(0x\(String(t, radix: 16))\(enc.map { ",enc=\($0)" } ?? ""))"
+        }
+    }
+    #endif
 
     // MARK: teardown
 

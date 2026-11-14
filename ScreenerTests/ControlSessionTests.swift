@@ -342,6 +342,68 @@ final class ControlSessionTests: XCTestCase {
         XCTAssertEqual(params.canvas.width, 3840)
         await session.close()
     }
+
+    /// Live 2026-11-14 (loopback, reference order): the server stayed silent
+    /// for >10 s after the first 0x1c and the session gave up; a reference
+    /// capture shows a first 0x1c unanswered for 3 s and the RE-SENT one
+    /// answered in 67 ms. negotiation._read_video_answer treats a 5 s read
+    /// timeout like a degenerate canvas, so silence must re-send the same 0x1c.
+    func testSilentServerTriggersOfferResend() async throws {
+        let (client, server) = MemoryPipe.pair()
+        let fake = FakeServer(server)
+        let bplist = try Self.answerBplist()
+        var tuning = ControlSession.Tuning.fast
+        tuning.retryAnswerWait = .milliseconds(100)
+        let session = makeSession(client, order: .reference, tuning: tuning)
+        let serverTask = Task { () -> Data in
+            try await fake.handshakeAndServerInit()
+            _ = try await server.read(exactly: 78)
+            try await fake.sendRekeyWithEncryptedTail()
+            _ = try await fake.readPlainSetDisplayConfiguration()
+            _ = try await fake.readPlainSetEncodings()
+            _ = try await server.read(exactly: 8)
+            var offer = Data()
+            for i in 0..<3 { let r = try await fake.readRecord(); if i == 1 { offer = r } }
+            // Say nothing: the client must re-send the identical offer.
+            let again = try await fake.readRecord()
+            XCTAssertEqual(again, offer)
+            try await fake.sendAnswer(bplist)
+            return again
+        }
+        let params = try await session.start()
+        _ = try await serverTask.value
+        XCTAssertEqual(params.canvas.width, 3840)
+        await session.close()
+    }
+
+    /// After every re-send went unanswered the failure is still a timeout.
+    func testAnswerTimeoutAfterAllResends() async throws {
+        let (client, server) = MemoryPipe.pair()
+        let fake = FakeServer(server)
+        var tuning = ControlSession.Tuning.fast
+        tuning.retryAnswerWait = .milliseconds(20)
+        tuning.degenerateRetryLimit = 2
+        let session = makeSession(client, order: .reference, tuning: tuning)
+        let serverTask = Task { () -> Int in
+            try await fake.handshakeAndServerInit()
+            _ = try await server.read(exactly: 78)
+            try await fake.sendRekeyWithEncryptedTail()
+            _ = try await fake.readPlainSetDisplayConfiguration()
+            _ = try await fake.readPlainSetEncodings()
+            _ = try await server.read(exactly: 8)
+            var offers = 0
+            while let r = try? await fake.readRecord() { if r.first == 0x1c { offers += 1 } }
+            return offers
+        }
+        do {
+            _ = try await session.start()
+            XCTFail("expected timeout")
+        } catch let e as ControlSessionError {
+            XCTAssertEqual(e, .timeout(step: "media answer"))
+        }
+        let offers = try await serverTask.value
+        XCTAssertEqual(offers, 3)   // the original + 2 re-sends
+    }
 }
 
 extension ControlSession.Tuning {
