@@ -1,6 +1,6 @@
 name: Screener
 options:
-  bundleIdPrefix: com.charlesvestal
+  bundleIdPrefix: com.vestal
   deploymentTarget:
     iOS: "26.0"
   createIntermediateGroups: true
@@ -37,7 +37,7 @@ targets:
         UIApplicationSupportsIndirectInputEvents: true
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: com.charlesvestal.screener
+        PRODUCT_BUNDLE_IDENTIFIER: com.vestal.screener
   ScreenerTests:
     type: bundle.unit-test
     platform: iOS
