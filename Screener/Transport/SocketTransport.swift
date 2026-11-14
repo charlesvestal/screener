@@ -173,6 +173,46 @@ enum DatagramChannelError: Error, Equatable, CustomStringConvertible {
     }
 }
 
+/// What a socket error means for a media flow (pure; the channel holds one
+/// under its lock).
+///   * EBADF / ENOTSOCK / ENOTCONN / EADDRNOTAVAIL (and EPIPE: shut down):
+///     the socket or its address is gone; fatal at once.
+///   * EHOSTUNREACH / EHOSTDOWN / ENETUNREACH / ENETDOWN: routing trouble
+///     (Wi-Fi roam, sleep, an ICMP unreachable). Fatal only when they keep
+///     coming for more than `routingGrace` with no successful send or
+///     receive in between; any success restarts the clock.
+///   * Everything else (ECONNREFUSED from a racing punch, ENOBUFS, ...) is
+///     transient.
+/// Transient errors are logged at most once per `logInterval` per errno.
+struct SocketErrorPolicy {
+    enum Verdict: Equatable { case transient(log: Bool), fatal }
+
+    static let routingGrace: Duration = .seconds(3)
+    static let logInterval: Duration = .seconds(1)
+
+    static func isFatal(_ e: Int32) -> Bool { [EBADF, ENOTSOCK, ENOTCONN, EADDRNOTAVAIL, EPIPE].contains(e) }
+    static func isRouting(_ e: Int32) -> Bool { [EHOSTUNREACH, EHOSTDOWN, ENETUNREACH, ENETDOWN].contains(e) }
+
+    /// Start of the current unbroken run of routing errors.
+    private var routingSince: ContinuousClock.Instant?
+    private var lastLogged: [Int32: ContinuousClock.Instant] = [:]
+
+    /// A send or receive succeeded: the network works.
+    mutating func noteSuccess() { routingSince = nil }
+
+    mutating func note(error e: Int32, at now: ContinuousClock.Instant) -> Verdict {
+        if Self.isFatal(e) { return .fatal }
+        if Self.isRouting(e) {
+            let since = routingSince ?? now
+            routingSince = since
+            if now - since > Self.routingGrace { return .fatal }
+        }
+        if let last = lastLogged[e], now - last < Self.logInterval { return .transient(log: false) }
+        lastLogged[e] = now
+        return .transient(log: true)
+    }
+}
+
 /// One media flow as a UDP socket bound to a fixed local port and connected
 /// to the server's matching port (`_bind_udp`).
 ///   * SO_REUSEADDR + SO_REUSEPORT: a second viewer (another coordinator, a
@@ -184,8 +224,9 @@ enum DatagramChannelError: Error, Equatable, CustomStringConvertible {
 ///     effective value is reported as an event.
 ///   * Connected UDP reports ICMP port-unreachable as ECONNREFUSED on the
 ///     next call; that is expected while punches race the server's bind and is
-///     only counted. Errors that mean the socket or the network is gone
-///     (`isFatal`) stop the channel and are reported through `onFailure`.
+///     only counted. Errors that mean the socket is gone, or routing errors
+///     that persist (`SocketErrorPolicy`), stop the channel and are reported
+///     through `onFailure`.
 final class SocketDatagramChannel: DatagramChannel, @unchecked Sendable {
     static let preferredReceiveBuffer: Int32 = 4 * 1024 * 1024
     static let minimumReceiveBuffer: Int32 = 256 * 1024
@@ -196,7 +237,8 @@ final class SocketDatagramChannel: DatagramChannel, @unchecked Sendable {
     private let localHost: String?
     private let localPort: UInt16
     private let queue: DispatchQueue
-    // `lock` guards fd / source / closed / failed / handlers / counters / closeWaiters.
+    // `lock` guards fd / source / closed / failed / handlers / counters /
+    // errorPolicy / closeWaiters.
     private let lock = NSLock()
     private var fd: Int32 = -1
     private var source: DispatchSourceRead?
@@ -208,6 +250,7 @@ final class SocketDatagramChannel: DatagramChannel, @unchecked Sendable {
     private var onEvent: (@Sendable (String) -> Void)?
     private var onFailure: (@Sendable (String) -> Void)?
     private var sendErrors = 0, receiveErrors = 0
+    private var errorPolicy = SocketErrorPolicy()
 
     init(label: String, remoteHost: String, remotePort: UInt16, localHost: String?, localPort: UInt16?) {
         self.label = label
@@ -222,12 +265,6 @@ final class SocketDatagramChannel: DatagramChannel, @unchecked Sendable {
         let port = config.remotePort(flow)
         return SocketDatagramChannel(label: flow.rawValue, remoteHost: config.host, remotePort: port,
                                      localHost: config.localAddress, localPort: config.symmetricLocalPorts ? port : nil)
-    }
-
-    /// Errors after which the socket will never work again (vs. EAGAIN /
-    /// EINTR / ECONNREFUSED, which are transient on a connected UDP socket).
-    static func isFatal(_ e: Int32) -> Bool {
-        [ENOTCONN, EBADF, ENOTSOCK, ENETDOWN, ENETUNREACH, EHOSTUNREACH, EHOSTDOWN, EADDRNOTAVAIL, EPIPE].contains(e)
     }
 
     /// Binds synchronously so the port is ours before the handshake starts;
@@ -312,17 +349,15 @@ final class SocketDatagramChannel: DatagramChannel, @unchecked Sendable {
         while true {
             let n = buf.withUnsafeMutableBytes { recv(s, $0.baseAddress, $0.count, 0) }
             if n > 0 {
-                lock.lock(); let cb = onReceive; lock.unlock()
+                lock.lock(); errorPolicy.noteSuccess(); let cb = onReceive; lock.unlock()
                 cb?(Data(buf[0..<n]))
                 continue
             }
             if n < 0 {
                 let e = errno
                 if e == EAGAIN || e == EWOULDBLOCK || e == EINTR { return }
-                lock.lock(); receiveErrors += 1; let k = receiveErrors; lock.unlock()
-                if k <= 5 || k % 100 == 0 { emit("receive error #\(k): \(String(cString: strerror(e)))") }
+                if !noteSocketError(e, op: "receive") { return }
                 if e == ECONNREFUSED { continue }   // ICMP from an early punch; keep draining
-                if Self.isFatal(e) { fail("receive: \(String(cString: strerror(e))) (\(e))") }
                 return
             }
             return
@@ -336,10 +371,34 @@ final class SocketDatagramChannel: DatagramChannel, @unchecked Sendable {
         guard s >= 0 else { return }
         let n = datagram.withUnsafeBytes { Darwin.send(s, $0.baseAddress, $0.count, 0) }
         if n < 0 {
-            let e = errno
-            lock.lock(); sendErrors += 1; let k = sendErrors; lock.unlock()
-            if k <= 5 || k % 100 == 0 { emit("send error #\(k): \(String(cString: strerror(e)))") }
-            if Self.isFatal(e) { fail("send: \(String(cString: strerror(e))) (\(e))") }
+            noteSocketError(errno, op: "send")   // EAGAIN/ENOBUFS: datagram dropped (transient)
+        } else {
+            noteSocketSuccess()
+        }
+    }
+
+    /// A send or receive succeeded (resets the routing-error clock).
+    func noteSocketSuccess() {
+        lock.lock(); errorPolicy.noteSuccess(); lock.unlock()
+    }
+
+    /// The error path of `send` / `drain` (internal for tests): counts and
+    /// rate-limits the log, and stops the flow when the policy says fatal.
+    /// Returns false once the channel has failed.
+    @discardableResult
+    func noteSocketError(_ e: Int32, op: String, at now: ContinuousClock.Instant = .now) -> Bool {
+        lock.lock()
+        let k: Int
+        if op == "send" { sendErrors += 1; k = sendErrors } else { receiveErrors += 1; k = receiveErrors }
+        let verdict = errorPolicy.note(error: e, at: now)
+        lock.unlock()
+        switch verdict {
+        case .fatal:
+            fail("\(op): \(String(cString: strerror(e))) (\(e))")
+            return false
+        case .transient(let log):
+            if log { emit("\(op) error #\(k): \(String(cString: strerror(e))) (\(e))") }
+            return true
         }
     }
 

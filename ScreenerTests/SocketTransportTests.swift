@@ -129,12 +129,67 @@ final class SocketTransportTests: XCTestCase {
     }
 
     func testFatalErrnoClassification() {
-        for e in [ENOTCONN, EBADF, ENETDOWN, EHOSTUNREACH, ENETUNREACH] {
-            XCTAssertTrue(SocketDatagramChannel.isFatal(e), "\(e)")
+        for e in [ENOTCONN, EBADF, ENOTSOCK, EADDRNOTAVAIL] {
+            XCTAssertTrue(SocketErrorPolicy.isFatal(e), "\(e)")
         }
-        for e in [EAGAIN, EINTR, ECONNREFUSED, ENOBUFS] {
-            XCTAssertFalse(SocketDatagramChannel.isFatal(e), "\(e)")
+        // Routing errors are fatal only once they persist (SocketErrorPolicy).
+        for e in [EAGAIN, EINTR, ECONNREFUSED, ENOBUFS, ENETDOWN, EHOSTUNREACH, ENETUNREACH, EHOSTDOWN] {
+            XCTAssertFalse(SocketErrorPolicy.isFatal(e), "\(e)")
         }
+    }
+
+    func testSocketErrorPolicyRoutingErrorsFatalOnlyAfterThreeSeconds() {
+        let t0 = ContinuousClock.now
+        func at(_ ms: Int) -> ContinuousClock.Instant { t0.advanced(by: .milliseconds(ms)) }
+        var p = SocketErrorPolicy()
+        XCTAssertEqual(p.note(error: EHOSTUNREACH, at: at(0)), .transient(log: true))
+        XCTAssertEqual(p.note(error: ENETDOWN, at: at(500)), .transient(log: true))       // other errno: own limit
+        XCTAssertEqual(p.note(error: EHOSTUNREACH, at: at(900)), .transient(log: false))  // ≤ 1 log/s
+        XCTAssertEqual(p.note(error: EHOSTUNREACH, at: at(2900)), .transient(log: true))
+        p.noteSuccess()                                                                    // timer restarts
+        XCTAssertEqual(p.note(error: EHOSTUNREACH, at: at(3500)), .transient(log: false))
+        XCTAssertEqual(p.note(error: ENETUNREACH, at: at(6400)), .transient(log: true))
+        XCTAssertEqual(p.note(error: EHOSTDOWN, at: at(6600)), .fatal)
+        // Immediately fatal.
+        for e in [EBADF, ENOTSOCK, ENOTCONN, EADDRNOTAVAIL] {
+            var q = SocketErrorPolicy()
+            XCTAssertEqual(q.note(error: e, at: t0), .fatal, "\(e)")
+        }
+        // Anything else is transient however long it lasts.
+        var r = SocketErrorPolicy()
+        XCTAssertEqual(r.note(error: ENOBUFS, at: at(0)), .transient(log: true))
+        XCTAssertEqual(r.note(error: ENOBUFS, at: at(10_000)), .transient(log: true))
+        XCTAssertEqual(r.note(error: ECONNREFUSED, at: at(10_100)), .transient(log: true))
+        XCTAssertEqual(r.note(error: ECONNREFUSED, at: at(10_200)), .transient(log: false))
+    }
+
+    /// The channel's error path: a routing error stops the flow only after
+    /// 3 s without a successful send/receive; EBADF stops it at once.
+    func testChannelErrorPathTransientThenFatal() async throws {
+        let c = SocketDatagramChannel(label: "e", remoteHost: "127.0.0.1", remotePort: 47_961, localHost: "127.0.0.1", localPort: 47_960)
+        let events = Inbox(), failures = Inbox()
+        try c.start(onReceive: { _ in }, onEvent: events.event, onFailure: failures.event)
+        let t0 = ContinuousClock.now
+        func at(_ ms: Int) -> ContinuousClock.Instant { t0.advanced(by: .milliseconds(ms)) }
+        let before = events.eventSnapshot.count
+        c.noteSocketError(EHOSTUNREACH, op: "send", at: at(0))
+        c.noteSocketError(EHOSTUNREACH, op: "send", at: at(200))
+        c.noteSocketError(EHOSTUNREACH, op: "receive", at: at(2_000))
+        c.noteSocketSuccess()
+        c.noteSocketError(EHOSTUNREACH, op: "send", at: at(4_000))
+        XCTAssertEqual(failures.eventSnapshot, [])
+        XCTAssertEqual(events.eventSnapshot.count - before, 3, "\(events.eventSnapshot)")
+        c.noteSocketError(EHOSTUNREACH, op: "send", at: at(7_100))
+        XCTAssertEqual(failures.eventSnapshot.count, 1)
+        XCTAssertTrue(failures.eventSnapshot[0].hasPrefix("udp e: send: "), failures.eventSnapshot[0])
+        await c.cancel()
+
+        let d = SocketDatagramChannel(label: "f", remoteHost: "127.0.0.1", remotePort: 47_963, localHost: "127.0.0.1", localPort: 47_962)
+        let f2 = Inbox()
+        try d.start(onReceive: { _ in }, onEvent: { _ in }, onFailure: f2.event)
+        d.noteSocketError(EBADF, op: "receive", at: t0)
+        XCTAssertEqual(f2.eventSnapshot.count, 1)
+        await d.cancel()
     }
 
     /// Cancelling a pinned TCP connect aborts it promptly (no 10 s poll).

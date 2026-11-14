@@ -557,7 +557,7 @@ final class HEVCAssemblerTests: XCTestCase {
         XCTAssertEqual(feed(a, Array(pkts.prefix(2))), [])
         s.advance(ms: 30)
         XCTAssertEqual(a.tick(now: s.now), [])
-        s.advance(ms: 40)
+        s.advance(ms: 280)                                              // pendingGroupTimeout (300 ms)
         XCTAssertEqual(a.tick(now: s.now).compactMap(\.keyframeSSRC), [ssrcs[1], ssrcs[0]])
         XCTAssertEqual(a.stats.groupsEvicted, 1)
         XCTAssertEqual(a.tilesAwaitingIDR, [1])
@@ -623,6 +623,126 @@ final class HEVCAssemblerTests: XCTestCase {
         XCTAssertEqual(b.ingest(s.packet(tile: 1, ts: 1, marker: true, bad)), [])
         XCTAssertNil(b.parameterSets)
         XCTAssertEqual(HEVCSPSInfo(sps: Sender.makeSPS(id: 15))?.spsID, 15)
+    }
+
+    // MARK: - re-review fixes
+
+    // An IRAP processed late clears only gates from losses before it in
+    // decoding order: tile 2's loss at DON 106 survives the IRAP at DON 100.
+    func testLateIRAPDoesNotClearLaterGate() {
+        let a = HEVCAssembler(tileSSRCs: ssrcs)
+        let s = Sender(ssrcs)
+        let first = feed(a, s.picture(tile: 0, ts: 1000, don: 96, type: 19, params: true))
+        XCTAssertEqual(first.compactMap(\.au).map(\.isIDR), [true])
+        _ = feedTiles(a, s, ts: 1000, [(1, 97), (2, 98), (3, 99)])
+        // Tile 0's IRAP (DON 100) is delayed past the window; it is built
+        // below, after tile 0's next AU, so tile 0 shows no sequence gap.
+        XCTAssertEqual(feedTiles(a, s, ts: 2000, [(1, 101), (2, 102), (3, 103)]), [])
+        s.advance(ms: 100)
+        XCTAssertEqual(a.tick(now: s.now).compactMap(\.au).map(\.don), [101, 102, 103])
+        XCTAssertEqual(a.tilesAwaitingIDR, [0])
+        s.lose(tile: 2)                                                 // gap before DON 106
+        let loss = feedTiles(a, s, ts: 3000, [(0, 104), (1, 105), (2, 106), (3, 107)])
+        XCTAssertEqual(loss.compactMap(\.au).map(\.don), [105, 107])
+        XCTAssertEqual(a.tilesAwaitingIDR, [0, 2])
+        let idr = s.picture(tile: 0, ts: 2000, don: 100, type: 19, fragments: 2)
+        XCTAssertEqual(feed(a, idr).compactMap(\.au).map(\.don), [100])   // late IRAP still emitted
+        XCTAssertEqual(a.tilesAwaitingIDR, [2])
+        let next = feedTiles(a, s, ts: 4000, [(0, 108), (1, 109), (2, 110), (3, 111)])
+        XCTAssertEqual(next.compactMap(\.au).map(\.don), [108, 109, 111])
+        XCTAssertEqual(feed(a, s.picture(tile: 0, ts: 5000, don: 112, type: 19)).compactMap(\.au).map(\.don), [112])
+        XCTAssertEqual(a.tilesAwaitingIDR, [])
+        XCTAssertEqual(feedTiles(a, s, ts: 5000, [(1, 113), (2, 114)]).compactMap(\.au).map(\.don), [113, 114])
+    }
+
+    // A decode-error escalation is gated at the reported DON: an IRAP that
+    // precedes it in decoding order does not lift it.
+    func testLateIRAPDoesNotClearLaterDecodeErrorEscalation() {
+        let (a, s) = warm()
+        _ = feedTiles(a, s, ts: 1000, [(1, 1), (2, 2), (3, 3)])
+        let idr = s.picture(tile: 0, ts: 2000, don: 4, type: 19, fragments: 2)   // delayed
+        _ = feedTiles(a, s, ts: 2000, [(1, 5), (2, 6), (3, 7)])
+        s.advance(ms: 100)
+        XCTAssertEqual(a.tick(now: s.now).compactMap(\.au).map(\.don), [5, 6, 7])
+        _ = a.noteDecodeError(tile: 2, don: 6)
+        XCTAssertEqual(a.tilesAwaitingIDR, Set(0..<4))
+        XCTAssertEqual(feed(a, idr).compactMap(\.au).map(\.don), [4])
+        XCTAssertEqual(a.tilesAwaitingIDR, Set(0..<4))
+        XCTAssertEqual(feedTiles(a, s, ts: 3000, [(0, 8), (1, 9), (2, 10), (3, 11)]).compactMap(\.au), [])
+        XCTAssertEqual(feed(a, s.picture(tile: 0, ts: 4000, don: 12, type: 19)).compactMap(\.au).map(\.don), [12])
+        XCTAssertEqual(a.tilesAwaitingIDR, [])
+    }
+
+    // A decoder error reported (asynchronously) for a picture before the
+    // last IRAP is stale: the IRAP already re-rooted everything.
+    func testStaleDecodeErrorBeforeLastIRAPIsIgnored() {
+        let (a, s) = warm()
+        _ = feedTiles(a, s, ts: 1000, [(1, 1), (2, 2), (3, 3)])
+        XCTAssertEqual(feed(a, s.picture(tile: 0, ts: 2000, don: 4, type: 19)).compactMap(\.au).map(\.don), [4])
+        XCTAssertEqual(a.noteDecodeError(tile: 2, don: 2), [])
+        XCTAssertEqual(a.tilesAwaitingIDR, [])
+        XCTAssertEqual(a.stats.decodeErrors, 0)
+        XCTAssertEqual(a.stats.staleDecodeErrors, 1)
+        XCTAssertEqual(feedTiles(a, s, ts: 2000, [(1, 5)]).compactMap(\.au).map(\.don), [5])
+        // At or after the IRAP: a real error.
+        XCTAssertEqual(a.noteDecodeError(tile: 1, don: 5), [.needKeyframe(ssrc: ssrcs[1]), .needKeyframe(ssrc: ssrcs[0])])
+        XCTAssertEqual(a.tilesAwaitingIDR, Set(0..<4))
+        XCTAssertEqual(a.stats.decodeErrors, 1)
+    }
+
+    // With the interleave unknown, a reported loss cannot say which tile a
+    // DON hole belongs to: skip the wait, but gate every tile.
+    func testExplainedHoleWithUnknownInterleaveGatesAllTiles() {
+        let (a, s) = warm()
+        XCTAssertEqual(feed(a, s.picture(tile: 1, ts: 1000, don: 1)).compactMap(\.au).map(\.don), [1])
+        XCTAssertEqual(feed(a, s.picture(tile: 3, ts: 1000, don: 2)).compactMap(\.au).map(\.don), [2])  // breaks the interleave
+        s.lose(tile: 1)
+        let out = feed(a, s.picture(tile: 1, ts: 2000, don: 5))         // gap before; DONs 3, 4 missing
+        XCTAssertEqual(out.compactMap(\.keyframeSSRC), [ssrcs[1], ssrcs[0]])
+        XCTAssertEqual(out.compactMap(\.au), [])
+        XCTAssertEqual(a.tilesAwaitingIDR, Set(0..<4))
+        XCTAssertEqual(a.stats.donHoles, 1)
+        XCTAssertEqual(feed(a, s.picture(tile: 2, ts: 2000, don: 6)).compactMap(\.au), [])
+    }
+
+    // Pending groups are evicted after their own timeout, not the 60 ms
+    // reorder window.
+    func testPendingGroupEvictionUsesItsOwnTimeout() {
+        var c = HEVCAssembler.Config(); c.pendingGroupTimeout = .milliseconds(300)
+        let (a, s) = warm(c)
+        let pkts = s.picture(tile: 1, ts: 1000, don: 1, fragments: 3)
+        XCTAssertEqual(feed(a, Array(pkts.prefix(2))), [])
+        s.advance(ms: 100)
+        XCTAssertEqual(a.tick(now: s.now), [])
+        XCTAssertEqual(a.stats.groupsEvicted, 0)
+        s.advance(ms: 210)
+        XCTAssertEqual(a.tick(now: s.now).compactMap(\.keyframeSSRC), [ssrcs[1], ssrcs[0]])
+        XCTAssertEqual(a.stats.groupsEvicted, 1)
+    }
+
+    // Packets that arrive out of order are not lost.
+    func testReorderedPacketsAreNotCountedAsLost() {
+        let (a, s) = warm()
+        XCTAssertEqual(feed(a, s.picture(tile: 1, ts: 1000, don: 1)).compactMap(\.au).map(\.don), [1])
+        let p = s.picture(tile: 1, ts: 2000, don: 5, fragments: 3)
+        _ = feedTiles(a, s, ts: 1500, [(2, 2), (3, 3), (0, 4)])
+        XCTAssertEqual(feed(a, [p[1], p[0], p[2]]).compactMap(\.au).map(\.don), [5])
+        XCTAssertEqual(a.stats.lostPackets, 0)
+        s.lose(tile: 1)
+        _ = feed(a, s.picture(tile: 1, ts: 3000, don: 9))
+        XCTAssertEqual(a.stats.lostPackets, 1)
+    }
+
+    // DON ordering switched off by a run of late DONs comes back on an IRAP.
+    func testDONOrderingIsReenabledByIRAP() {
+        var c = HEVCAssembler.Config(); c.lateDONLimit = 2
+        let (a, s) = warm(c)
+        _ = feedTiles(a, s, ts: 1000, [(1, 1), (2, 2), (3, 3)])
+        _ = feedTiles(a, s, ts: 2000, [(1, 1), (2, 2)])                 // late DONs
+        XCTAssertFalse(a.stats.donOrdering)
+        XCTAssertEqual(feed(a, s.picture(tile: 0, ts: 3000, don: 4, type: 19)).compactMap(\.au).map(\.don), [4])
+        XCTAssertTrue(a.stats.donOrdering)
+        XCTAssertEqual(feedTiles(a, s, ts: 3000, [(2, 6), (1, 5)]).compactMap(\.au).map(\.don), [5, 6])
     }
 
     // MARK: - replay of a real capture (local only)
