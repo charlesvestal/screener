@@ -425,6 +425,81 @@ final class AuthTests: XCTestCase {
         }
     }
 
+    /// Task 22 fix (Important/security): a rejection after a *full* SRP
+    /// exchange means the password was wrong, not that SRP is unusable — the
+    /// reference's "retry everything on any AuthError" policy would resend
+    /// the same wrong password over the weaker RSA-wrapped-AES channel. We
+    /// must close the stream and rethrow `.rejected` without opening a
+    /// second connection.
+    func testRejectedSRPDoesNotFallBack() async throws {
+        let fx = try SRPFixture()
+        let key = try TestRSAKey()
+        let (c1, s1) = MemoryPipe.pair()
+        let srpServer = Task {
+            try await runFakeSRPServer(s1, key: key, fx: fx, m2: fx.M2, result: 1, reason: "Authentication failed")
+        }
+        let conns = ConnQueue([c1])
+        do {
+            _ = try await Authenticator.runWithFallback(username: "alice", password: fx.password) {
+                try await conns.next()
+            }
+            XCTFail("expected rejection")
+        } catch {
+            XCTAssertEqual(error as? AuthError, .rejected(reason: "Authentication failed"))
+        }
+        _ = try await srpServer.value
+        let opened = await conns.opened
+        XCTAssertEqual(opened, 1, "fallback must not open a second connection after a genuine SRP rejection")
+    }
+
+    /// (2a) On success, the client must not consume any bytes past the
+    /// SecurityResult u32 — proves there is no speculative reason-read on
+    /// the success path.
+    func testSuccessDoesNotReadPastSecurityResult() async throws {
+        let key = try TestRSAKey()
+        let (client, server) = MemoryPipe.pair()
+        let serverTask = Task {
+            _ = try await serveKeyRequest(server, key: key)
+            _ = try await server.read(exactly: 4 + 394)
+            var out = ByteWriter()
+            out.u32(0)   // non-SRP 4-byte padding
+            out.u32(0)   // SecurityResult success
+            out.bytes(Data(hex: "DEADBEEF"))   // sentinel the client must not touch
+            try await server.write(out.data)
+        }
+        let seams = AuthSeams(random: { n in Data(repeating: n == 16 ? 0x11 : 0xee, count: n) })
+        _ = try await Authenticator.run(stream: client, username: "alice", password: "s3cret",
+                                        method: .nonSRP, seams: seams)
+        _ = try await serverTask.value
+        let sentinel = try await client.read(exactly: 4)
+        XCTAssertEqual(sentinel.hex, "deadbeef")
+    }
+
+    /// (2b) A non-zero result with nothing following it, on a connection the
+    /// server keeps open, must still resolve to `.rejected(reason: nil)`
+    /// within the reason-read grace period (~500ms), not hang indefinitely.
+    func testRejectedWithoutReasonOnOpenConnection() async throws {
+        let key = try TestRSAKey()
+        let (client, server) = MemoryPipe.pair()
+        let serverTask = Task {
+            _ = try await serveKeyRequest(server, key: key)
+            _ = try await server.read(exactly: 4 + 394)
+            var out = ByteWriter(); out.u32(0); out.u32(1)
+            try await server.write(out.data)
+            // Deliberately do NOT close `server` or send anything else.
+        }
+        let start = Date()
+        do {
+            _ = try await Authenticator.run(stream: client, username: "a", password: "b", method: .nonSRP)
+            XCTFail("expected rejection")
+        } catch {
+            XCTAssertEqual(error as? AuthError, .rejected(reason: nil))
+        }
+        XCTAssertLessThan(Date().timeIntervalSince(start), 1.0)
+        _ = try await serverTask.value
+        server.close()
+    }
+
     func testTransportErrorDoesNotFallBack() async throws {
         let (c1, s1) = MemoryPipe.pair()
         s1.close()

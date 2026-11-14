@@ -74,6 +74,29 @@ struct AuthSeams: Sendable {
 /// fallback. Because fallback needs a new connection, `run` performs a single
 /// attempt on the stream it is given; `runWithFallback` implements the full
 /// policy given a `connect` closure that opens + handshakes a fresh stream.
+///
+/// ### Deviation (Task 22, security): no fallback after a genuine SRP rejection
+/// Unlike the reference, we do **not** fall back to non-SRP when the
+/// *primary* attempt is SRP and it fails with `.rejected` — i.e. the full
+/// challenge/response exchange completed and the server's SecurityResult
+/// says the password was wrong. In that case we close the stream and
+/// rethrow `.rejected` directly. Retrying a wrong password via non-SRP
+/// would (a) double the number of failed attempts the server sees,
+/// tripping lockout/backoff sooner, and (b) resend that same password
+/// over the weaker RSA-wrapped-AES-ECB channel instead of SRP — an active
+/// MITM that cannot break SRP could deliberately force this downgrade by
+/// answering with a bogus `SecurityResult=1` and harvest the password from
+/// the non-SRP attempt. Fallback is still used for `.srpUnavailable`
+/// (server routed to non-SRP itself) and for `.unsupported`/`.malformed`
+/// raised before or while parsing the challenge (SRP itself unusable, not a
+/// wrong password) — and, for those two cases, in a few more situations
+/// than the reference: bad/truncated DER in the RSA key response, a
+/// truncated challenge parse, a too-long username, or a non-RFC5054 SRP
+/// group. (Task 23 will further gate non-SRP fallback on whether the
+/// server's RSA key matches a previously pinned one, closing the remaining
+/// MITM angle on `.srpUnavailable`/`.unsupported` fallbacks.) Known
+/// limitation: `password` is a `String` and cannot be zeroized, so it is
+/// retained in memory across the fallback attempt.
 enum Authenticator {
     static func run(stream: ByteStream, username: String, password: String,
                     method: AuthResult.Method = .srp) async throws -> AuthResult {
@@ -94,8 +117,13 @@ enum Authenticator {
         do {
             return (first, try await run(stream: first, username: username, password: password, method: primary))
         } catch let error as AuthError {
-            Log.auth.error("\(primary) auth failed (\(error)); falling back to \(fallback) on a new connection")
             first.close()
+            if case .rejected = error {
+                Log.auth.error("\(primary) auth rejected by server; NOT falling back to \(fallback) " +
+                               "(see runWithFallback doc comment: avoids retrying a wrong password over the weaker channel)")
+                throw error
+            }
+            Log.auth.error("\(primary) auth failed (\(error)); falling back to \(fallback) on a new connection")
         } catch {
             first.close()
             throw error
@@ -134,6 +162,9 @@ private enum K {
     /// which would happily allocate whatever the u32 says).
     static let maxFrameLen = 64 * 1024
     static let maxReasonLen = 4096
+    /// Cap on server-provided strings (rejection reason, SRP options) echoed
+    /// into our logs, after `sanitizeForLog` escapes control characters.
+    static let maxLoggedStringLen = 200
     /// How long to wait for an optional reason string after a non-zero result.
     static let reasonGrace: Duration = .milliseconds(500)
 }
@@ -333,7 +364,7 @@ extension Authenticator {
             guard iterations <= K.srpMaxIterations else {
                 throw AuthError.malformed("SRP iteration count \(iterations) exceeds 1M cap")
             }
-            Log.auth.info("SRP challenge: N=\(N.count * 8)b g=\(g.map(String.init).joined()) salt=\(salt.count)B iters=\(iterations) cap=\(String(decoding: options, as: UTF8.self))")
+            Log.auth.info("SRP challenge: N=\(N.count * 8)b g=\(g.map(String.init).joined()) salt=\(salt.count)B iters=\(iterations) cap=\(sanitizeForLog(String(decoding: options, as: UTF8.self)))")
             return SRPChallenge(N: N, g: g, salt: salt, B: B, iterations: iterations, options: options)
         } catch is ByteReader.Error {
             throw AuthError.malformed("SRP challenge truncated")
@@ -342,30 +373,55 @@ extension Authenticator {
 
     /// `_solve_srp` via `SRPClient`. CPU-heavy (PBKDF2 + 4096-bit modexps):
     /// runs on a detached task so it never blocks the caller's executor.
+    ///
+    /// Cancellation: the detached task is wrapped in
+    /// `withTaskCancellationHandler` so cancelling the calling task (e.g. the
+    /// user backgrounds/cancels the connect attempt) promptly cancels the
+    /// compute too; we also check `Task.isCancelled` between PBKDF2 and
+    /// `SRPClient.init`, and again before `respond(to:)`. Note PBKDF2-SHA512
+    /// itself (inside `SRPClient.init`) cannot be interrupted mid-computation
+    /// — CryptoKit/CommonCrypto's PBKDF2 runs to completion once started, so
+    /// cancellation there only takes effect at the next checkpoint, not
+    /// instantly.
     static func solveSRP(_ ch: SRPChallenge, password: String,
                          privateA: Data?) async throws -> (publicA: Data, proof: SRPProof) {
         // SRPClient hard-codes the RFC 5054 4096-bit group with g = 5; the
         // reference instead uses whatever N/g the server sent. Apple always
         // sends this group, so refuse anything else rather than mis-compute.
-        let gValue = ch.g.reduce(0) { ($0 << 8) | Int($1) }
-        guard ch.N == Data(SRPGroup.N.serialize()), ch.g.count <= 8, gValue == 5 else {
+        // Check the byte count before reducing into an Int so a maliciously
+        // long `g` can't be shifted into overflow first.
+        guard ch.g.count <= 8 else {
             Log.auth.error("SRP challenge uses an unsupported group")
             throw AuthError.unsupported
         }
-        let result = await Task.detached(priority: .userInitiated) { () -> Result<(Data, SRPProof), Error> in
+        let gValue = ch.g.reduce(0) { ($0 << 8) | Int($1) }
+        guard ch.N == Data(SRPGroup.N.serialize()), gValue == 5 else {
+            Log.auth.error("SRP challenge uses an unsupported group")
+            throw AuthError.unsupported
+        }
+        let task = Task.detached(priority: .userInitiated) { () -> Result<(Data, SRPProof), Error> in
             Result {
+                try Task.checkCancellation()
                 let client = if let privateA {
                     try SRPClient(password: password, salt: ch.salt, iterations: ch.iterations, privateA: privateA)
                 } else {
                     try SRPClient(password: password, salt: ch.salt, iterations: ch.iterations)
                 }
+                try Task.checkCancellation()
                 return (client.publicA, try client.respond(to: ch.B))
             }
-        }.value
+        }
+        let result = await withTaskCancellationHandler {
+            await task.value
+        } onCancel: {
+            task.cancel()
+        }
         try Task.checkCancellation()
         do {
             let (a, proof) = try result.get()
             return (a, proof)
+        } catch is CancellationError {
+            throw CancellationError()
         } catch {
             Log.auth.error("SRP computation rejected server values: \(error)")
             throw AuthError.malformed("invalid SRP server values")
@@ -431,6 +487,21 @@ extension Authenticator {
 // MARK: - Shared reads
 
 extension Authenticator {
+    /// Server-provided strings (rejection `reason`, SRP `options`) are
+    /// attacker-controlled bytes echoed straight off the wire. Before they
+    /// reach `Log`/the on-device log file, replace control characters
+    /// (including newlines, which could otherwise forge extra log lines)
+    /// with spaces and cap the length, so a malicious/buggy server can't
+    /// pollute or blow up the log.
+    static func sanitizeForLog(_ s: String) -> String {
+        let truncated = s.unicodeScalars.count > K.maxLoggedStringLen
+        var out = String.UnicodeScalarView()
+        for scalar in s.unicodeScalars.prefix(K.maxLoggedStringLen) {
+            out.append(scalar.value < 0x20 || scalar.value == 0x7f ? " " : scalar)
+        }
+        return String(out) + (truncated ? "…" : "")
+    }
+
     /// `u32 len || body[len]`.
     static func readFrame(_ s: ByteStream, what: String) async throws -> Data {
         var r = ByteReader(try await s.read(exactly: 4))
@@ -444,7 +515,7 @@ extension Authenticator {
         let result = try r.u32()
         guard result == 0 else {
             let reason = await readRejectionReason(s)
-            Log.auth.error("\(label) auth rejected: result=\(result) reason=\(reason ?? "<none>")")
+            Log.auth.error("\(label) auth rejected: result=\(result) reason=\(reason.map(sanitizeForLog) ?? "<none>")")
             throw AuthError.rejected(reason: reason)
         }
     }
