@@ -30,7 +30,7 @@ final class RFBHandshakeTests: XCTestCase {
     func testCountZeroFailureListWithReason() async throws {
         let (client, server) = MemoryPipe.pair()
         let reason = "Too many authentication failures"
-        Task {
+        _ = Task {
             try await server.write(Self.banner)
             _ = try await server.read(exactly: 12)
             var w = ByteWriter()
@@ -48,7 +48,7 @@ final class RFBHandshakeTests: XCTestCase {
     /// Count 0 with the server closing before a reason: still a refusal.
     func testCountZeroFailureListWithoutReason() async throws {
         let (client, server) = MemoryPipe.pair()
-        Task {
+        _ = Task {
             try await server.write(Self.banner)
             _ = try await server.read(exactly: 12)
             try await server.write(Data([0]))
@@ -64,7 +64,7 @@ final class RFBHandshakeTests: XCTestCase {
 
     func testType33AbsentIsUnsupported() async throws {
         let (client, server) = MemoryPipe.pair()
-        Task {
+        _ = Task {
             try await server.write(Self.banner)
             _ = try await server.read(exactly: 12)
             try await server.write(Data(hex: "031e2423"))
@@ -113,7 +113,7 @@ final class RFBHandshakeTests: XCTestCase {
 
     func testServerInitEmptyName() async throws {
         let (client, server) = MemoryPipe.pair()
-        Task {
+        _ = Task {
             _ = try await server.read(exactly: 1)
             var w = ByteWriter()
             w.u16(1920); w.u16(1080); w.zeros(16); w.u32(0)
@@ -126,7 +126,7 @@ final class RFBHandshakeTests: XCTestCase {
 
     func testServerInitAbsurdNameLengthIsMalformed() async throws {
         let (client, server) = MemoryPipe.pair()
-        Task {
+        _ = Task {
             _ = try await server.read(exactly: 1)
             var w = ByteWriter()
             w.u16(1920); w.u16(1080); w.zeros(16); w.u32(0x7fff_ffff)

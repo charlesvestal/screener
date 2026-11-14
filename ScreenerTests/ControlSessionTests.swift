@@ -278,7 +278,7 @@ final class ControlSessionTests: XCTestCase {
         let (client, server) = MemoryPipe.pair()
         let fake = FakeServer(server)
         let session = makeSession(client, order: .reference)
-        Task {
+        _ = Task {
             try await fake.handshakeAndServerInit()
             var ssi = ByteWriter()
             ssi.bytes([0x00, 0x4a, 0x00, 0x01]); ssi.u32(0x5); ssi.zeros(4)
@@ -300,7 +300,7 @@ final class ControlSessionTests: XCTestCase {
         var tuning = ControlSession.Tuning.fast
         tuning.stepTimeout = .milliseconds(200)
         let session = makeSession(client, order: .reference, tuning: tuning)
-        Task {
+        _ = Task {
             try await server.write(Data("RFB 003.889\n".utf8))
             _ = try await server.read(exactly: 12)
             try await server.write(Data(hex: "041e212423"))
