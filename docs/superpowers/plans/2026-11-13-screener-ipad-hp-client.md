@@ -27,6 +27,10 @@
 - Device build+install+launch: `Tools/run-on-ipad.sh` (created in Task 0)
 - Device log fetch: `Tools/fetch-ipad-log.sh` (created in Task 0) → prints `screener.log` from the app's Documents container
 
+**Testing when the user is home (decision 2026-11-14):**
+- The user chose "Ask me before each run". Agents must NOT run live tests (`Tools/sim-connect.sh`, `Tools/ref-connect.sh`, or on-iPad sessions) on their own. The coordinator asks the user before every live run.
+- The user chose "Direct USB install" for on-iPad testing. Use `Tools/run-on-ipad.sh` / `fetch-ipad-log.sh`. TestFlight is only for when the user is away.
+
 **Testing while the user is away (decision 2026-11-14):** the user said "i'm not home tho so to test we can do a personal testflight. it gets rate limited so dont build until you'r ready for me".
 - **No device builds and no TestFlight uploads** until the coordinator decides a build is worth the user's time. `Tools/run-on-ipad.sh` / `fetch-ipad-log.sh` are unused while the user is away.
 - **Same-Mac live runs must use two different local IPs** (the server sends media to <TCP peer IP>:5900/5901 from its own :5900/5901, so loopback collides): `SCREENER_LOCAL_ADDR=192.0.2.33 Tools/sim-connect.sh 192.0.2.54 25`.
