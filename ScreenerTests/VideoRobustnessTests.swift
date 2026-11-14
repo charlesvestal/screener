@@ -13,8 +13,87 @@ final class VideoRobustnessTests: XCTestCase {
         return try XCTUnwrap(b)
     }
 
-    private func frame(tile: Int = 0, seq: Int) throws -> DecodedFrame {
-        DecodedFrame(tile: tile, pixelBuffer: try pixelBuffer(), decodeTime: .milliseconds(1), don: 0, seq: seq)
+    private func frame(tile: Int = 0, seq: Int, ts: UInt32? = nil) throws -> DecodedFrame {
+        DecodedFrame(tile: tile, pixelBuffer: try pixelBuffer(), decodeTime: .milliseconds(1), don: 0, seq: seq,
+                     rtpTimestamp: ts)
+    }
+
+    // MARK: VideoFrameStore coherent pictures
+
+    /// The four strips of one RTP timestamp become visible together: nothing
+    /// changes (and no redraw is asked for) until the last strip is in.
+    func testStripsOfAPictureAreCommittedTogether() throws {
+        let store = VideoFrameStore()
+        let e = store.reset()
+        store.configure(tileCount: 4)
+        let changes = Counter()
+        store.onChange = { changes.bump() }
+        let before = store.currentVersion
+        for t in 0..<3 { store.publish(try frame(tile: t, seq: 10 + t, ts: 900), epoch: e) }
+        XCTAssertEqual(changes.value, 0)
+        XCTAssertEqual(store.currentVersion, before)
+        XCTAssertEqual(store.snapshot(ifNewerThan: nil)?.frames.count, 0, "partial picture is not presentable")
+        XCTAssertTrue(store.hasDecoded)
+        let last = try frame(tile: 3, seq: 13, ts: 900)
+        store.publish(last, epoch: e)
+        XCTAssertEqual(changes.value, 1)
+        let snap = try XCTUnwrap(store.snapshot(ifNewerThan: before))
+        XCTAssertEqual(snap.frames.count, 4)
+        XCTAssertTrue(snap.frames[3] === last.pixelBuffer)
+        XCTAssertEqual(store.takePartialCommits(), 0)
+        XCTAssertEqual(store.takeCounters().frames, [0: 1, 1: 1, 2: 1, 3: 1], "fps counts every decoded strip")
+    }
+
+    /// A strip that never comes (its tile is gated) does not hold the picture
+    /// back past the next picture's first strip, which stays staged.
+    func testANewerPictureCommitsTheIncompleteOne() throws {
+        let store = VideoFrameStore()
+        let e = store.reset()
+        store.configure(tileCount: 4)
+        let t0 = try frame(tile: 0, seq: 20, ts: 1000)
+        store.publish(t0, epoch: e)
+        store.publish(try frame(tile: 1, seq: 21, ts: 1000), epoch: e)   // tiles 2 and 3 missing
+        let next = try frame(tile: 0, seq: 22, ts: 2500)
+        store.publish(next, epoch: e)
+        let snap = try XCTUnwrap(store.snapshot(ifNewerThan: nil))
+        XCTAssertEqual(snap.frames.count, 2)
+        XCTAssertTrue(snap.frames[0] === t0.pixelBuffer, "the newer picture's strip is still staged")
+        XCTAssertEqual(store.takePartialCommits(), 1)
+    }
+
+    /// The ticker commits the last picture before the screen goes static.
+    func testFlushCommitsAStalledPictureAfterTheTimeout() throws {
+        let store = VideoFrameStore()
+        let e = store.reset()
+        store.configure(tileCount: 4)
+        let start = ContinuousClock.now
+        store.publish(try frame(tile: 0, seq: 30, ts: 7), epoch: e, now: start)
+        store.flushStaged(now: start.advanced(by: .milliseconds(20)))
+        XCTAssertEqual(store.snapshot(ifNewerThan: nil)?.frames.count, 0)
+        store.flushStaged(now: start + VideoFrameStore.stagingTimeout)
+        XCTAssertEqual(store.snapshot(ifNewerThan: nil)?.frames.count, 1)
+        // A stale strip (older seq than the committed one) is ignored.
+        store.publish(try frame(tile: 0, seq: 29, ts: 8), epoch: e)
+        store.flushStaged(now: .now + .seconds(1))
+        XCTAssertEqual(store.takePartialCommits(), 1)
+    }
+
+    /// Single-tile streams (and frames without a timestamp) commit at once.
+    func testSingleTileCommitsImmediately() throws {
+        let store = VideoFrameStore()
+        let e = store.reset()
+        store.configure(tileCount: 1)
+        store.publish(try frame(tile: 0, seq: 40, ts: 1), epoch: e)
+        XCTAssertEqual(store.snapshot(ifNewerThan: nil)?.frames.count, 1)
+    }
+
+    func testIntervalStatsSummary() {
+        var s = IntervalStats()
+        func au(_ tile: Int, _ n: Int, idr: Bool = false) -> AccessUnit {
+            AccessUnit(nalUnits: [Data(count: n)], isIDR: idr, tile: tile, rtpTimestamp: 0, ssrc: 1, don: 0)
+        }
+        s.note(au(0, 1000, idr: true)); s.note(au(0, 3000)); s.note(au(1, 500))
+        XCTAssertEqual(s.summary(seconds: 2, tiles: 2), "kbps=18 au_avg=[2000,500] au_max=[3000,500] idr=1")
     }
 
     // MARK: VideoFrameStore epochs

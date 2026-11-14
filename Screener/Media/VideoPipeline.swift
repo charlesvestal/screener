@@ -21,7 +21,18 @@
 //     failures in a row in the same mode;
 //   * frames are published with the store epoch this pipeline was created
 //     under (late callbacks after a reset are dropped);
-//   * every 2 s: `video fps=… decode_ms=… tiles=[…]`.
+//   * the ticker also commits a picture whose strips stopped coming
+//     (VideoFrameStore.flushStaged; strips are presented per picture);
+//   * LTR acks (session._on_frame_published → _send_ltr_ack): for every
+//     decoded tile-0 picture, its DON goes to `hooks.ackLTR` (MediaTransport
+//     sends it only when it changed). OFF by default, as on the reference's
+//     macOS path: vtdecode.py:93-96 leaves last_clean_donl all-None, so the
+//     reference's VideoToolbox decoder never acks (only its libav path does,
+//     hevc.py:448). Opt in with the environment variable SCREENER_LTR_ACK=1
+//     (devicectl: DEVICECTL_CHILD_SCREENER_LTR_ACK=1) for an A/B test;
+//   * every 2 s: `video fps=… decode_ms=… tiles=[…] kbps=… au_avg=[…]
+//     au_max=[…] idr=… partial=…` (AU payload bytes of what was fed;
+//     `partial` = pictures shown with a strip missing).
 import CoreMedia
 import CoreVideo
 import Foundation
@@ -33,7 +44,12 @@ actor VideoPipeline {
         var requestKeyframe: @Sendable (UInt32) async -> Void
         var notePublished: @Sendable () async -> Void
         var onNotHEVC: @Sendable () async -> Void
+        /// Receives the DON of each decoded tile-0 picture when LTR acks are on.
+        var ackLTR: (@Sendable (UInt16) async -> Void)? = nil
     }
+
+    /// SCREENER_LTR_ACK=1 turns LTR acks on (see the header).
+    static let ltrAcksEnabled = ProcessInfo.processInfo.environment["SCREENER_LTR_ACK"] == "1"
 
     nonisolated let store: VideoFrameStore
     private let hooks: Hooks
@@ -45,19 +61,28 @@ actor VideoPipeline {
     private var lastStatsLog = ContinuousClock.now
     private var fed = 0
     private var dropped = 0
+    private var interval = IntervalStats()
     private let publishThrottle = PublishThrottle()
 
-    init(store: VideoFrameStore, hooks: Hooks) {
+    init(store: VideoFrameStore, hooks: Hooks, ltrAcks: Bool = VideoPipeline.ltrAcksEnabled) {
         self.store = store
         self.hooks = hooks
         let throttle = publishThrottle
         let weakSelf = WeakBox<VideoPipeline>()
         let epoch = store.currentEpoch
+        let ackLTR = ltrAcks ? hooks.ackLTR : nil
+        let lastDON = LatestDON()
+        if ackLTR != nil { Log.video.info("video: LTR acks ON (tile-0 DON per decoded picture)") }
         self.decoder = VideoDecoder { event in
             switch event {
             case .frame(let f):
                 store.publish(f, epoch: epoch)
                 if throttle.shouldNotify() { Task { await hooks.notePublished() } }
+                // Tasks may run out of order: each sends the newest DON at that moment.
+                if f.tile == 0, let ackLTR {
+                    lastDON.set(f.don)
+                    Task { if let don = lastDON.get() { await ackLTR(don) } }
+                }
             case .error(let tile, let don, let status, let irap):
                 store.noteError()
                 Task { await weakSelf.value?.decodeFailed(tile: tile, don: don, status: status, isIRAP: irap) }
@@ -109,6 +134,7 @@ actor VideoPipeline {
     func tick(now: ContinuousClock.Instant = .now) async {
         guard !stopped else { return }
         if let a = assembler { await handle(a.tick(now: now)) }
+        store.flushStaged(now: now)
         if now - lastStatsLog >= .seconds(2) { logStats(now) }
     }
 
@@ -137,6 +163,7 @@ actor VideoPipeline {
             case .accessUnit(let au):
                 guard decoder.isReady else { dropped += 1; continue }
                 fed += 1
+                interval.note(au)
                 let status = decoder.decode(au)
                 if status != noErr {
                     store.noteError()
@@ -198,11 +225,40 @@ actor VideoPipeline {
         let perTile = (0..<tiles).map { String(format: "%.0f", Double(c.frames[$0] ?? 0) / secs) }
         let fps = Double(c.frames.values.max() ?? 0) / secs
         let ms = total > 0 ? Double(c.decodeNanos) / Double(total) / 1e6 : 0
-        Log.video.info(String(format: "video fps=%.1f decode_ms=%.2f tiles=[%@] fed=%d errors=%d dropped=%d mode=%@",
+        Log.video.info(String(format: "video fps=%.1f decode_ms=%.2f tiles=[%@] fed=%d errors=%d dropped=%d mode=%@ %@ partial=%d",
                               fps, ms, perTile.joined(separator: ","), fed, c.errors, dropped,
-                              decoder.mode.map { "\($0)" } ?? "-"))
+                              decoder.mode.map { "\($0)" } ?? "-", interval.summary(seconds: secs, tiles: tiles),
+                              store.takePartialCommits()))
         fed = 0
         dropped = 0
+        interval = IntervalStats()
+    }
+}
+
+/// Per-interval AU sizes for the stats line (fed AUs only).
+struct IntervalStats: Equatable {
+    var bytes = 0
+    var idrs = 0
+    var count: [Int: Int] = [:]
+    var total: [Int: Int] = [:]
+    var largest: [Int: Int] = [:]
+
+    mutating func note(_ au: AccessUnit) {
+        let n = au.nalUnits.reduce(0) { $0 + $1.count }
+        bytes += n
+        if au.isIDR { idrs += 1 }
+        count[au.tile, default: 0] += 1
+        total[au.tile, default: 0] += n
+        largest[au.tile] = max(largest[au.tile] ?? 0, n)
+    }
+
+    /// `kbps=… au_avg=[…] au_max=[…] idr=…` (sizes in bytes, per tile).
+    func summary(seconds: Double, tiles: Int) -> String {
+        let kbps = seconds > 0 ? Double(bytes) * 8 / seconds / 1000 : 0
+        let avg = (0..<tiles).map { t in String((total[t] ?? 0) / max(1, count[t] ?? 0)) }
+        let mx = (0..<tiles).map { String(largest[$0] ?? 0) }
+        return String(format: "kbps=%.0f au_avg=[%@] au_max=[%@] idr=%d", kbps,
+                      avg.joined(separator: ","), mx.joined(separator: ","), idrs)
     }
 }
 
@@ -224,6 +280,14 @@ private final class PublishThrottle: @unchecked Sendable {   // state behind `lo
             return true
         }
     }
+}
+
+/// The newest decoded tile-0 DON (VideoToolbox thread → ack tasks).
+private final class LatestDON: @unchecked Sendable {   // `value` behind `lock`
+    private let lock = NSLock()
+    private var value: UInt16?
+    func set(_ v: UInt16) { lock.withLock { value = v } }
+    func get() -> UInt16? { lock.withLock { value } }
 }
 
 private final class WeakBox<T: AnyObject>: @unchecked Sendable {   // set once, before use

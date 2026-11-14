@@ -15,6 +15,19 @@
 // are process-global as well). The coordinator resets on teardown too, which
 // frees the pixel buffers.
 //
+// Coherent pictures (deviation; the reference's desktop frontend composites
+// whatever each tile slot holds): a picture is four tile strips that share an
+// RTP timestamp and are decoded one after another, and on the paced stream
+// the last strip lands up to ~20 ms after the first. Showing each strip as it
+// decodes put strips of two different pictures on screen (a dragged window
+// sheared at the strip seams). So a frame that carries its RTP timestamp is
+// STAGED and the presentable set (`snapshot`) changes once per picture: when
+// all `tileCount` strips of the timestamp are in, when a newer timestamp
+// starts (a strip was gated / never came), or when `flushStaged` finds the
+// staged picture older than `stagingTimeout` (the pipeline ticker calls it,
+// so the last picture before the screen goes static is never held back).
+// Frames without a timestamp (tests, single-tile streams) commit at once.
+//
 // `onChange` (the renderer's redraw trigger) is called, outside the lock,
 // after every change that bumps `version`.
 import CoreGraphics
@@ -35,8 +48,15 @@ final class VideoFrameStore: @unchecked Sendable {   // all state behind `lock`
         var decodeNanos: Int64 = 0
     }
 
+    /// How long a partly-decoded picture may stay staged (see the header).
+    static let stagingTimeout: Duration = .milliseconds(50)
+
     private let lock = NSLock()
     private var frames: [Int: (buffer: CVPixelBuffer, seq: Int)] = [:]
+    private var staged: [Int: (buffer: CVPixelBuffer, seq: Int)] = [:]
+    private var stagedTimestamp: UInt32?
+    private var stagedSince: ContinuousClock.Instant?
+    private var partialCommits = 0
     private var version = 0
     private var tileCount = 4
     private var canvas: CGSize?
@@ -81,6 +101,7 @@ final class VideoFrameStore: @unchecked Sendable {   // all state behind `lock`
     func reset() -> Int {
         let (e, cb) = lock.withLock {
             frames = [:]; version += 1; canvas = nil; tileCount = 4
+            staged = [:]; stagedTimestamp = nil; stagedSince = nil
             counters = Counters(); firstFrameSeen = false
             epoch += 1
             return (epoch, _onChange)
@@ -98,6 +119,7 @@ final class VideoFrameStore: @unchecked Sendable {   // all state behind `lock`
             if let tileCount, tileCount > 0, tileCount != self.tileCount {
                 self.tileCount = tileCount
                 frames = frames.filter { $0.key < tileCount }
+                staged = staged.filter { $0.key < tileCount }
                 version += 1
             }
             if let canvas, canvas != self.canvas { self.canvas = canvas; version += 1 }
@@ -107,23 +129,62 @@ final class VideoFrameStore: @unchecked Sendable {   // all state behind `lock`
     }
 
     /// Stores `f` if it belongs to the current session (`epoch`) and is not
-    /// older than the tile's stored picture.
-    func publish(_ f: DecodedFrame, epoch: Int) {
+    /// older than the tile's stored or staged picture. With an RTP timestamp
+    /// the frame is staged until its picture is complete (see the header).
+    func publish(_ f: DecodedFrame, epoch: Int, now: ContinuousClock.Instant = .now) {
         let (first, changed): ((@Sendable (CVPixelBuffer) -> Void)?, (@Sendable () -> Void)?) = lock.withLock {
             guard epoch == self.epoch else { staleDropped += 1; return (nil, nil) }   // a previous session
-            if let cur = frames[f.tile], f.seq < cur.seq { return (nil, nil) }       // older than stored
-            frames[f.tile] = (f.pixelBuffer, f.seq)
-            version += 1
+            let newest = max(frames[f.tile]?.seq ?? Int.min, staged[f.tile]?.seq ?? Int.min)
+            if f.seq < newest { return (nil, nil) }                                   // older than stored
             published += 1
             counters.frames[f.tile, default: 0] += 1
             counters.decodeNanos += f.decodeTime.components.seconds * 1_000_000_000
                 + f.decodeTime.components.attoseconds / 1_000_000_000
-            guard !firstFrameSeen else { return (nil, _onChange) }
+            var committed = false
+            if let ts = f.rtpTimestamp, tileCount > 1 {
+                // A newer picture (or a repeat of a staged strip) ends the staged one.
+                if stagedTimestamp != nil, stagedTimestamp != ts || staged[f.tile] != nil {
+                    commitStagedLocked(partial: staged.count < tileCount)
+                    committed = true
+                }
+                if staged.isEmpty { stagedTimestamp = ts; stagedSince = now }
+                staged[f.tile] = (f.pixelBuffer, f.seq)
+                if staged.count >= tileCount {
+                    commitStagedLocked(partial: false)
+                    committed = true
+                }
+            } else {
+                frames[f.tile] = (f.pixelBuffer, f.seq)
+                version += 1
+                committed = true
+            }
+            let cb = committed ? _onChange : nil
+            guard !firstFrameSeen else { return (nil, cb) }
             firstFrameSeen = true
-            return (_onFirstFrame, _onChange)
+            return (_onFirstFrame, cb)
         }
         first?(f.pixelBuffer)
         changed?()
+    }
+
+    /// Commits a staged picture older than `timeout` (the pipeline ticker).
+    func flushStaged(now: ContinuousClock.Instant = .now, timeout: Duration = VideoFrameStore.stagingTimeout) {
+        let cb: (@Sendable () -> Void)? = lock.withLock {
+            guard let since = stagedSince, now - since >= timeout, !staged.isEmpty else { return nil }
+            commitStagedLocked(partial: staged.count < tileCount)
+            return _onChange
+        }
+        cb?()
+    }
+
+    /// Pictures shown with fewer than `tileCount` new strips (since the last call).
+    func takePartialCommits() -> Int { lock.withLock { defer { partialCommits = 0 }; return partialCommits } }
+
+    private func commitStagedLocked(partial: Bool) {
+        for (tile, entry) in staged { frames[tile] = entry }
+        staged = [:]; stagedTimestamp = nil; stagedSince = nil
+        if partial { partialCommits += 1 }
+        version += 1
     }
 
     /// Pictures stored since the store was created (all sessions).

@@ -61,6 +61,9 @@ struct DecodedFrame: @unchecked Sendable {      // CVPixelBuffer is immutable on
     /// Monotonic submit counter, process-global (survives rebuilds and
     /// sessions; DONs do not).
     var seq: Int
+    /// The AU's RTP timestamp: the strips of one picture share it
+    /// (VideoFrameStore presents them together). nil = commit at once.
+    var rtpTimestamp: UInt32? = nil
 }
 
 extension OSType {
@@ -255,7 +258,7 @@ final class VideoDecoder {
         if let refused = Self.precheck(hasSession: session != nil && formatDescription != nil, au: au) { return refused }
         guard let session, let fmt = formatDescription else { return kVTInvalidSessionErr }
         guard let sample = Self.makeSample(AVCC.sample(au.nalUnits), format: fmt) else { return kVTParameterErr }
-        let tile = au.tile, don = au.don, irap = au.isIDR
+        let tile = au.tile, don = au.don, irap = au.isIDR, ts = au.rtpTimestamp
         let onEvent = self.onEvent
         let start = ContinuousClock.now
         submitted += 1
@@ -267,7 +270,8 @@ final class VideoDecoder {
         ) { status, flags, image, _, _ in
             if status == noErr, let image, !flags.contains(.frameDropped) {
                 onEvent(.frame(DecodedFrame(tile: tile, pixelBuffer: image,
-                                            decodeTime: ContinuousClock.now - start, don: don, seq: seq)))
+                                            decodeTime: ContinuousClock.now - start, don: don, seq: seq,
+                                            rtpTimestamp: ts)))
             } else if status != noErr {
                 onEvent(.error(tile: tile, don: don, status: status, isIRAP: irap))
             }

@@ -479,7 +479,8 @@ final class SessionCoordinator {
             activeSSRCs: { await media.activeVideoSSRCs },
             requestKeyframe: { _ = await media.requestKeyframe(ssrc: $0) },
             notePublished: { await media.notePublished() },
-            onNotHEVC: { [weak self] in await self?.videoIsNotHEVC(gen) })
+            onNotHEVC: { [weak self] in await self?.videoIsNotHEVC(gen) },
+            ackLTR: { await media.sendLTRAck(donl: UInt32($0)) })
         let pipeline = VideoPipeline(store: frames, hooks: hooks)
         #if DEBUG
         let makeTap = makeVideoTap
