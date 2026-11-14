@@ -70,6 +70,7 @@ final class SessionCoordinatorConnectedTests: XCTestCase {
         private let lock = NSLock()
         private var _channels: [(MediaTransport.Flow, FakeDatagramChannel)] = []
         private var _streams: [ScriptedStream] = []
+        private var _fakes: [ControlSessionTests.FakeServer] = []
         private var _auth = 0
         private var servers: [Task<Void, Error>] = []
         let answer: Data
@@ -86,6 +87,7 @@ final class SessionCoordinatorConnectedTests: XCTestCase {
         var lastVideo: FakeDatagramChannel? {
             lock.lock(); defer { lock.unlock() }; return _channels.last { $0.0 == .video }?.1
         }
+        var lastFake: ControlSessionTests.FakeServer? { lock.lock(); defer { lock.unlock() }; return _fakes.last }
 
         func seams(ip: String) -> SessionCoordinator.Seams {
             var tuning = MediaTransport.Tuning()
@@ -139,8 +141,23 @@ final class SessionCoordinatorConnectedTests: XCTestCase {
                 while true { _ = try await fake.readRecord() }   // drain until closed
             }
             let stream = ScriptedStream(client)
-            lock.lock(); servers.append(task); _streams.append(stream); lock.unlock()
+            lock.lock(); servers.append(task); _streams.append(stream); _fakes.append(fake); lock.unlock()
             return stream
+        }
+
+        /// Sends an AppleDisplayLayout (0x451) FBU rect with the given scaled
+        /// (logical) / backing sizes (DisplayLayout.init's field layout: a
+        /// leading reserved u16, then scaledWidth/Height, backingWidth/Height,
+        /// then a trailing unused u16 — no displays, short payload).
+        func sendDisplayLayout(scaledWidth: UInt16, scaledHeight: UInt16,
+                               backingWidth: UInt16, backingHeight: UInt16) async throws {
+            let fake = try XCTUnwrap(lastFake)
+            var w = ByteWriter()
+            w.u8(0); w.u8(0); w.u16(1)
+            w.zeros(8); w.u32(0x451)
+            w.u16(12)
+            w.u16(0); w.u16(scaledWidth); w.u16(scaledHeight); w.u16(backingWidth); w.u16(backingHeight); w.u16(0)
+            try await fake.sendRecord(w.data)
         }
 
         /// A 4-tile start burst (40 packets) under the session's server video key.
@@ -274,5 +291,52 @@ final class SessionCoordinatorConnectedTests: XCTestCase {
         var pb: CVPixelBuffer?
         CVPixelBufferCreate(nil, 16, 16, kCVPixelFormatType_32BGRA, nil, &pb)
         return try XCTUnwrap(pb)
+    }
+
+    // MARK: teardown releases input first
+
+    /// A disconnect calls `releaseInput` (the session view's
+    /// RemoteInputView.releaseAll(), here a fake) before `input` is torn
+    /// down, and gives whatever was already queued (the releases it just
+    /// sent) a bounded chance to actually reach the control channel: a
+    /// message enqueued right before `disconnect()` must still be sent, not
+    /// silently dropped by `input.close()`.
+    func testDisconnectReleasesInputBeforeClosingTheControlChannel() async throws {
+        let (c, h, t) = try await connected("192.0.2.210")
+        await t.value
+        let input = try XCTUnwrap(c.input)
+        var released = false
+        c.releaseInput = { released = true }
+        input.key(down: false, keysym: 0xffe1)   // queued as if releaseAll() had just run
+        let before = input.sentCount
+        await c.disconnect()
+        XCTAssertTrue(released, "releaseInput was not called before teardown")
+        XCTAssertEqual(input.sentCount, before + 1,
+                       "the queued release must reach the control channel before input is closed")
+        XCTAssertNil(c.input)
+        _ = h
+    }
+
+    // MARK: single canvas source of truth
+
+    /// A 0x451 with a different backing size updates both the frame store's
+    /// canvas (video layout / drawCursor's CompositeLayout) and the input
+    /// controller's mapping, so they never disagree about the canvas.
+    func testDisplayLayoutUpdatesTheFrameStoreCanvasAndInputMappingTogether() async throws {
+        let (c, h, t) = try await connected("192.0.2.211")
+        await t.value
+        let canvasBefore = c.frames.snapshot(ifNewerThan: nil)?.canvas
+        XCTAssertEqual(canvasBefore, CGSize(width: 3840, height: 2160))   // the 0x1c answer's canvas
+        let input = try XCTUnwrap(c.input)
+        XCTAssertEqual(input.serverWidth, 3840)
+        XCTAssertEqual(input.serverHeight, 2160)
+
+        try await h.sendDisplayLayout(scaledWidth: 960, scaledHeight: 600, backingWidth: 1920, backingHeight: 1200)
+        try await waitUntil("input dims updated") { input.serverWidth == 1920 && input.serverHeight == 1200 }
+        try await waitUntil("frame store canvas updated") {
+            c.frames.snapshot(ifNewerThan: nil)?.canvas == CGSize(width: 1920, height: 1200)
+        }
+        XCTAssertEqual(c.frames.snapshot(ifNewerThan: nil)?.canvas, CGSize(width: input.serverWidth, height: input.serverHeight))
+        await c.disconnect()
     }
 }

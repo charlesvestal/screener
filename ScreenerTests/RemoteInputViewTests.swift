@@ -241,4 +241,43 @@ final class RemoteInputViewTests: XCTestCase {
     func testWheelNotchTunable() {
         XCTAssertEqual(RemoteInputView.Tuning.pointsPerWheelNotch, 10)
     }
+
+    // MARK: pointer hiding is scoped to the fitted video rect
+
+    /// A pure hover outside the fitted video rect (the letterbox, here the
+    /// 25pt pillarbox either side of a 50×100 canvas in a 100×100 view)
+    /// sends nothing — the system pointer shows there instead.
+    func testHoverOutsideTheFittedRectSendsNothing() async {
+        let (view, input, sink) = make()
+        input.setServerDims(width: 50, height: 100)
+        view.movePointer(to: CGPoint(x: 10, y: 10), coalescable: true)
+        let got = await events(input, sink)
+        XCTAssertEqual(got, [])
+    }
+
+    /// The same hover inside the fitted rect sends a move as usual.
+    func testHoverInsideTheFittedRectSendsAMove() async {
+        let (view, input, sink) = make()
+        input.setServerDims(width: 50, height: 100)
+        view.movePointer(to: CGPoint(x: 50, y: 10), coalescable: true)
+        let got = await events(input, sink)
+        XCTAssertFalse(got.isEmpty, "a hover inside the video rect must still move the pointer")
+    }
+
+    /// `styleFor` hides the system pointer only for the region `regionFor`
+    /// tags as the video (identifier "video"); any other region (the
+    /// letterbox's default region) always shows the normal pointer, even
+    /// with a host cursor image known.
+    func testStyleHidesTheSystemPointerOnlyForTheVideoRegion() {
+        let (view, _, _) = make()
+        let cursor = RemoteCursor()
+        cursor.store(id: 1, hotspot: PixelPoint(x: 0, y: 0), size: PixelSize(width: 1, height: 1),
+                    bgra: Data([0, 0, 0, 0]), alpha: Data([255]))
+        view.cursor = cursor
+        let interaction = UIPointerInteraction(delegate: view)
+        let letterbox = UIPointerRegion(rect: CGRect(x: 0, y: 0, width: 10, height: 10))
+        XCTAssertNil(view.pointerInteraction(interaction, styleFor: letterbox))
+        let video = UIPointerRegion(rect: CGRect(x: 0, y: 0, width: 10, height: 10), identifier: "video" as NSString)
+        XCTAssertNotNil(view.pointerInteraction(interaction, styleFor: video))
+    }
 }

@@ -13,7 +13,7 @@ struct SessionView: View {
     var body: some View {
         ZStack {
             Color.black.ignoresSafeArea()
-            RemoteScreenView(store: model.frames, cursor: model.cursor, input: model.input,
+            RemoteScreenView(model: model, store: model.frames, cursor: model.cursor, input: model.input,
                              keyboardVisible: $keyboardVisible)
                 .ignoresSafeArea()
             if model.isReconnecting || !model.hasFirstFrame {
@@ -73,6 +73,7 @@ struct ShareLogButton: View {
 /// The video (MTKView drawn on demand by MetalRenderer, with the host
 /// cursor) under a transparent RemoteInputView of the same size.
 struct RemoteScreenView: UIViewRepresentable {
+    let model: SessionCoordinator
     let store: VideoFrameStore
     let cursor: RemoteCursor
     let input: InputController?
@@ -109,6 +110,11 @@ struct RemoteScreenView: UIViewRepresentable {
             context.coordinator.renderer = renderer
         }
         view.remoteInput.cursor = cursor
+        // Before any teardown (disconnect, background, failure) the
+        // coordinator must release every held key/button on the Mac; this is
+        // the one seam between the UI's RemoteInputView and the coordinator,
+        // held weakly so a torn-down view simply makes it a no-op.
+        model.releaseInput = { [weak view] in view?.remoteInput.releaseAll() }
         return view
     }
 

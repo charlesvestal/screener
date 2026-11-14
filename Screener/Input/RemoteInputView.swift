@@ -9,7 +9,9 @@
 //   - UIPointerInteraction hides the system pointer while a host cursor
 //     shape is known (the host cursor is drawn instead); without one the
 //     system pointer stays as the fallback, as the reference falls back to
-//     the OS cursor on a cache miss.
+//     the OS cursor on a cache miss. This only applies inside the fitted
+//     video rect (regionFor/styleFor): over the letterbox the system pointer
+//     always shows, and a pure hover there sends nothing (movePointer).
 //   - UIHoverGestureRecognizer: movement with no button held (sends the
 //     current mask, as on_cursor_pos does); leaving the view hides the
 //     host cursor (on_cursor_enter).
@@ -219,9 +221,17 @@ final class RemoteInputView: UIView, UIPointerInteractionDelegate, UIGestureReco
     // MARK: pointer movement
 
     /// Maps `point` to the host, sends the pointer with the current buttons
-    /// and moves the drawn cursor there.
-    private func movePointer(to point: CGPoint, coalescable: Bool) {
-        guard let input, let host = input.hostPoint(forViewPoint: point, viewSize: bounds.size) else { return }
+    /// and moves the drawn cursor there. A pure hover (no button held)
+    /// outside the fitted video rect (the letterbox) sends nothing and hides
+    /// our cursor — the system pointer shows there instead, via
+    /// `pointerInteraction(_:regionFor:defaultRegion:)` / `styleFor`.
+    func movePointer(to point: CGPoint, coalescable: Bool) {
+        guard let input else { return }
+        if buttons == 0, !input.fittedRect(in: bounds.size).contains(point) {
+            cursor?.hide()
+            return
+        }
+        guard let host = input.hostPoint(forViewPoint: point, viewSize: bounds.size) else { return }
         let moved = lastHost.map { $0 != host } ?? true
         lastHost = host
         if moved || !coalescable {
@@ -388,8 +398,21 @@ final class RemoteInputView: UIView, UIPointerInteractionDelegate, UIGestureReco
 
     // MARK: UIPointerInteractionDelegate
 
+    /// Identifies the region returned for a point inside the fitted video
+    /// rect, so `styleFor` only hides the system pointer there.
+    private static let videoRegionID = "video" as NSString
+
+    func pointerInteraction(_ interaction: UIPointerInteraction, regionFor request: UIPointerRegionRequest,
+                            defaultRegion: UIPointerRegion) -> UIPointerRegion? {
+        guard let input else { return defaultRegion }
+        let fit = input.fittedRect(in: bounds.size)
+        guard fit.contains(request.location) else { return defaultRegion }
+        return UIPointerRegion(rect: fit, identifier: Self.videoRegionID)
+    }
+
     func pointerInteraction(_ interaction: UIPointerInteraction, styleFor region: UIPointerRegion) -> UIPointerStyle? {
-        cursor?.image != nil ? .hidden() : nil
+        guard (region.identifier as? NSString) == Self.videoRegionID else { return nil }
+        return cursor?.image != nil ? .hidden() : nil
     }
 
     // MARK: hardware keys

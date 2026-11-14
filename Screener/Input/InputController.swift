@@ -135,6 +135,14 @@ final class InputController {
         return (max(0, x), max(0, y))
     }
 
+    /// Where the aspect-fitted canvas lands in a view of `viewSize` (view
+    /// coordinates); `.zero` before the view or the canvas has an extent.
+    /// The system pointer is hidden only inside this rect (RemoteInputView);
+    /// outside it (the letterbox) is not part of the video.
+    func fittedRect(in viewSize: CGSize) -> CGRect {
+        CompositeLayout.aspectFit(CGSize(width: serverWidth, height: serverHeight), in: viewSize)
+    }
+
     /// Host scroll pixels (logical points: one press scrolls 1 px) per view
     /// point, so content under the fingers moves 1:1.
     func scrollTicksPerPoint(viewSize: CGSize) -> CGFloat {

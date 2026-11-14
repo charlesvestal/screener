@@ -229,8 +229,14 @@ final class MetalRenderer: NSObject, MTKViewDelegate {
         }
         let primaries = CVBufferCopyAttachment(ref, kCVImageBufferColorPrimariesKey, nil) as? String
         setLayerColorSpace(Self.colorSpaceName(primaries: primaries), on: view)
-        guard let drawable = view.currentDrawable,
-              let pass = view.currentRenderPassDescriptor,
+        guard let drawable = view.currentDrawable else {
+            // No drawable right now (e.g. the layer isn't sized/visible yet):
+            // ask for another pass rather than silently dropping this frame —
+            // `lastVersion` is left as-is, so the next draw sees it as new again.
+            view.setNeedsDisplay()
+            return
+        }
+        guard let pass = view.currentRenderPassDescriptor,
               let cmd = queue.makeCommandBuffer() else { return }
         pass.colorAttachments[0].loadAction = .clear
         pass.colorAttachments[0].clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 1)

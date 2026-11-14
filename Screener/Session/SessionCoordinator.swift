@@ -86,6 +86,9 @@ final class SessionCoordinator {
         var firstFrameDeadline: Duration = .seconds(10)
         /// Longest wait for the TCP close to go out before closing media anyway.
         var controlCloseTimeout: Duration = .seconds(1)
+        /// Longest wait, at teardown, for queued input (the releases sent by
+        /// `releaseInput`) to reach the control channel before it's closed.
+        var inputFlushTimeout: Duration = .milliseconds(150)
     }
 
     /// Injection points for tests.
@@ -121,6 +124,11 @@ final class SessionCoordinator {
     let cursor = RemoteCursor()
     /// Sends pointer / keyboard input; nil until the stream has started.
     private(set) var input: InputController?
+    /// Releases every held key and pointer button on the UI layer (weakly
+    /// capturing the session view's `RemoteInputView`; a no-op once that view
+    /// is gone). Called synchronously before any teardown, so the Mac never
+    /// keeps input held after a disconnect, background, or failure.
+    var releaseInput: (() -> Void)?
     /// Latest 0x451 backing size (pointer clamp) and backing/scaled factor.
     private var hostBacking: (width: Int, height: Int)?
     private var hostPointScale: CGFloat = 2
@@ -462,8 +470,16 @@ final class SessionCoordinator {
         statsTask?.cancel(); statsTask = nil
         mediaFailureTask?.cancel(); mediaFailureTask = nil
         videoTask?.cancel(); videoTask = nil
-        input?.close()
-        input = nil
+        // Never leave a key or pointer button held on the Mac: release
+        // everything on the UI layer at once, synchronously (before `input`
+        // itself is cleared below), so the Mac sees the releases as soon as
+        // possible. The flush that gets them onto the wire needs an await
+        // (below, inside `work`): it must not land between clearing `state`
+        // and clearing `input`/`media`, which callers (and tests) read as
+        // one atomic transition.
+        releaseInput?()
+        let input = input
+        self.input = nil
         cursor.reset()
         let (c, m, server) = (control, media, serverAddress)
         control = nil
@@ -475,8 +491,21 @@ final class SessionCoordinator {
         frames.reset()
         let previous = pendingTeardown
         let closeTimeout = policy.controlCloseTimeout
+        let inputFlushTimeout = policy.inputFlushTimeout
         let work = Task { @MainActor [weak self] in
             await previous?.value
+            // Give whatever `releaseInput` just queued a bounded chance to
+            // actually reach the control channel before `input` (and then
+            // the control channel itself) is closed.
+            if let input {
+                await withTaskGroup(of: Void.self) { group in
+                    group.addTask { await input.flush() }
+                    group.addTask { try? await Task.sleep(for: inputFlushTimeout) }
+                    await group.next()
+                    group.cancelAll()
+                }
+                input.close()
+            }
             // TCP first: the Mac ends the session (and display privacy) when
             // it sees this close, so it must go out before anything else.
             if let c {
@@ -527,6 +556,10 @@ final class SessionCoordinator {
             if l.backingWidth > 0, l.backingHeight > 0 {
                 hostBacking = (l.backingWidth, l.backingHeight)
                 input?.setServerDims(width: l.backingWidth, height: l.backingHeight)
+                // One canvas source of truth: the frame store (video layout
+                // and drawCursor's CompositeLayout) and the input mapping
+                // must agree on the same backing size.
+                frames.configure(canvas: CGSize(width: l.backingWidth, height: l.backingHeight))
                 if l.scaledWidth > 0 {
                     hostPointScale = CGFloat(l.backingWidth) / CGFloat(l.scaledWidth)
                     input?.pointScale = hostPointScale

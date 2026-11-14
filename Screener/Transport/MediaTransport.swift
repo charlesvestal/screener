@@ -108,12 +108,20 @@ enum MediaTransportError: Error, Equatable, LocalizedError {
 
     static let localNetworkMessage =
         "Screener needs Local Network access — check Settings › Privacy & Security › Local Network."
+    static let unreachableMessage = "Can't reach this Mac — check it's awake and on this network."
 
     var errorDescription: String? {
         switch self {
         case .bindFailed(let a, let v, _): return "UDP ports \(a)/\(v) unavailable (another Screen Sharing session?)"
         case .channelFailed(let why): return "Media connection lost (\(why))"
-        case .localNetworkBlocked: return Self.localNetworkMessage
+        // EPERM / EACCES: iOS Local Network privacy denied the sends. Any
+        // other errno (EHOSTUNREACH, ENETUNREACH, ETIMEDOUT, ...) means the
+        // Mac just isn't reachable right now — a different message (see
+        // UserFacingError.kind(of:), which already makes this split for the
+        // coordinator; this keeps the error's own description consistent
+        // with it for anything that logs `error.localizedDescription` directly).
+        case .localNetworkBlocked(let errno):
+            return errno == EPERM || errno == EACCES ? Self.localNetworkMessage : Self.unreachableMessage
         }
     }
 }

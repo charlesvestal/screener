@@ -383,6 +383,19 @@ final class MediaTransportTests: XCTestCase {
         await t.close()
     }
 
+    /// A routing errno (not a privacy denial) describes itself as "can't
+    /// reach this Mac", not the Local Network text.
+    func testLocalNetworkBlockedDescribesRoutingErrnosDifferentlyFromPrivacyDenials() {
+        for errno in [EHOSTUNREACH, ENETUNREACH, ETIMEDOUT, EHOSTDOWN, ENETDOWN] {
+            XCTAssertEqual(MediaTransportError.localNetworkBlocked(errno: errno).localizedDescription,
+                          MediaTransportError.unreachableMessage, "errno \(errno)")
+        }
+        for errno in [EPERM, EACCES] {
+            XCTAssertEqual(MediaTransportError.localNetworkBlocked(errno: errno).localizedDescription,
+                          MediaTransportError.localNetworkMessage, "errno \(errno)")
+        }
+    }
+
     func testResetForRetryKeepsTheChannelsAndAcceptsAFreshBurst() async throws {
         let ch = FakeChannels()
         let t = make(ch)
