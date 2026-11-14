@@ -29,7 +29,15 @@
 - **No device builds and no TestFlight uploads** until the coordinator decides a build is worth the user's time. `Tools/run-on-ipad.sh` / `fetch-ipad-log.sh` are unused while the user is away.
 - **Protocol milestones M1–M4 and M7 (Mac→iPad clipboard) are verified in the iPad simulator against this Mac's own Screen Sharing** (`127.0.0.1:5900` or this Mac's LAN IP). The simulator's `screener.log` is read directly from the simulator container (`xcrun simctl get_app_container booted com.charlesvestal.screener data`). If screensharingd refuses loopback, try the LAN IP. If that also fails, record it and fall back to TestFlight for those milestones. Simulator builds may launch the app with `-autoConnect host user` launch arguments (DEBUG only) and read credentials from `~/.screener-test.env` (chmod 600, outside the repo) so no UI interaction is needed.
 - **Device-only checks** (touch, Pencil, trackpad/pointer lock, haptics, audio output on iPad, rotation/Stage Manager, multi-window, Wake-on-LAN) are batched into **as few TestFlight builds as possible**. Each build ships with an in-app "Share Log" action (Task 14 adds it to the session/host UI) so the user can send `screener.log` back from wherever they are. To reach this Mac from outside the LAN, the iPad needs a route to it (e.g. Tailscale or a VPN). Ask the user before the first TestFlight build.
-- TestFlight upload: App Store Connect API key `~/.appstoreconnect/private_keys/AuthKey_XXXXXXXXXX.p8` and fastlane are present. The issuer ID and app record still need confirming at upload time.
+- TestFlight upload: copy the user's proven pipeline, `an existing TestFlight deploy script`, as `Tools/deploy-testflight.sh`:
+  - Swap its cmake step for `xcodegen generate`.
+  - Archive with `-allowProvisioningUpdates` and the Admin ASC key flags.
+  - Export with `manageAppVersionAndBuildNumber` and upload, putting system rsync first on PATH.
+  - Credentials go in a gitignored `Tools/.deploy.local` (same `ASC_KEY_ID`/`ASC_ISSUER_ID`/`DEVELOPMENT_TEAM` as the other project's `scripts/.deploy.local`).
+  - Before the first upload, create the App Store Connect app record in Chrome, where the user is signed in. The API can't create apps.
+  - Confirm with the user whether the bundle ID should follow their `com.vestal.<app>` convention (currently `com.charlesvestal.screener`).
+  - Settle the export-compliance answer (`ITSAppUsesNonExemptEncryption`).
+  - The app uses standard AES/SRTP only to talk to Apple's own Screen Sharing protocol, so ask the user how they want to answer the compliance question.
 
 **Live-test caveat:** HP mode forces display privacy on the host, so this Mac's screen goes dark while the iPad is connected. Live-session steps must be kept short. Start them from the terminal and ask the user to watch the iPad. The user disconnects from the iPad toolbar (or by force-quitting the app) to get the Mac's screen back.
 
