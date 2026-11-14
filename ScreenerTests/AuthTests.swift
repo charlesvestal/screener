@@ -87,22 +87,33 @@ private func serveKeyRequest(_ s: ByteStream, key: TestRSAKey) async throws -> D
     return req
 }
 
-/// RFC §4.2.4.7 final proof: `u32 total || u8 step || u32 x || u32 payload_len ||
-/// %o M2 || %o server_random || %s "" || %u 0`.
-private func finalProofFrame(m2: Data) -> Data {
+/// RFC §4.2.4.7 final proof as a live macOS server sends it (98 bytes):
+/// `u32 total || u16 0 || u16 2 || u16 x || u32 payload_len ||
+/// %o M2 || %o server_random || %s "" || %u 0`, x = payload_len + 4.
+private func finalProofBody(m2: Data, rfcNineByteHeader: Bool = false) -> Data {
     var inner = ByteWriter()
     inner.writeO(m2)
     inner.writeO(Data(repeating: 0x5a, count: 16))
     inner.writeS("")
     inner.u32(0)
     var body = ByteWriter()
-    body.u8(0)
-    body.u32(UInt32(inner.data.count + 4))
+    if rfcNineByteHeader {
+        body.u8(0)
+        body.u32(UInt32(inner.data.count + 4))
+    } else {
+        body.u16(0); body.u16(2)
+        body.u16(UInt16(inner.data.count + 4))
+    }
     body.u32(UInt32(inner.data.count))
     body.bytes(inner.data)
+    return body.data
+}
+
+private func finalProofFrame(m2: Data) -> Data {
+    let body = finalProofBody(m2: m2)
     var w = ByteWriter()
-    w.u32(UInt32(body.data.count))
-    w.bytes(body.data)
+    w.u32(UInt32(body.count))
+    w.bytes(body)
     return w.data
 }
 
@@ -257,6 +268,31 @@ final class AuthTests: XCTestCase {
         XCTAssertEqual(try r.readM(), fx.A)
         XCTAssertEqual(try r.readO(), fx.M1)
         XCTAssertEqual(try r.readS(), fx.cap)
+    }
+
+    /// Live macOS server, 98-byte final proof with the 10-byte header
+    /// `00000002 005c 00000058` (observed 2026-11-14): M2 must be found.
+    /// Before the fix the 9-byte RFC header was assumed, so the u8 read at
+    /// offset 9 (0x58 = 88) was taken as the M2 length and M2 was never checked.
+    func testExtractM2FromLiveShapedFinalProof() {
+        let m2 = Data((0..<64).map { UInt8($0) })
+        let body = finalProofBody(m2: m2)
+        XCTAssertEqual(body.count, 98)
+        XCTAssertEqual(body.prefix(11).hex, "00000002005c0000005840")
+        XCTAssertEqual(Authenticator.extractM2(body), m2)
+    }
+
+    func testExtractM2FromRFCShapedFinalProof() {
+        let m2 = Data(repeating: 0xab, count: 64)
+        XCTAssertEqual(Authenticator.extractM2(finalProofBody(m2: m2, rfcNineByteHeader: true)), m2)
+    }
+
+    func testExtractM2RejectsInconsistentHeader() {
+        var body = finalProofBody(m2: Data(repeating: 1, count: 64))
+        body[5] ^= 0x01   // x no longer equals payload_len + 4
+        XCTAssertNil(Authenticator.extractM2(body))
+        XCTAssertNil(Authenticator.extractM2(Data()))
+        XCTAssertNil(Authenticator.extractM2(finalProofBody(m2: Data(repeating: 1, count: 63))))
     }
 
     func testM2MismatchLogsButSucceeds() async throws {

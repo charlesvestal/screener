@@ -471,16 +471,42 @@ extension Authenticator {
                 Log.auth.error("SRP server proof M2 MISMATCH — continuing (formula unverified against live server); SecurityResult decides")
             }
         } else {
-            Log.auth.error("SRP final proof (\(finalProof.count)B) did not parse per RFC §4.2.4.7; M2 not checked")
+            // Lengths only: the proof is public, but keep the log terse.
+            let head = finalProof.prefix(10).map { String(format: "%02x", $0) }.joined()
+            Log.auth.error("SRP final proof (\(finalProof.count)B, header \(head)) did not parse per RFC §4.2.4.7; M2 not checked")
         }
         try await readSecurityResult(s, label: "SRP")
     }
 
-    /// RFC §4.2.4.7: `u8 step || u32 x || u32 payload_len || %o M2 || …`.
+    /// RFC §4.2.4.7 final proof → M2. The inner payload is
+    /// `%o M2 || %o server_random || %s "" || %u 0`, behind a header whose
+    /// `x` field always equals `payload_len + 4`. Two header shapes:
+    ///   * observed live (macOS screensharingd, 98-byte proof):
+    ///     `u16 0 || u16 2 || u16 x || u32 payload_len` (10 bytes) — the same
+    ///     shape as the challenge (`00000002 0487 00000483 …`), whose fixed
+    ///     12-byte skip in `parseSRPChallenge` already assumes it;
+    ///   * as written in the RFC text: `u8 step || u32 x || u32 payload_len`
+    ///     (9 bytes).
+    /// A header is accepted only if `x == payload_len + 4` and the payload
+    /// fills the rest of the frame exactly, so the two cannot be confused.
     static func extractM2(_ body: Data) -> Data? {
-        var r = ByteReader(body)
-        guard (try? r.skip(9)) != nil, let m2 = try? r.readO(), m2.count == K.srpHashLen else { return nil }
-        return m2
+        func m2(afterHeader n: Int, x: Int, payloadLen: Int) -> Data? {
+            guard x == payloadLen + 4, body.count == n + payloadLen else { return nil }
+            var r = ByteReader(body.dropFirst(n))
+            guard let m2 = try? r.readO(), m2.count == K.srpHashLen else { return nil }
+            return m2
+        }
+        var r10 = ByteReader(body)
+        if (try? r10.skip(4)) != nil, let x = try? r10.u16(), let len = try? r10.u32(),
+           let v = m2(afterHeader: 10, x: Int(x), payloadLen: Int(len)) {
+            return v
+        }
+        var r9 = ByteReader(body)
+        if (try? r9.skip(1)) != nil, let x = try? r9.u32(), let len = try? r9.u32(),
+           let v = m2(afterHeader: 9, x: Int(x), payloadLen: Int(len)) {
+            return v
+        }
+        return nil
     }
 }
 
