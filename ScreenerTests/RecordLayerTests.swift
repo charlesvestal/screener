@@ -42,6 +42,23 @@ final class RecordLayerTests: XCTestCase {
         }
     }
 
+    func testOpenRejectsNonBlockMultipleCiphertext() throws {
+        let rx = try RecordLayer(rekeyBody: Data(count: 36), wrapKey: Data(count: 16))
+        // 33 bytes: not a multiple of the 16-byte AES block size, so it can't be
+        // decrypted at all. Must be rejected as badFrame before CBC ever runs,
+        // without advancing the receive sequence counter (checked below via a
+        // follow-up record still opening cleanly, proving CBC state is untouched).
+        let notBlockMultiple = Data(count: 33)
+        XCTAssertThrowsError(try rx.open(ciphertext: notBlockMultiple)) { error in
+            XCTAssertEqual(error as? RecordLayerError, .badFrame)
+        }
+
+        let tx = try RecordLayer(rekeyBody: Data(count: 36), wrapKey: Data(count: 16))
+        let body = Data([0x07, 0x08])
+        let wire = try tx.seal(body)
+        XCTAssertEqual(try rx.open(ciphertext: wire.dropFirst(2)), body)
+    }
+
     func testFrameSplitter() throws {
         var s = FrameSplitter()
         let frame = Data([0x00, 0x20]) + Data(count: 32)

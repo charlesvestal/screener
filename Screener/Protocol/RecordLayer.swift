@@ -85,6 +85,17 @@ final class RecordLayer: @unchecked Sendable {
     /// since CBC chaining state must stay in sync with the sender.
     func open(ciphertext: Data) throws -> Data {
         lock.lock(); defer { lock.unlock() }
+
+        // AES-CBC only accepts whole blocks; a ciphertext that isn't a non-zero
+        // multiple of the 16-byte block size can't be decrypted at all, and
+        // `FrameSplitter` (the only normal producer of ciphertext fed here) never
+        // emits one. Reject it before touching `dec`, so a malformed/adversarial
+        // frame can't desync the CBC chaining state that legitimate records depend
+        // on for every subsequent `open` call.
+        guard ciphertext.count > 0, ciphertext.count % 16 == 0 else {
+            throw RecordLayerError.badFrame
+        }
+
         let plaintext = try dec.update(Data(ciphertext))
         let ctrStart = recvSeq
         recvSeq &+= 1
