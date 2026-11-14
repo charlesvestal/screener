@@ -703,6 +703,75 @@ def build_hevc_rtp_fixture():
     return out
 
 
+
+# ════════════════════════════════════════════════════════════════════
+# input.json — proxy/input.py InputController (pointer / scroll / key)
+# ════════════════════════════════════════════════════════════════════
+
+class _CaptureCipher:
+    """Stands in for enc1103.StreamCipher: InputController only reads
+    `cbc_key` (for msg 0x10) and calls `encrypt_and_send(sock, payload)`.
+    Captures each plaintext payload so the fixture records exactly what
+    InputController hands the record layer, in order."""
+
+    def __init__(self, cbc_key: bytes):
+        self.cbc_key = cbc_key
+        self.sent: list[bytes] = []
+
+    def encrypt_and_send(self, _sock, payload: bytes) -> None:
+        self.sent.append(bytes(payload))
+
+
+def build_input_fixture():
+    key = bytes(range(16))
+    out = {"cbc_key": h(key)}
+
+    def run(server_w, server_h, fn):
+        cipher = _CaptureCipher(key)
+        ctl = input_mod.InputController(
+            None, cipher, server_width=server_w, server_height=server_h,
+        )
+        fn(ctl)
+        return [h(m) for m in cipher.sent]
+
+    out["click"] = {
+        "args": {"server": [1920, 1080], "calls": "pointer(0,960,540); pointer(1,960,540); pointer(0,960,540)"},
+        "result": run(1920, 1080, lambda c: (
+            c.pointer_event(0, 960, 540), c.pointer_event(1, 960, 540), c.pointer_event(0, 960, 540))),
+    }
+    out["right_click"] = {
+        "args": {"server": [1920, 1080], "calls": "pointer(2,10,20); pointer(0,10,20)"},
+        "result": run(1920, 1080, lambda c: (c.pointer_event(2, 10, 20), c.pointer_event(0, 10, 20))),
+    }
+    out["clamp"] = {
+        "args": {"server": [1920, 1080], "calls": "pointer(0,-5,5000); pointer(0,1920,1080)"},
+        "result": run(1920, 1080, lambda c: (c.pointer_event(0, -5, 5000), c.pointer_event(0, 1920, 1080))),
+    }
+    out["set_server_dims"] = {
+        "args": {"server": [1920, 1080], "calls": "set_server_dims(3840,2160); pointer(0,3000,2000)"},
+        "result": run(1920, 1080, lambda c: (c.set_server_dims(3840, 2160), c.pointer_event(0, 3000, 2000))),
+    }
+    out["scroll_down_2"] = {
+        "args": {"server": [1920, 1080], "calls": "scroll_event(100,200,0,2)"},
+        "result": run(1920, 1080, lambda c: c.scroll_event(100, 200, 0, 2)),
+    }
+    out["scroll_up_1"] = {
+        "args": {"server": [1920, 1080], "calls": "scroll_event(100,200,5,-1) (dx ignored)"},
+        "result": run(1920, 1080, lambda c: c.scroll_event(100, 200, 5, -1)),
+    }
+    out["scroll_horizontal_only"] = {
+        "args": {"server": [1920, 1080], "calls": "scroll_event(100,200,3,0)"},
+        "result": run(1920, 1080, lambda c: c.scroll_event(100, 200, 3, 0)),
+    }
+    out["keys"] = {
+        "args": {"server": [1920, 1080],
+                 "calls": "key(True,0xffeb); key(True,0x63); key(False,0x63); key(False,0xffeb); key(True,0)"},
+        "result": run(1920, 1080, lambda c: (
+            c.key_event(True, 0xffeb), c.key_event(True, 0x63), c.key_event(False, 0x63),
+            c.key_event(False, 0xffeb), c.key_event(True, 0))),
+    }
+    return out
+
 # ════════════════════════════════════════════════════════════════════
 
 def main() -> int:
@@ -714,6 +783,7 @@ def main() -> int:
     write_json("clipboard", build_clipboard_fixture())
     write_json("rtcp", build_rtcp_fixture())
     write_json("hevc_rtp", build_hevc_rtp_fixture())
+    write_json("input", build_input_fixture())
     return 0
 
 

@@ -14,7 +14,7 @@ cd Tools/fixtures
 uv run --python 3.12 --with cryptography --with pycryptodome --with numpy python make_fixtures.py
 ```
 
-Exits 0 and writes all 8 files to `../../ScreenerTests/Fixtures/`. Re-running
+Exits 0 and writes all 9 files to `../../ScreenerTests/Fixtures/`. Re-running
 produces byte-identical files — verified with:
 
 ```bash
@@ -143,6 +143,17 @@ the JSON is self-describing; this file summarizes the same information.
   slice), as the plan allows. See **Deviations** for why the "expected
   de-DONL'd NAL units" are *not* hand-computed here but come from directly
   calling the real reference reassembler.
+
+- **`input.json`** — `proxy/input.py` `InputController`. Each entry drives a
+  real `InputController` (fixed 16-byte `cbc_key` = `00..0f`, server
+  1920×1080) whose cipher is a capturing stand-in: InputController only reads
+  `cipher.cbc_key` (for msg 0x10) and calls `cipher.encrypt_and_send(sock,
+  payload)`, so the stand-in records each plaintext `payload` in order —
+  exactly what the reference hands its record layer. Covers a left click
+  (move/down/up), a right click, coordinate clamping, `set_server_dims`,
+  `scroll_event` (dy=+2 → two bit4 press/release pairs; dy=-1 → one bit3
+  pair; dx-only → nothing) and `key_event` (incl. keysym 0 → dropped).
+  AES-ECB is deterministic, so the msg 0x10 bytes are stable.
 
 ## Deviations from the plan
 

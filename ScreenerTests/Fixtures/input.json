@@ -1,0 +1,108 @@
+{
+  "cbc_key": "000102030405060708090a0b0c0d0e0f",
+  "clamp": {
+    "args": {
+      "calls": "pointer(0,-5,5000); pointer(0,1920,1080)",
+      "server": [
+        1920,
+        1080
+      ]
+    },
+    "result": [
+      "100070f6c72f94ac9b88815883bdbd29237f",
+      "100054af9df1dac03a012f9ae7904efd67c8"
+    ]
+  },
+  "click": {
+    "args": {
+      "calls": "pointer(0,960,540); pointer(1,960,540); pointer(0,960,540)",
+      "server": [
+        1920,
+        1080
+      ]
+    },
+    "result": [
+      "10003a9beb0ad29b55c3559570149cedd157",
+      "1000aeb9345e999487b35090814a79d0e3fa",
+      "10003a9beb0ad29b55c3559570149cedd157"
+    ]
+  },
+  "keys": {
+    "args": {
+      "calls": "key(True,0xffeb); key(True,0x63); key(False,0x63); key(False,0xffeb); key(True,0)",
+      "server": [
+        1920,
+        1080
+      ]
+    },
+    "result": [
+      "040100000000ffeb",
+      "0401000000000063",
+      "0400000000000063",
+      "040000000000ffeb"
+    ]
+  },
+  "right_click": {
+    "args": {
+      "calls": "pointer(2,10,20); pointer(0,10,20)",
+      "server": [
+        1920,
+        1080
+      ]
+    },
+    "result": [
+      "1000f1469b0cb58d41fadb4be701faee407d",
+      "10001074f7c887344c312512a7c6840f1ae2"
+    ]
+  },
+  "scroll_down_2": {
+    "args": {
+      "calls": "scroll_event(100,200,0,2)",
+      "server": [
+        1920,
+        1080
+      ]
+    },
+    "result": [
+      "10006a461a99d8971320ba75482aa06221bf",
+      "10007771788d867ab2f9c27a9d53b50880e0",
+      "10006a461a99d8971320ba75482aa06221bf",
+      "10007771788d867ab2f9c27a9d53b50880e0"
+    ]
+  },
+  "scroll_horizontal_only": {
+    "args": {
+      "calls": "scroll_event(100,200,3,0)",
+      "server": [
+        1920,
+        1080
+      ]
+    },
+    "result": []
+  },
+  "scroll_up_1": {
+    "args": {
+      "calls": "scroll_event(100,200,5,-1) (dx ignored)",
+      "server": [
+        1920,
+        1080
+      ]
+    },
+    "result": [
+      "1000ffc572239b6ab02abbff35c3fe4adbf6",
+      "10007771788d867ab2f9c27a9d53b50880e0"
+    ]
+  },
+  "set_server_dims": {
+    "args": {
+      "calls": "set_server_dims(3840,2160); pointer(0,3000,2000)",
+      "server": [
+        1920,
+        1080
+      ]
+    },
+    "result": [
+      "10006e4bef9e51d2d2e04c55b4a1be40c116"
+    ]
+  }
+}
