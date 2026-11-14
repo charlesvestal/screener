@@ -55,6 +55,11 @@ enum AES {
 }
 
 /// One persistent AES-128/256-CBC context: chaining state carries across update() calls.
+///
+/// `@unchecked Sendable` because `CCCryptorRef` is not itself `Sendable`-checked, and the
+/// chaining state inside it is mutated by every `update(_:)` call. Callers must serialize
+/// access to a given instance — `update()` is **not** safe to call concurrently from multiple
+/// tasks on the same `AESCBCStream`.
 final class AESCBCStream: @unchecked Sendable {
     enum Operation { case encrypt, decrypt }
     private let ref: CCCryptorRef
