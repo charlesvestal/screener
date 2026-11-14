@@ -6,6 +6,11 @@
 #     seconds        -autoDisconnectAfter (default 20)
 #     startup-order  reference (default) | native — ControlSession.StartupOrder
 #
+# SCREENER_LOCAL_ADDR=<ipv4> (env) pins the app's TCP + UDP source address
+# (-localAddress). HP media goes to the TCP peer address on the server's own
+# port numbers, so testing against THIS Mac needs two local IPs: connect to
+# one from the other (e.g. host=192.0.2.54 SCREENER_LOCAL_ADDR=192.0.2.33).
+#
 # Credentials come from ~/.screener-test.env (override the path with
 # SCREENER_TEST_ENV), which the user creates (Tools/make-test-env.sh):
 #   SCREENER_USER=<value>
@@ -74,6 +79,7 @@ xcrun simctl install "$UDID" "$APP"
 # --- launch (credentials go only into the child's environment) ---
 args=(-autoConnect "$HOST" -autoDisconnectAfter "$AFTER")
 [[ -n $ORDER ]] && args+=(-startupOrder "$ORDER")
+[[ -n ${SCREENER_LOCAL_ADDR:-} ]] && args+=(-localAddress "$SCREENER_LOCAL_ADDR")
 echo "Launching $BUNDLE: ${args[*]}"
 SIMCTL_CHILD_SCREENER_USER=$SCREENER_USER_VALUE SIMCTL_CHILD_SCREENER_PASS=$SCREENER_PASS_VALUE \
   xcrun simctl launch --terminate-running-process "$UDID" "$BUNDLE" "${args[@]}" >/dev/null

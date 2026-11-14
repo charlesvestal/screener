@@ -1,78 +1,8 @@
-import Observation
 import SwiftUI
-import UIKit
-
-/// Owns one `ControlSession` for the debug connect flow (Task 10). Task 14's
-/// SessionView will replace the "connected" placeholder in HostListView.
-@MainActor @Observable
-final class ConnectionModel {
-    enum State: Equatable {
-        case idle
-        case connecting
-        case connected(canvasWidth: Int, canvasHeight: Int)
-        case failed(String)
-    }
-
-    private(set) var state: State = .idle
-    private var session: ControlSession?
-    private var eventsTask: Task<Void, Never>?
-    private var userClosed = false
-
-    var isBusy: Bool { state == .connecting }
-
-    func connect(host: String, port: UInt16, username: String, password: String,
-                 order: ControlSession.StartupOrder = .reference) async {
-        guard session == nil else { return }
-        let (logical, backing) = Self.screenSizes()
-        let config = ControlSession.Config(host: host, port: port, username: username, password: password,
-                                           logicalSize: logical, backingSize: backing, startupOrder: order)
-        let session = ControlSession(config: config)
-        self.session = session
-        userClosed = false
-        state = .connecting
-        do {
-            let params = try await session.start()
-            state = .connected(canvasWidth: params.canvas.width, canvasHeight: params.canvas.height)
-            watch(session)
-        } catch {
-            self.session = nil
-            state = userClosed ? .idle : .failed(ControlSession.describe(error))
-        }
-    }
-
-    func disconnect() async {
-        userClosed = true
-        eventsTask?.cancel(); eventsTask = nil
-        if let session { await session.close() }
-        session = nil
-        state = .idle
-    }
-
-    /// Drains events (nothing consumes them yet) and notices when the session ends.
-    private func watch(_ session: ControlSession) {
-        eventsTask = Task { [weak self] in
-            for await _ in session.events {}
-            let failure = await session.failure
-            guard let self, !Task.isCancelled, self.session === session else { return }
-            self.session = nil
-            self.state = failure.map { .failed(ControlSession.describe($0)) } ?? .idle
-        }
-    }
-
-    /// Advertised display: the window scene's screen in points (logical) and
-    /// `points × nativeScale` (backing). Using bounds × scale rather than
-    /// `nativeBounds` keeps the backing size in the current orientation.
-    static func screenSizes() -> (logical: CGSize, backing: CGSize) {
-        let screen = UIApplication.shared.connectedScenes.compactMap { ($0 as? UIWindowScene)?.screen }.first
-        let logical = screen?.bounds.size ?? CGSize(width: 1376, height: 1032)
-        let scale = screen?.nativeScale ?? 2
-        return (logical, CGSize(width: logical.width * scale, height: logical.height * scale))
-    }
-}
 
 /// Minimal manual-connect form (reused by Task 18).
 struct ConnectSheet: View {
-    let model: ConnectionModel
+    let model: SessionCoordinator
     @Environment(\.dismiss) private var dismiss
     @State private var host = ""
     @State private var port = "5900"

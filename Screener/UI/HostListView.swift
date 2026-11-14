@@ -1,7 +1,7 @@
 import SwiftUI
 
 struct HostListView: View {
-    @State private var model = ConnectionModel()
+    @State private var model = SessionCoordinator()
     @State private var showingConnect = false
 
     var body: some View {

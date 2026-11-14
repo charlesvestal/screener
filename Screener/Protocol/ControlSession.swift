@@ -51,7 +51,7 @@
 //     closes, then dwells 1.4 s. Its stated purpose is surviving lock →
 //     login → desktop transitions, not getting connected at all (loopback
 //     included). `_handshake_with_reconnect` (burst-starvation reconnect)
-//     depends on the UDP burst (Task 12) and is not ported either.
+//     lives in SessionCoordinator, which owns the UDP side.
 //   * Session-select cmd 0/2 (share console / alt session) is not implemented
 //     in v1: the prompt is reported as `.sessionSelectUnsupported`.
 import CoreGraphics
@@ -141,17 +141,31 @@ actor ControlSession {
                                      _ connect: @escaping @Sendable () async throws -> ByteStream)
             async throws -> (stream: ByteStream, result: AuthResult)
 
-        static let live = Seams(
-            connect: { host, port in
-                do {
-                    return try await TCPByteStream.connect(host: host, port: port, timeout: .seconds(10))
-                } catch TransportError.timeout {
-                    throw ControlSessionError.timeout(step: "connect")
-                }
-            },
-            authenticate: { user, pass, connect in
-                try await Authenticator.runWithFallback(username: user, password: pass, connect: connect)
-            })
+        static let live = live(localAddress: nil)
+
+        /// `localAddress` pins the TCP source address. The HP server sends its
+        /// UDP media to the control connection's peer address, so MediaTransport
+        /// must bind the same address (matters when the Mac has several, or
+        /// for same-host testing where loopback cannot work).
+        static func live(localAddress: String?) -> Seams {
+            Seams(
+                connect: { host, port in
+                    do {
+                        // Network.framework ignores a required local endpoint in the
+                        // simulator, so a pinned source address uses a BSD socket.
+                        if let localAddress {
+                            return try await SocketTCPByteStream.connect(host: host, port: port, localAddress: localAddress,
+                                                                         timeout: .seconds(10))
+                        }
+                        return try await TCPByteStream.connect(host: host, port: port, timeout: .seconds(10))
+                    } catch TransportError.timeout {
+                        throw ControlSessionError.timeout(step: "connect")
+                    }
+                },
+                authenticate: { user, pass, connect in
+                    try await Authenticator.runWithFallback(username: user, password: pass, connect: connect)
+                })
+        }
     }
 
     struct MediaParams: Sendable {
