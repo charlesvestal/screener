@@ -47,3 +47,24 @@ fragment float4 stripFragment(VOut in [[stage_in]],
                         y + u.coeffs.w * c.x);
     return float4(saturate(rgb), 1.0);
 }
+
+// Cursor overlay (gpu.py WGSL_CURSOR): one textured quad over the video.
+// The texture is premultiplied RGBA (RemoteCursor); the pipeline blends
+// one / one-minus-source-alpha. (gpu.py samples straight alpha and blends
+// src-alpha / one-minus-src-alpha: same result.)
+struct CursorUniforms {
+    float4 dstRect;     // NDC: left, top, right, bottom
+};
+
+vertex VOut cursorVertex(uint vid [[vertex_id]], constant CursorUniforms &u [[buffer(0)]]) {
+    float2 corner = float2(vid >= 2 ? 1.0 : 0.0, (vid & 1) ? 1.0 : 0.0);
+    VOut o;
+    o.position = float4(mix(u.dstRect.x, u.dstRect.z, corner.x), mix(u.dstRect.y, u.dstRect.w, corner.y), 0.0, 1.0);
+    o.uv = corner;
+    return o;
+}
+
+fragment float4 cursorFragment(VOut in [[stage_in]], texture2d<float> tex [[texture(0)]]) {
+    constexpr sampler s(filter::linear, address::clamp_to_edge);
+    return tex.sample(s, in.uv);
+}

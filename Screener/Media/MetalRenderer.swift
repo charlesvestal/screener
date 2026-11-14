@@ -23,6 +23,13 @@
 // VideoToolbox fills from the stream's VUI (Apple's stream: ITU_R_709_2);
 // BT.709 when absent, as gpu.py hard-codes. The range comes from the pixel
 // format ('444f' = full range, as the reference). Logged once per change.
+//
+// Cursor (gpu.py cursor overlay): the host's cursor (RemoteCursor, 0x450)
+// is drawn after the strips as one premultiplied-alpha quad at the pointer
+// position (host canvas pixels mapped through the same aspect fit), minus
+// the hotspot, sized cursor px × (view px per canvas px) × backing/scaled.
+// A cursor change (shape, position, visibility) asks for a redraw through
+// the same coalescer and forces a redraw of the current picture.
 import CoreVideo
 import Metal
 import MetalKit
@@ -95,6 +102,11 @@ final class MetalRenderer: NSObject, MTKViewDelegate {
     let device: MTLDevice
     private let queue: MTLCommandQueue
     private let pipeline: MTLRenderPipelineState
+    private let cursorPipeline: MTLRenderPipelineState
+    private let cursor: RemoteCursor?
+    private var cursorTexture: MTLTexture?
+    private var cursorTextureSerial: Int?
+    private var lastCursorRevision: Int?
     private let textureCache: CVMetalTextureCache
     private let store: VideoFrameStore
     private var lastVersion: Int?
@@ -110,7 +122,8 @@ final class MetalRenderer: NSObject, MTKViewDelegate {
 
     static let colorPixelFormat: MTLPixelFormat = .bgra8Unorm
 
-    init?(store: VideoFrameStore, device: MTLDevice? = MTLCreateSystemDefaultDevice()) {
+    init?(store: VideoFrameStore, cursor: RemoteCursor? = nil,
+          device: MTLDevice? = MTLCreateSystemDefaultDevice()) {
         guard let device, let queue = device.makeCommandQueue() else {
             Log.video.error("Metal: no device / command queue")
             return nil
@@ -122,6 +135,19 @@ final class MetalRenderer: NSObject, MTKViewDelegate {
             desc.fragmentFunction = library.makeFunction(name: "stripFragment")
             desc.colorAttachments[0].pixelFormat = Self.colorPixelFormat
             pipeline = try device.makeRenderPipelineState(descriptor: desc)
+            let cdesc = MTLRenderPipelineDescriptor()
+            cdesc.vertexFunction = library.makeFunction(name: "cursorVertex")
+            cdesc.fragmentFunction = library.makeFunction(name: "cursorFragment")
+            let att = cdesc.colorAttachments[0]!
+            att.pixelFormat = Self.colorPixelFormat
+            att.isBlendingEnabled = true
+            att.rgbBlendOperation = .add
+            att.alphaBlendOperation = .add
+            att.sourceRGBBlendFactor = .one
+            att.sourceAlphaBlendFactor = .one
+            att.destinationRGBBlendFactor = .oneMinusSourceAlpha
+            att.destinationAlphaBlendFactor = .oneMinusSourceAlpha
+            cursorPipeline = try device.makeRenderPipelineState(descriptor: cdesc)
         } catch {
             Log.video.error("Metal: pipeline creation failed: \(error)")
             return nil
@@ -136,6 +162,7 @@ final class MetalRenderer: NSObject, MTKViewDelegate {
         self.queue = queue
         self.textureCache = cache
         self.store = store
+        self.cursor = cursor
         super.init()
     }
 
@@ -153,12 +180,14 @@ final class MetalRenderer: NSObject, MTKViewDelegate {
         let coalescer = RedrawCoalescer { [weak view] in view?.setNeedsDisplay() }
         self.coalescer = coalescer
         store.setOnChange(owner: self) { coalescer.signal() }
+        cursor?.onChange = { coalescer.signal() }
         view.setNeedsDisplay()
     }
 
     /// Stops redraw requests (the view is going away).
     func detach() {
         store.clearOnChange(owner: self)
+        cursor?.onChange = nil
         coalescer = nil
     }
 
@@ -188,11 +217,13 @@ final class MetalRenderer: NSObject, MTKViewDelegate {
     private func drawFrame(in view: MTKView) {
         let size = view.drawableSize
         let resized = size != lastDrawableSize
-        guard let snap = store.snapshot(ifNewerThan: resized ? nil : lastVersion) else { return }
+        let cursorChanged = cursor.map { $0.revision != lastCursorRevision } ?? false
+        guard let snap = store.snapshot(ifNewerThan: resized || cursorChanged ? nil : lastVersion) else { return }
         guard let ref = snap.frames[0] ?? snap.frames.first?.value else {
             // Nothing drawable (new session, reconnecting): keep the last
             // picture on the layer and don't grab a drawable for this version.
             lastVersion = snap.version
+            lastCursorRevision = cursor?.revision
             lastDrawableSize = size
             return
         }
@@ -205,6 +236,7 @@ final class MetalRenderer: NSObject, MTKViewDelegate {
         pass.colorAttachments[0].clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 1)
         guard encode(snap, into: pass, size: size, commandBuffer: cmd) else {
             lastVersion = snap.version
+            lastCursorRevision = cursor?.revision
             lastDrawableSize = size
             return
         }
@@ -212,6 +244,7 @@ final class MetalRenderer: NSObject, MTKViewDelegate {
         cmd.commit()
         CVMetalTextureCacheFlush(textureCache, 0)
         lastVersion = snap.version
+        lastCursorRevision = cursor?.revision
         lastDrawableSize = size
         framesDrawn += 1
         if framesDrawn == 1 { onFirstDraw?() }
@@ -274,12 +307,48 @@ final class MetalRenderer: NSObject, MTKViewDelegate {
             enc.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4)
             drew = true
         }
+        if drew { drawCursor(enc, canvas: layout.canvas, size: size) }
         enc.endEncoding()
         // The CVMetalTextures (and through them the pixel buffers) must live
         // until the GPU is done with them.
         let held = TextureHold(keep)
         cmd.addCompletedHandler { _ in withExtendedLifetime(held) {} }
         return drew
+    }
+
+    private func drawCursor(_ enc: MTLRenderCommandEncoder, canvas: CGSize, size: CGSize) {
+        guard let cursor, let img = cursor.image, let pos = cursor.position, img.width > 0, img.height > 0
+        else { return }
+        let host = cursor.hostSize.width > 0 && cursor.hostSize.height > 0 ? cursor.hostSize : canvas
+        let fit = CompositeLayout.aspectFit(host, in: size)
+        guard fit.width > 0, let tex = cursorTexture(for: img) else { return }
+        let scl = fit.width / host.width                       // view px per canvas px
+        let d = scl * cursor.pointScale
+        let px = fit.minX + pos.x * scl, py = fit.minY + pos.y * scl
+        let x0 = px - CGFloat(img.hotspot.x) * d, y0 = py - CGFloat(img.hotspot.y) * d
+        let x1 = x0 + CGFloat(img.width) * d, y1 = y0 + CGFloat(img.height) * d
+        var rect = SIMD4<Float>(Float(x0 / size.width * 2 - 1), Float(1 - y0 / size.height * 2),
+                                Float(x1 / size.width * 2 - 1), Float(1 - y1 / size.height * 2))
+        enc.setRenderPipelineState(cursorPipeline)
+        enc.setVertexBytes(&rect, length: MemoryLayout<SIMD4<Float>>.stride, index: 0)
+        enc.setFragmentTexture(tex, index: 0)
+        enc.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4)
+    }
+
+    private func cursorTexture(for img: CursorImage) -> MTLTexture? {
+        if cursorTextureSerial == img.serial, let t = cursorTexture { return t }
+        let desc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba8Unorm, width: img.width,
+                                                            height: img.height, mipmapped: false)
+        desc.usage = .shaderRead
+        guard let tex = device.makeTexture(descriptor: desc) else { return nil }
+        img.rgba.withUnsafeBytes { raw in
+            guard let base = raw.baseAddress else { return }
+            tex.replace(region: MTLRegionMake2D(0, 0, img.width, img.height), mipmapLevel: 0,
+                        withBytes: base, bytesPerRow: img.width * 4)
+        }
+        cursorTexture = tex
+        cursorTextureSerial = img.serial
+        return tex
     }
 
     private func texture(_ buffer: CVPixelBuffer, plane: Int, format: MTLPixelFormat) -> CVMetalTexture? {

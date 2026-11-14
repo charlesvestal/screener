@@ -1,17 +1,20 @@
 import MetalKit
 import SwiftUI
 
-/// Full-screen remote desktop: the composited video, a small floating toolbar
-/// (Disconnect, Share Log) and a "Connecting…" overlay until the first
+/// Full-screen remote desktop: the composited video with the input layer on
+/// top (RemoteInputView), a small floating toolbar (Keyboard, Share Log,
+/// Disconnect) and a "Connecting…" overlay until the first
 /// picture decodes ("Reconnecting…" over the last picture while a session
 /// suspended by backgrounding is resumed).
 struct SessionView: View {
     let model: SessionCoordinator
+    @State private var keyboardVisible = false
 
     var body: some View {
         ZStack {
             Color.black.ignoresSafeArea()
-            VideoView(store: model.frames)
+            RemoteScreenView(store: model.frames, cursor: model.cursor, input: model.input,
+                             keyboardVisible: $keyboardVisible)
                 .ignoresSafeArea()
             if model.isReconnecting || !model.hasFirstFrame {
                 VStack(spacing: 12) {
@@ -30,6 +33,13 @@ struct SessionView: View {
 
     private var toolbar: some View {
         HStack(spacing: 4) {
+            Button {
+                keyboardVisible.toggle()
+            } label: {
+                Label(keyboardVisible ? "Hide Keyboard" : "Show Keyboard",
+                      systemImage: keyboardVisible ? "keyboard.chevron.compact.down" : "keyboard")
+            }
+            .disabled(model.input == nil)
             ShareLogButton()
             Button(role: .destructive) {
                 Task { await model.disconnect() }
@@ -60,31 +70,60 @@ struct ShareLogButton: View {
     }
 }
 
-/// MTKView drawn on demand by MetalRenderer (redrawn when a picture arrives).
-struct VideoView: UIViewRepresentable {
+/// The video (MTKView drawn on demand by MetalRenderer, with the host
+/// cursor) under a transparent RemoteInputView of the same size.
+struct RemoteScreenView: UIViewRepresentable {
     let store: VideoFrameStore
+    let cursor: RemoteCursor
+    let input: InputController?
+    @Binding var keyboardVisible: Bool
 
     final class Coordinator {
         var renderer: MetalRenderer?
     }
 
+    final class Container: UIView {
+        let video = MTKView(frame: .zero)
+        let remoteInput = RemoteInputView(frame: .zero)
+
+        override init(frame: CGRect) {
+            super.init(frame: frame)
+            backgroundColor = .black
+            video.backgroundColor = .black
+            for v in [video, remoteInput] as [UIView] {
+                v.frame = bounds
+                v.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+                addSubview(v)
+            }
+        }
+
+        required init?(coder: NSCoder) { fatalError("init(coder:) is not used") }
+    }
+
     func makeCoordinator() -> Coordinator { Coordinator() }
 
-    func makeUIView(context: Context) -> MTKView {
-        let view = MTKView(frame: .zero)
-        view.backgroundColor = .black
-        if let renderer = MetalRenderer(store: store) {
-            renderer.attach(to: view)
+    func makeUIView(context: Context) -> Container {
+        let view = Container(frame: .zero)
+        if let renderer = MetalRenderer(store: store, cursor: cursor) {
+            renderer.attach(to: view.video)
             context.coordinator.renderer = renderer
         }
+        view.remoteInput.cursor = cursor
         return view
     }
 
-    func updateUIView(_ view: MTKView, context: Context) {}
+    func updateUIView(_ view: Container, context: Context) {
+        view.remoteInput.input = input
+        let binding = $keyboardVisible
+        view.remoteInput.onSoftwareKeyboardDismissed = { binding.wrappedValue = false }
+        view.remoteInput.softwareKeyboardVisible = keyboardVisible && input != nil
+    }
 
-    static func dismantleUIView(_ view: MTKView, coordinator: Coordinator) {
-        view.isPaused = true
-        view.delegate = nil
+    static func dismantleUIView(_ view: Container, coordinator: Coordinator) {
+        view.video.isPaused = true
+        view.video.delegate = nil
+        view.remoteInput.input = nil
+        view.remoteInput.cursor = nil
         coordinator.renderer?.detach()
         coordinator.renderer = nil
     }

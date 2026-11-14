@@ -20,6 +20,13 @@
 // the assembler's 20 ms tick are wired inside it. A stream that turns out to
 // be H.264 fails the session ("server chose H.264").
 //
+// Input (Task 15): once the stream has started, an InputController sends
+// pointer / key input on the control channel (0x10 pointer events under the
+// record layer's content key). Control events feed it and the host cursor:
+// each 0x451 updates the pointer's canvas (backing) size and the cursor's
+// backing/scaled factor; 0x450 STORE / SELECT update RemoteCursor. Both are
+// dropped at teardown (cursor cache ids are per connection).
+//
 // Concurrency: every connect runs in `connectTask` under a generation number.
 // `disconnect()` and any session failure bump the generation, cancel the task
 // and tear down; the connect task re-checks its generation after every await
@@ -93,6 +100,13 @@ final class SessionCoordinator {
     private(set) var serverAddress: String?
     /// Latest decoded picture per tile; the session view's renderer reads it.
     let frames = VideoFrameStore()
+    /// The host's cursor shape and the local pointer position (rendered over the video).
+    let cursor = RemoteCursor()
+    /// Sends pointer / keyboard input; nil until the stream has started.
+    private(set) var input: InputController?
+    /// Latest 0x451 backing size (pointer clamp) and backing/scaled factor.
+    private var hostBacking: (width: Int, height: Int)?
+    private var hostPointScale: CGFloat = 2
     /// The current session decoded its first picture.
     private(set) var hasFirstFrame = false
     /// A suspended session is being resumed: from the background close until
@@ -291,6 +305,9 @@ final class SessionCoordinator {
         startStatsPolling(media)
 
         let (logical, backing) = Self.screenSizes()
+        hostBacking = nil
+        hostPointScale = logical.width > 0 ? backing.width / logical.width : 2
+        cursor.setPointScale(hostPointScale)
         let config = ControlSession.Config(host: ip, port: port, username: username, password: password,
                                            logicalSize: logical, backingSize: backing, startupOrder: order)
         let attempts = max(1, policy.burstRetryAttempts)
@@ -298,6 +315,7 @@ final class SessionCoordinator {
             let session = ControlSession(config: config, tuning: seams.controlTuning,
                                          seams: seams.controlSeams(localAddress))
             self.control = session
+            cursor.reset()
             let params: ControlSession.MediaParams
             do {
                 params = try await session.start()
@@ -326,6 +344,7 @@ final class SessionCoordinator {
             switch outcome {
             case .started:
                 frames.configure(canvas: CGSize(width: params.canvas.width, height: params.canvas.height))
+                startInput(session, params)
                 state = .connected(canvasWidth: params.canvas.width, canvasHeight: params.canvas.height)
                 return
             case .failed(let error):
@@ -371,6 +390,9 @@ final class SessionCoordinator {
         statsTask?.cancel(); statsTask = nil
         mediaFailureTask?.cancel(); mediaFailureTask = nil
         videoTask?.cancel(); videoTask = nil
+        input?.close()
+        input = nil
+        cursor.reset()
         let (c, m, server) = (control, media, serverAddress)
         control = nil
         media = nil
@@ -395,12 +417,15 @@ final class SessionCoordinator {
         if pendingTeardown == work { pendingTeardown = nil }
     }
 
-    /// Drains control events (nothing consumes them yet) and notices when the
+    /// Feeds control events to input and the cursor, and notices when the
     /// session ends; media goes down with it.
     private func watch(_ session: ControlSession, _ gen: Int) {
         eventsTask?.cancel()
         eventsTask = Task { [weak self] in
-            for await _ in session.events {}
+            for await event in session.events {
+                guard let self, self.control === session else { continue }
+                self.apply(event)
+            }
             let failure = await session.failure
             guard let self, !Task.isCancelled, self.control === session else { return }
             if let failure {
@@ -409,6 +434,41 @@ final class SessionCoordinator {
                 await self.end(gen, .idle)
             }
         }
+    }
+
+    /// input.py set_server_dims (from the 0x451 handler) and the cursor cache.
+    private func apply(_ event: ServerEvent) {
+        switch event {
+        case .displayLayout(let l):
+            if l.backingWidth > 0, l.backingHeight > 0 {
+                hostBacking = (l.backingWidth, l.backingHeight)
+                input?.setServerDims(width: l.backingWidth, height: l.backingHeight)
+                if l.scaledWidth > 0 {
+                    hostPointScale = CGFloat(l.backingWidth) / CGFloat(l.scaledWidth)
+                    input?.pointScale = hostPointScale
+                    cursor.setPointScale(hostPointScale)
+                }
+            }
+        case .cursorStore(let id, let hotspot, let size, let bgra, let alpha):
+            cursor.store(id: id, hotspot: hotspot, size: size, bgra: bgra, alpha: alpha)
+        case .cursorSelect(let id):
+            cursor.select(id: id)
+        default:
+            break
+        }
+    }
+
+    /// session.py step 9: the InputController over the control channel,
+    /// clamped to the canvas (then to each 0x451's backing size).
+    private func startInput(_ session: ControlSession, _ params: ControlSession.MediaParams) {
+        let input = InputController(contentKey: params.contentKey, serverWidth: params.canvas.width,
+                                    serverHeight: params.canvas.height,
+                                    send: { try await session.send($0) })
+        if let b = hostBacking { input.setServerDims(width: b.width, height: b.height) }
+        input.pointScale = hostPointScale
+        self.input?.close()
+        self.input = input
+        Log.input.info("M5 input ready: canvas \(input.serverWidth)x\(input.serverHeight), pointer via 0x10")
     }
 
     /// The single consumer of `media.video` for this session (see the header).
