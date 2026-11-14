@@ -116,6 +116,14 @@ final class RTCPTests: XCTestCase {
         XCTAssertTrue(RTCP.parseSRArrivals(Data(hex: "80c8ffff11223344"), now: arrival).isEmpty)
     }
 
+    func testPacketTypesWalksCompound() {
+        let rr = Data(hex: "80c9000100000001")
+        let sr = Data(hex: "80c80006" + "11223344" + "0001aaaa" + "bbbb0000" + "00000000" + "00000000" + "00000000")
+        let app = RTCP.appLTR(senderSSRC: 1, ltrID: 7)
+        XCTAssertEqual(RTCP.packetTypes(rr + sr + app + Data([0x80])), [201, 200, 204])
+        XCTAssertEqual(RTCP.packetTypes(Data(hex: "80c8ffff11223344")), [], "a length past the buffer stops the walk")
+    }
+
     func testClassification() {
         XCTAssertTrue(RTCP.isRTCP(Data([0x80, 200])))
         XCTAssertTrue(RTCP.isRTCP(Data([0x81, 207])))

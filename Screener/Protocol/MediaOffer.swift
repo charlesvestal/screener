@@ -108,9 +108,14 @@ enum MediaOffer {
         /// This device: `hw.machine` (e.g. "iPad16,5"; the iOS analogue of
         /// the Mac `hw.model` the reference sends) and `kern.osversion`
         /// (the build, as `sw_vers -buildVersion` gives on macOS).
+        /// SCREENER_ENDPOINT_MODEL overrides the model (A/B test: does the
+        /// server treat an iPad model differently from the Mac model the
+        /// reference and the native viewer send?).
         static var current: EndpointInfo {
             var model = sysctlString("hw.machine") ?? "Generic"
-            if let sim = ProcessInfo.processInfo.environment["SIMULATOR_MODEL_IDENTIFIER"], !sim.isEmpty { model = sim }
+            let env = ProcessInfo.processInfo.environment
+            if let sim = env["SIMULATOR_MODEL_IDENTIFIER"], !sim.isEmpty { model = sim }
+            if let forced = env["SCREENER_ENDPOINT_MODEL"], !forced.isEmpty { model = forced }
             return EndpointInfo(hardwareModel: model.isEmpty ? "Generic" : model,
                                 avcVersion: "1.0.0",
                                 osBuild: sysctlString("kern.osversion") ?? "0")

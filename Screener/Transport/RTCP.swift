@@ -168,6 +168,21 @@ enum RTCP {
         return out
     }
 
+    /// Packet types of every packet in a compound RTCP buffer (diagnostics:
+    /// which feedback the server sends). Stops at a truncated packet.
+    static func packetTypes(_ data: Data) -> [UInt8] {
+        let b = [UInt8](data)
+        var out: [UInt8] = []
+        var pos = 0
+        while pos + 4 <= b.count {
+            let pktLen = ((Int(b[pos + 2]) << 8 | Int(b[pos + 3])) + 1) * 4
+            guard pos + pktLen <= b.count else { break }
+            out.append(b[pos + 1])
+            pos += pktLen
+        }
+        return out
+    }
+
     /// compound_with_rr: prefix feedback with an empty RR (some peers reject
     /// feedback that isn't a compound packet starting with SR/RR).
     static func compoundWithRR(senderSSRC: UInt32, payload: Data) -> Data {

@@ -189,6 +189,8 @@ final class MediaTransportTests: XCTestCase {
         try await waitUntil("rtcp") { await t.stats.rtcpPackets == 2 }
         let s = await t.stats
         XCTAssertEqual(s.serverSRs, 2)
+        XCTAssertEqual(s.rtcpTypes, [200: 2])
+        XCTAssertEqual(s.srSSRCs, [0x1000])
         XCTAssertEqual(s.rtcpAuthFailures, 1)
         XCTAssertEqual(s.videoPackets + s.audioPackets, 0, "RTCP must not reach the RTP decryptors")
         XCTAssertEqual(s.authFailures, 0)
@@ -257,6 +259,29 @@ final class MediaTransportTests: XCTestCase {
                                                + RTCP.pli(senderSSRC: ourVideo, mediaSSRC: target)
                                                + RTCP.firLegacy(targetSSRC: target))
         XCTAssertEqual(firs.first?.hex, expected.hex)
+    }
+
+    /// session._send_ltr_ack: the APP LTR packet (subtype 5, the DON) goes to
+    /// the VIDEO port, SRTCP-protected with videoKeyV, once per new DON.
+    func testLTRAckGoesToTheVideoPortOncePerDON() async throws {
+        let ch = FakeChannels()
+        var tuning = fastTuning
+        tuning.txInterval = .seconds(60)
+        let t = make(ch, tuning: tuning)
+        try await t.open()
+        try await t.activate(activation)
+        await t.sendLTRAck(donl: 60146)
+        await t.sendLTRAck(donl: 60146)     // unchanged: not re-sent
+        await t.sendLTRAck(donl: 60150)
+        let sent = await t.stats.ltrAcksSent
+        await t.close()
+        XCTAssertEqual(sent, 2)
+        let rtcpDec = try SRTCPDecryptor(blob: keys.videoKeyV)
+        let acks = ch.video.sent.filter { RTCP.isRTCP($0) }.compactMap { rtcpDec.unprotect($0) }
+        XCTAssertEqual(acks.map(\.hex), [RTCP.appLTR(senderSSRC: ourVideo, ltrID: 60146).hex,
+                                         RTCP.appLTR(senderSSRC: ourVideo, ltrID: 60150).hex])
+        XCTAssertEqual(acks.first?.hex, "80cc0003" + "40142f36" + "00000005" + "0000eaf2")
+        XCTAssertFalse(ch.audio.sent.contains { RTCP.isRTCP($0) && rtcpDec.unprotect($0)?[1] == 204 })
     }
 
     // MARK: burst starvation + adoption

@@ -93,6 +93,12 @@ final class MediaOfferTests: XCTestCase {
         XCTAssertThrowsError(try MediaStreamOptions.parseAnswer(Data()))
     }
 
+    func testEndpointModelOverride() {
+        setenv("SCREENER_ENDPOINT_MODEL", "Mac16,10", 1)
+        defer { unsetenv("SCREENER_ENDPOINT_MODEL") }
+        XCTAssertEqual(MediaOffer.EndpointInfo.current.hardwareModel, "Mac16,10")
+    }
+
     func testRandomKeys() {
         let k = NegotiationKeys.random()
         let all = [k.audioKeyV, k.audioKeyS, k.videoKeyV, k.videoKeyS]

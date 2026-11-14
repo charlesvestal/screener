@@ -38,7 +38,10 @@
 //     empty SR prepended every 10th tick (5 s)
 //   * keyframe request: RR + FIR(206, seq = tick & 0xFF) + PLI + legacy FIR(192)
 //     compound, rate-limited to one per SSRC per 0.25 s
-// and, on P+1, APP LTR acks (Task 13 drives those).
+// and, on P+1, APP LTR acks (VideoPipeline drives those, opt-in: the
+// reference's macOS VideoToolbox path never sends any).
+// Every 2 s the stats line adds the video payload kbps/pps, the server's
+// RTCP packet types, the SR source SSRCs and the last RR we sent.
 //
 // Deviations (deliberate):
 //   * The reference's ctrl process loop tests `200 <= pkt[1] & 0x7F <= 207`,
@@ -233,6 +236,12 @@ actor MediaTransport {
         var videoStreamDrops = 0, audioStreamDrops = 0
         var punchesSent = 0, keepalivesSent = 0, reportsSent = 0, keyframeRequestsSent = 0, ltrAcksSent = 0
         var serverSRs = 0
+        /// Decrypted video RTP payload bytes (what the encoder spent).
+        var videoPayloadBytes = 0
+        /// Server RTCP packets by packet type (200 SR, 201 RR, 204 APP, 205/206 feedback, ...).
+        var rtcpTypes: [UInt8: Int] = [:]
+        /// SSRCs the server's Sender Reports came from.
+        var srSSRCs: Set<UInt32> = []
         var activeVideoSSRCs: [UInt32] = []
         var ssrcCounts: [UInt32: Int] = [:]
     }
@@ -294,6 +303,10 @@ actor MediaTransport {
     private var burstWaiters: [CheckedContinuation<BurstOutcome, Never>] = []
 
     private var counters = Stats()
+    /// Rate window for the stats line: (when, payload bytes, packets) at the last line.
+    private var lastStatsMark: (at: ContinuousClock.Instant, bytes: Int, packets: Int)?
+    /// The last RR we sent: blocks, blocks carrying an LSR, the largest DLSR (ms), tile-0 extended seq.
+    private var lastReport = (blocks: 0, withLSR: 0, maxDLSRms: 0, extSeq0: UInt32(0))
     private let drops = DropCounter()
     private var streamDrops = (video: 0, audio: 0)
 
@@ -564,6 +577,7 @@ actor MediaTransport {
             emitAudio(pkt)
         case .video:
             counters.videoPackets += 1
+            counters.videoPayloadBytes += pkt.payload.count
             handleVideo(pkt)
         }
     }
@@ -600,7 +614,8 @@ actor MediaTransport {
         guard case .dropped = audioOut.yield(p) else { return }
         streamDrops.audio += 1
         let n = streamDrops.audio
-        if n <= 5 || n % 1000 == 0 { Log.media.error("audio stream consumer lagging: \(n) packets dropped") }
+        // Audio has no consumer yet (Task 16): log the first drop and every 1000th.
+        if n == 1 || n % 1000 == 0 { Log.media.error("audio stream consumer lagging: \(n) packets dropped") }
     }
 
     private func scheduleBurstLock() {
@@ -669,9 +684,11 @@ actor MediaTransport {
                 let key = (flow == .video) == (i == 0) ? "videoKeyS" : "audioKeyS"
                 Log.media.info("SRTCP on \(flow.rawValue) port authenticates with \(key)")
             }
+            for pt in RTCP.packetTypes(plain) { counters.rtcpTypes[pt, default: 0] += 1 }
             for sr in RTCP.parseSRArrivals(plain) {
                 serverSR[sr.ssrc] = RTCP.SRInfo(lsr: sr.ntpMid32, arrival: sr.arrival)
                 counters.serverSRs += 1
+                counters.srSSRCs.insert(sr.ssrc)
             }
             return
         }
@@ -715,7 +732,12 @@ actor MediaTransport {
             let st = states[s]
             stats[s] = RTCP.SourceStats(maxSeq: st?.maxSeq ?? 0, roc: st?.roc ?? 0)
         }
-        var rr = RTCP.receiverReport(senderSSRC: sender, sources: sources, stats: stats, srData: serverSR)
+        let now = Date()
+        var rr = RTCP.receiverReport(senderSSRC: sender, sources: sources, stats: stats, srData: serverSR, now: now)
+        let withSR = sources.compactMap { serverSR[$0] }
+        lastReport = (sources.count, withSR.count,
+                      withSR.map { Int(now.timeIntervalSince($0.arrival) * 1000) }.max() ?? 0,
+                      sources.first.flatMap { stats[$0] }.map { ($0.roc & 0xFFFF) << 16 | UInt32($0.maxSeq) } ?? 0)
         if tick % tuning.srEveryNTicks == 0 { rr = RTCP.emptySR(senderSSRC: sender) + rr }
         guard let wire = try? enc.protect(rr) else { return }
         channel.send(wire)
@@ -724,11 +746,25 @@ actor MediaTransport {
 
     private func statsLine() -> String {
         let s = stats
+        let now = clock.now
+        var rate = ""
+        if let m = lastStatsMark {
+            let secs = Double((now - m.at).components.attoseconds) / 1e18 + Double((now - m.at).components.seconds)
+            if secs > 0 {
+                rate = String(format: " kbps=%.0f pps=%.0f", Double(s.videoPayloadBytes - m.bytes) * 8 / secs / 1000,
+                              Double(s.videoPackets - m.packets) / secs)
+            }
+        }
+        lastStatsMark = (now, s.videoPayloadBytes, s.videoPackets)
+        let types = s.rtcpTypes.sorted { $0.key < $1.key }.map { "\($0.key):\($0.value)" }.joined(separator: ",")
+        let r = lastReport
         return "M3 udp video pkts=\(s.videoPackets) audio pkts=\(s.audioPackets) ssrcs=[\(s.activeVideoSSRCs.map(hex).joined(separator: ","))]"
             + " rtcp=\(s.rtcpPackets) raw=\(s.videoDatagrams)/\(s.audioDatagrams) authfail=\(s.authFailures)"
             + " rtcpfail=\(s.rtcpAuthFailures) drop=\(s.droppedDatagrams) streamdrop=\(s.videoStreamDrops)/\(s.audioStreamDrops)"
             + " sr=\(s.serverSRs)"
             + " tx ka=\(s.keepalivesSent) rr=\(s.reportsSent) fir=\(s.keyframeRequestsSent) punch=\(s.punchesSent)"
+            + " ltr=\(s.ltrAcksSent)\(rate) rtcp_rx={\(types)} sr_from=[\(s.srSSRCs.sorted().map(hex).joined(separator: ","))]"
+            + " rr_last={blocks=\(r.blocks) ext0=\(r.extSeq0) lsr=\(r.withLSR)/\(r.blocks) dlsr_max_ms=\(r.maxDLSRms)}"
     }
 }
 
