@@ -11,7 +11,9 @@
 // Ports are symmetric: ScreensharingAgent binds <its TCP-local IP>:P / P+1 and
 // connects those sockets to <our TCP-peer IP>:P / P+1 (netstat during a live
 // reference session, 2026-11-14), so we bind the same local port numbers and
-// "connect" each NWConnection to the matching server port.
+// connect each flow to the matching server port. The default channel is a
+// BSD socket (SocketTransport.swift): NWConnection ignores the required local
+// endpoint in the simulator. NWDatagramChannel is kept for comparison.
 //
 // Keys (negotiation.py:818): receive with the server→viewer S blobs
 // (videoKeyS on P+1, audioKeyS on P); send with the viewer→server V blobs.
@@ -233,7 +235,7 @@ actor MediaTransport {
     init(config: Config, tuning: Tuning = Tuning(), channelFactory: ChannelFactory? = nil) {
         self.config = config
         self.tuning = tuning
-        self.makeChannel = channelFactory ?? { flow, cfg in NWDatagramChannel.make(flow: flow, config: cfg) }
+        self.makeChannel = channelFactory ?? { flow, cfg in SocketDatagramChannel.make(flow: flow, config: cfg) }
         self.tracker = SSRCGroupTracker(threshold: tuning.adoptThreshold, stall: tuning.adoptStall)
         (video, videoOut) = AsyncStream.makeStream(of: MediaPacket.self, bufferingPolicy: .bufferingNewest(4096))
         (audio, audioOut) = AsyncStream.makeStream(of: MediaPacket.self, bufferingPolicy: .bufferingNewest(1024))
