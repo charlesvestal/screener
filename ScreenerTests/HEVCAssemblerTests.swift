@@ -368,20 +368,64 @@ final class HEVCAssemblerTests: XCTestCase {
         XCTAssertEqual(feed(a, s.picture(tile: 0, ts: 2000, don: 4)), [])   // inside the window
         s.advance(ms: 40)
         let out = a.tick(now: s.now)
-        // The interleave puts DON 1 on tile 1: only tile 1 waits.
+        // Tiles 0, 2 and 3 already sent later DONs: only tile 1 can own DON 1.
         XCTAssertEqual(out.compactMap(\.keyframeSSRC), [ssrcs[1], ssrcs[0]])
         XCTAssertEqual(out.compactMap(\.au).map(\.don), [2, 3, 4])
         XCTAssertEqual(a.tilesAwaitingIDR, [1])
         XCTAssertEqual(a.stats.donHoles, 1)
     }
 
-    func testDONHoleGatesAllTilesWhenInterleaveUnknown() {
+    // DON 1 cannot be tile 0's (its AUs 0 and 2 came with no sequence gap):
+    // the tiles that sent nothing after it wait, tile 0 keeps going.
+    func testDONHoleGatesOnlyTheTilesThatCanOwnIt() {
         let (a, s) = warm()
-        XCTAssertEqual(feed(a, s.picture(tile: 0, ts: 2000, don: 2)), [])   // breaks the interleave
+        XCTAssertEqual(feed(a, s.picture(tile: 0, ts: 2000, don: 2)), [])
         s.advance(ms: 70)
         let out = a.tick(now: s.now)
-        XCTAssertEqual(out.compactMap(\.keyframeSSRC), [ssrcs[0]])
-        XCTAssertEqual(a.tilesAwaitingIDR, Set(0..<4))
+        XCTAssertEqual(out.compactMap(\.keyframeSSRC), [ssrcs[1], ssrcs[2], ssrcs[3], ssrcs[0]])
+        XCTAssertEqual(out.compactMap(\.au).map(\.don), [2])
+        XCTAssertEqual(a.tilesAwaitingIDR, [1, 2, 3])
+        XCTAssertEqual(a.stats.donHoles, 1)
+    }
+
+    // Apple's encoder skips tiles with nothing new, and the DON counter does
+    // not count them (live, 2026-11-18: motion in the top-left corner sent
+    // tiles {0,1} in ~60% of the pictures, all four in ~35%, {0,1,3} in the
+    // rest; DONs stayed contiguous). A skipped tile is not a loss.
+    func testSkippedTilesAreNotLoss() {
+        let (a, s) = warm()
+        var don: UInt16 = 1
+        var emitted: [UInt16] = []
+        for (i, tiles) in [[1, 2, 3], [0, 1], [0, 1], [0, 1, 2, 3], [0, 1, 3], [3], [0, 2, 3], [0, 1]].enumerated() {
+            let tileDONs = tiles.map { t -> (Int, UInt16) in defer { don += 1 }; return (t, don) }
+            emitted += feedTiles(a, s, ts: UInt32(1000 + 400 * i), tileDONs).compactMap(\.au).map(\.don)
+            s.advance(ms: 17)
+            emitted += a.tick(now: s.now).compactMap(\.au).map(\.don)
+        }
+        XCTAssertEqual(emitted, Array(1..<don))
+        XCTAssertEqual(a.stats.keyframeRequests, 0)
+        XCTAssertEqual(a.stats.droppedWaitingForIDR, 0)
+        XCTAssertEqual(a.stats.donHoles, 0)
+        XCTAssertEqual(a.tilesAwaitingIDR, [])
+    }
+
+    // After skipped tiles, a whole lost AU is put on the tile that can own
+    // it, not on the one a fixed tile interleave would name: DON 7 here was
+    // tile 3's, where (DON − IDR DON) mod 4 says tile 2.
+    func testHoleAfterSkippedTilesGatesTheTileThatCanOwnIt() {
+        let (a, s) = warm()
+        _ = feedTiles(a, s, ts: 1000, [(1, 1), (2, 2), (3, 3)])
+        _ = feedTiles(a, s, ts: 1400, [(0, 4), (1, 5)])                 // tiles 2, 3 skipped
+        XCTAssertEqual(feedTiles(a, s, ts: 1800, [(0, 6)]).compactMap(\.au).map(\.don), [6])
+        s.lose(tile: 3)                                                 // DON 7 (tile 3) vanishes
+        XCTAssertEqual(feedTiles(a, s, ts: 2200, [(0, 8), (1, 9), (2, 10)]), [])
+        s.advance(ms: 70)
+        let out = a.tick(now: s.now)
+        XCTAssertEqual(out.compactMap(\.keyframeSSRC), [ssrcs[3], ssrcs[0]])
+        XCTAssertEqual(out.compactMap(\.au).map(\.don), [8, 9, 10])
+        XCTAssertEqual(a.tilesAwaitingIDR, [3])
+        // Tile 3's next AU shows the sequence gap; it waits for an IRAP.
+        XCTAssertEqual(feedTiles(a, s, ts: 2600, [(0, 11), (3, 12)]).compactMap(\.au).map(\.don), [11])
     }
 
     func testGroupSpanningTwoDONsAdvancesExpectedDON() {
@@ -690,19 +734,35 @@ final class HEVCAssemblerTests: XCTestCase {
         XCTAssertEqual(a.stats.decodeErrors, 1)
     }
 
-    // With the interleave unknown, a reported loss cannot say which tile a
-    // DON hole belongs to: skip the wait, but gate every tile.
-    func testExplainedHoleWithUnknownInterleaveGatesAllTiles() {
+    // A hole that a sequence gap explains, and that only the lossy tile can
+    // own (between tiles 0 and 2 of one picture), is not waited for and
+    // gates only that tile, with a tile skipped before it (tile 2 sent
+    // nothing at ts 1000).
+    func testExplainedHoleAfterSkippedTileGatesOnlyTheLossyTile() {
         let (a, s) = warm()
-        XCTAssertEqual(feed(a, s.picture(tile: 1, ts: 1000, don: 1)).compactMap(\.au).map(\.don), [1])
-        XCTAssertEqual(feed(a, s.picture(tile: 3, ts: 1000, don: 2)).compactMap(\.au).map(\.don), [2])  // breaks the interleave
-        s.lose(tile: 1)
-        let out = feed(a, s.picture(tile: 1, ts: 2000, don: 5))         // gap before; DONs 3, 4 missing
+        XCTAssertEqual(feedTiles(a, s, ts: 1000, [(1, 1), (3, 2)]).compactMap(\.au).map(\.don), [1, 2])
+        XCTAssertEqual(feedTiles(a, s, ts: 2000, [(0, 3)]).compactMap(\.au).map(\.don), [3])
+        s.lose(tile: 1)                                                 // DON 4 (tile 1) lost
+        XCTAssertEqual(feedTiles(a, s, ts: 2000, [(2, 5), (3, 6)]), [])
+        let out = feed(a, s.picture(tile: 1, ts: 2400, don: 7))         // gap before
         XCTAssertEqual(out.compactMap(\.keyframeSSRC), [ssrcs[1], ssrcs[0]])
-        XCTAssertEqual(out.compactMap(\.au), [])
-        XCTAssertEqual(a.tilesAwaitingIDR, Set(0..<4))
-        XCTAssertEqual(a.stats.donHoles, 1)
+        XCTAssertEqual(out.compactMap(\.au).map(\.don), [5, 6])
+        XCTAssertEqual(a.tilesAwaitingIDR, [1])
+        XCTAssertEqual(a.stats.donHoles, 0)
+        XCTAssertEqual(feed(a, s.picture(tile: 2, ts: 2400, don: 8)).compactMap(\.au).map(\.don), [8])
+    }
+
+    // A sequence gap on one tile does not explain a hole another tile may
+    // still fill: DON 5 sits between tiles 0 and 2 of one picture, so it is
+    // tile 1's, whatever tile 2 lost.
+    func testExplainedLossOnOneTileStillWaitsForAnotherTilesAU() {
+        let (a, s) = warm()
+        _ = feedTiles(a, s, ts: 1000, [(1, 1), (2, 2), (3, 3)])
+        _ = feedTiles(a, s, ts: 2000, [(0, 4)])
+        s.lose(tile: 2)
         XCTAssertEqual(feed(a, s.picture(tile: 2, ts: 2000, don: 6)).compactMap(\.au), [])
+        XCTAssertEqual(feed(a, s.picture(tile: 1, ts: 2000, don: 5)).compactMap(\.au).map(\.don), [5])
+        XCTAssertEqual(a.tilesAwaitingIDR, [2])
     }
 
     // Pending groups are evicted after their own timeout, not the 60 ms

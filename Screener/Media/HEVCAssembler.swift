@@ -29,17 +29,24 @@
 // a timer). Packets that fill a sequence gap late are not counted lost.
 //
 // Decoding order: every AU carries a DONL, and on Apple's stream it is ONE
-// counter across all tiles (+1 per AU, tile 0..3 per RTP timestamp; seen on
-// a live capture, 2026-11-14). That is exactly the (timestamp, tile)
-// interleave feed_burst uses so the shared DPB sees POCs in order. AUs are
+// counter across all tiles: +1 per AU SENT, the tiles of one RTP timestamp
+// in tile order, then the next timestamp (live captures 2026-11-14 and
+// 2026-11-18: 5400 AUs, every DON step 1, never a timestamp going back).
+// The encoder does NOT send every tile of every picture: a tile with nothing
+// new is often skipped (with motion in one corner, 2 of 4 tiles are missing
+// from ~60% of the pictures; ~2% even with full-screen motion), and the DON
+// counter does not count skipped tiles. So the DON says nothing about WHICH
+// tile an AU is; only that AUs come in (timestamp, tile) order, which is
+// what feed_burst does so the shared DPB sees POCs in order. AUs are
 // released in DON order through a reorder buffer: a DON hole holds later
 // AUs for `reorderWindow` of wall time (MediaPacket.arrival), longer while
-// the missing AU is visibly still arriving, and then counts as loss. A hole
-// that a reported loss already explains (the AU after a sequence gap on the
-// hole's tile) is not waited for — but only while that loss is still ahead
-// of decoding, and only while the interleave says which tile the hole is:
-// with the interleave unknown, an "explained" hole is not waited for but
-// gates every tile. Cold start holds everything until an IRAP or the window,
+// the missing AU is visibly still arriving, and then counts as loss. The
+// hole belongs to a tile whose newest AU so far is before the hole: AUs of
+// one SSRC arrive in DON order, so a tile that already delivered a later
+// DON (with no sequence gap) cannot own it. A hole that a reported loss
+// already explains (it lies between the lossy tile's previous AU and the AU
+// after its sequence gap) is not waited for — but only while that loss is
+// still ahead of decoding. Cold start holds everything until an IRAP or the window,
 // so an IDR that completes after its timestamp's tiles 1–3 still goes first.
 // A late IRAP is never discarded. If DONs ever look per-SSRC (repeated late
 // DONs), ordering falls back to marker-arrival order, which is what the
@@ -53,9 +60,8 @@
 // every tile (each gate keeps the DON of its loss, so a late IRAP does not
 // lift a gate set by a later loss; reference default
 // ISS_PERTILE_RECOVERY=1: Apple sends IRAPs on the base SSRC; the other
-// tiles keep decoding from their intact history). A DON hole is attributed
-// to its tile by the interleave, (DON − IRAP DON + IRAP tile) mod tileCount,
-// while observed AUs fit it; otherwise it gates every tile. The decoder
+// tiles keep decoding from their intact history). A DON hole that outlives
+// the wait gates the tiles that can own it (see above). The decoder
 // reports a corrupt picture with `noteDecodeError(tile:don:)`, which gates
 // every tile until an IRAP after it (cross-tile references can spread
 // damage) and asks for a keyframe; a report for a picture before the last
@@ -200,12 +206,15 @@ final class HEVCAssembler {
     /// Before the first anchor: the first DON seen (ordering reference).
     private var coldRef: UInt16?
     private var lateDONStreak = 0
-    /// Per tile: DON holes on that tile up to this DON are explained by a
-    /// loss already reported. Dropped once decoding passes it.
-    private var explained: [Int: UInt16] = [:]
-    /// DON of tile 0's slot in the interleave, from the last IRAP; nil when
-    /// unknown or when AUs stopped fitting it.
-    private var interleaveBase: UInt16?
+    /// Per tile: a loss already reported explains DON holes after `after`
+    /// (the tile's AU before the loss; nil = none seen) up to `through` (the
+    /// AU after it). Dropped once decoding passes `through`.
+    private var explained: [Int: (after: UInt16?, through: UInt16)] = [:]
+    /// Per tile: the newest DON received (which tiles can own a DON hole).
+    private var newestDON: [Int: UInt16] = [:]
+    /// (timestamp, tile) of the entry released just before `expectedDON`;
+    /// nil after a hole or a reset.
+    private var lastReleased: (timestamp: UInt32, tile: Int)?
     private var lastIRAPDON: UInt16?
 
     // Recovery.
@@ -245,7 +254,7 @@ final class HEVCAssembler {
         harvestVPS = nil; harvestSPS = nil; harvestPPS = [:]
         hevcConfirmed = false; h264Evidence = 0; isNotHEVC = false
         held = [:]; expectedDON = nil; coldRef = nil; lateDONStreak = 0
-        explained = [:]; interleaveBase = nil; lastIRAPDON = nil
+        explained = [:]; newestDON = [:]; lastReleased = nil; lastIRAPDON = nil
         everHadIDR = false
         escalation = nil
         donOrderingStops = 0
@@ -323,7 +332,7 @@ final class HEVCAssembler {
             for (ts, g) in stale.sorted(by: { (ref &- $0.value.firstSeq) > (ref &- $1.value.firstSeq) }) {
                 state.pending[ts] = nil
                 state.markFlushed(ts)
-                entries.append(evicted(g, tile: tile, ssrc: ssrc))
+                entries.append(evicted(g, timestamp: ts, tile: tile, ssrc: ssrc))
             }
             ssrcState[ssrc] = state
         }
@@ -451,7 +460,7 @@ final class HEVCAssembler {
         for (ts, g, _) in behindGroups.sorted(by: { $0.2 > $1.2 }) {
             state.pending[ts] = nil
             state.markFlushed(ts)
-            entries.append(evicted(g, tile: tile, ssrc: ssrc))
+            entries.append(evicted(g, timestamp: ts, tile: tile, ssrc: ssrc))
         }
 
         // Reassemble with sequence-aware FU tracking.
@@ -494,13 +503,13 @@ final class HEVCAssembler {
             kind = .picture(AccessUnit(nalUnits: vcl, isIDR: idr, tile: tile, rtpTimestamp: timestamp,
                                        ssrc: ssrc, don: donFirst ?? 0))
         }
-        entries.append(Entry(donFirst: donFirst, donLast: donLast ?? donFirst, tile: tile, kind: kind,
+        entries.append(Entry(donFirst: donFirst, donLast: donLast ?? donFirst, tile: tile, timestamp: timestamp, kind: kind,
                              gapBefore: gapBefore, parameterSets: newParams, arrival: clock ?? .now))
         return entries
     }
 
     /// _drop_incomplete_group for a group whose marker never came.
-    private func evicted(_ g: Group, tile: Int, ssrc: UInt32) -> Entry {
+    private func evicted(_ g: Group, timestamp: UInt32, tile: Int, ssrc: UInt32) -> Entry {
         stats.groupsEvicted += 1
         let payloads = Self.sorted(g.packets).map(\.payload)
         let don = HEVCDepacketizer.firstDONL(payloads)
@@ -509,7 +518,7 @@ final class HEVCAssembler {
         for p in payloads {
             if case .nals(let n, _)? = try? HEVCDepacketizer.parse(p), let ps = harvest(n) { params = ps }
         }
-        return Entry(donFirst: don, donLast: don, tile: tile, kind: .lost, gapBefore: false,
+        return Entry(donFirst: don, donLast: don, tile: tile, timestamp: timestamp, kind: .lost, gapBefore: false,
                      parameterSets: params, arrival: clock ?? .now)
     }
 
@@ -521,7 +530,7 @@ final class HEVCAssembler {
               }) else { return nil }
         state.pending[ts] = nil
         state.markFlushed(ts)
-        return evicted(g, tile: tile, ssrc: ssrc)
+        return evicted(g, timestamp: ts, tile: tile, ssrc: ssrc)
     }
 
     // MARK: - parameter sets (session._harvest_param_sets / burst.py)
@@ -579,6 +588,7 @@ final class HEVCAssembler {
         var donFirst: UInt16?
         var donLast: UInt16?
         var tile: Int
+        var timestamp: UInt32
         var kind: Kind
         var gapBefore: Bool
         var parameterSets: AssemblerOutput?
@@ -601,7 +611,8 @@ final class HEVCAssembler {
         // Ask for the keyframe now so the request is not delayed behind the
         // reorder buffer; the gate applies when `process` reaches the entry.
         if e.gapBefore || e.isLost { reportLoss(tiles: [e.tile], out: &out) }
-        if case .picture(let au) = e.kind, let d = e.pictureDON { checkInterleave(don: d, tile: au.tile) }
+        let previous = newestDON[e.tile]
+        if let d = e.pictureDON { newestDON[e.tile] = Self.later(previous, d) }
         guard stats.donOrdering, let don = e.donFirst else {
             // No DON: ordered by arrival, after everything already held.
             if let k = newestHeldKey() { held[k]!.followers.append(e) } else { process(e, out: &out) }
@@ -617,7 +628,7 @@ final class HEVCAssembler {
             coldRef = don
         }
         lateDONStreak = 0
-        if e.gapBefore || e.isLost { explain(tile: e.tile, through: e.pictureDON ?? don) }
+        if e.gapBefore || e.isLost { explain(tile: e.tile, after: previous, through: e.pictureDON ?? don) }
         guard var first = held[don] else {
             held[don] = e
             return
@@ -647,6 +658,7 @@ final class HEVCAssembler {
                 drainAll(out: &out)
                 expectedDON = nil
                 explained = [:]
+                newestDON = [:]
             }
             process(e, out: &out)
             return
@@ -679,30 +691,25 @@ final class HEVCAssembler {
         if expectedDON == nil, !anchorColdStart(out: &out) { return }
         while let exp = expectedDON {
             // A loss that decoding has passed explains nothing any more.
-            explained = explained.filter { ($0.value &- exp) < 0x8000 }
+            explained = explained.filter { ($0.value.through &- exp) < 0x8000 }
             if let e = held.removeValue(forKey: exp) {
                 process(e, out: &out)
                 advance(past: e.donLast ?? exp)
+                lastReleased = (e.timestamp, e.tile)
                 continue
             }
             guard let next = held.keys.min(by: { ($0 &- exp) < ($1 &- exp) }) else { return }
-            switch explainedHole(from: exp, to: next) {
-            case .tiles(let t)?:
-                gateHole(tiles: t, from: exp, to: next, out: &out)   // reported already; gate it here
-            case .unknownTile?:
-                // A loss was reported (and counted), but without the
-                // interleave nothing says the hole is that loss: do not
-                // wait, gate every tile and ask the base SSRC for a keyframe.
-                stats.donHoles += 1
-                gateHole(tiles: nil, from: exp, to: next, out: &out)
-            case nil:
-                let attributed = attributedTiles(from: exp, to: next)
-                guard holeExpired(tiles: attributed) else { return }
+            let owners = holeOwners(from: exp, before: held[next]!)
+            if let lossy = explainedHole(from: exp), owners.isSubset(of: lossy) {
+                gate(tiles: owners, don: next &- 1, out: &out)           // reported already; gate it here
+            } else {
+                guard holeExpired(tiles: owners) else { return }
                 // A DON hole that outlived the window: those AUs are gone.
                 stats.donHoles += 1
-                reportLoss(tiles: attributed, out: &out)
-                gateHole(tiles: attributed, from: exp, to: next, out: &out)
+                reportLoss(tiles: owners, out: &out)
+                gate(tiles: owners, don: next &- 1, out: &out)
             }
+            lastReleased = nil
             expectedDON = next
         }
     }
@@ -755,9 +762,8 @@ final class HEVCAssembler {
         return true
     }
 
-    /// A pending group on the hole's tile(s) is still receiving packets.
-    /// With the tile unknown there is no extension: some tile nearly always
-    /// has a group in flight.
+    /// A pending group on one of the hole's possible tiles is still
+    /// receiving packets.
     private func holeInFlight(tiles: Set<Int>?, now: ContinuousClock.Instant) -> Bool {
         guard let tiles else { return false }
         return tiles.contains { t in
@@ -767,54 +773,40 @@ final class HEVCAssembler {
         }
     }
 
-    // MARK: - interleave attribution
+    // MARK: - DON hole attribution
 
-    private func attributedTile(_ don: UInt16) -> Int? {
-        guard let base = interleaveBase, !tileSSRCs.isEmpty else { return nil }
-        return Int((don &- base) % UInt16(tileSSRCs.count))
-    }
-
-    /// Tiles the DONs in [from, to) belong to; nil when unknown.
-    private func attributedTiles(from: UInt16, to: UInt16) -> Set<Int>? {
-        guard interleaveBase != nil else { return nil }
-        let len = Int(to &- from)
-        guard len < tileSSRCs.count else { return Set(tileSSRCs.indices) }
-        return Set((0..<len).compactMap { attributedTile(from &+ UInt16($0)) })
-    }
-
-    private enum HoleCause { case tiles(Set<Int>), unknownTile }
-
-    /// The tiles of a hole [from, to) that reported losses fully explain;
-    /// `.unknownTile` when a reported loss covers it but the interleave is
-    /// unknown; nil when some DON in it is not explained.
-    private func explainedHole(from: UInt16, to: UInt16) -> HoleCause? {
-        guard !explained.isEmpty else { return nil }
-        let len = Int(to &- from)
-        if interleaveBase != nil {
-            guard len <= 4 * max(1, tileSSRCs.count) else { return nil }
-            var tiles = Set<Int>()
-            for k in 0..<len {
-                let d = from &+ UInt16(k)
-                guard let t = attributedTile(d), let through = explained[t], (through &- d) < 0x8000 else { return nil }
-                tiles.insert(t)
-            }
-            return .tiles(tiles)
+    /// The tiles that can own the DON hole starting at `from`, ahead of the
+    /// held entry `next`: those whose newest AU so far is before the hole,
+    /// plus those whose reported loss covers it (a tile that delivered a
+    /// later DON with no sequence gap cannot); failing that, the tiles that
+    /// have sent nothing yet. When the AUs on both sides of the hole share a
+    /// timestamp, only the tiles between them fit (DONs follow tile order
+    /// within a picture). Never empty: with no candidate (a renumbered
+    /// stream) every tile.
+    private func holeOwners(from: UInt16, before next: Entry) -> Set<Int> {
+        let all = Set(tileSSRCs.indices)
+        var owners = all.filter { t in newestDON[t].map { Self.precedes($0, from) } ?? false }
+        owners.formUnion(explainedHole(from: from) ?? [])
+        if owners.isEmpty { owners = all.filter { newestDON[$0] == nil } }
+        if let prev = lastReleased, prev.timestamp == next.timestamp {
+            owners = owners.filter { $0 > prev.tile && $0 < next.tile }
         }
-        // Tile unknown: a loss reported at or after the hole's end covers it.
-        let covering = explained.contains { ($0.value &- from) < 0x8000 && (to &- from) <= ($0.value &- from) }
-        return covering ? .unknownTile : nil
+        return owners.isEmpty ? all : owners
     }
 
-    private func explain(tile: Int, through don: UInt16) {
-        if let cur = explained[tile], (cur &- don) != 0, (cur &- don) < 0x8000 { return }   // already further
-        explained[tile] = don
+    /// The tiles whose reported loss covers DON `from`; nil when none does.
+    private func explainedHole(from: UInt16) -> Set<Int>? {
+        let tiles = explained.filter { _, r in
+            (r.after.map { Self.precedes($0, from) } ?? true) && Self.precedes(from, r.through)
+        }.keys
+        return tiles.isEmpty ? nil : Set(tiles)
     }
 
-    /// Drops the interleave assumption when an AU does not fit it.
-    private func checkInterleave(don: UInt16, tile: Int) {
-        guard let t = attributedTile(don), t != tile else { return }
-        interleaveBase = nil
-        Log.video.info("HEVC: DON \(don) on tile \(tile) breaks the tile interleave; DON holes gate every tile")
+    private func explain(tile: Int, after: UInt16?, through don: UInt16) {
+        if let cur = explained[tile], Self.precedes(don, cur.through) { return }   // already further
+        // A second loss before decoding reached the first keeps the earlier start.
+        let start = explained[tile].map { $0.after } ?? after
+        explained[tile] = (start, don)
     }
 
     // MARK: - decode gate + recovery (hevc.py _decode_one / _try_recovery)
@@ -886,11 +878,7 @@ final class HEVCAssembler {
             requestedSinceWait = false
             dropsSinceRequest = 0
         }
-        // Re-anchor ordering on the IRAP (unless it is behind the last one).
-        if lastIRAPDON.map({ !Self.precedes(pictureDON, $0) }) ?? true {
-            interleaveBase = pictureDON &- UInt16(truncatingIfNeeded: au.tile)
-            lastIRAPDON = pictureDON
-        }
+        if lastIRAPDON.map({ !Self.precedes(pictureDON, $0) }) ?? true { lastIRAPDON = pictureDON }
         lateDONStreak = 0
         if !stats.donOrdering, donOrderingStops <= config.donOrderingRestarts {
             // Arrival order was a fallback; try DON order again from here.
@@ -922,22 +910,6 @@ final class HEVCAssembler {
         guard everHadIDR else { return }
         setGate(scopeTiles(tiles), don: don)
         requestKeyframes(for: tiles, out: &out)      // no-op if already asked this wait
-    }
-
-    /// Gates the tiles of a DON hole [from, to), each at its own last DON in
-    /// the hole when the interleave says which that is (else the hole's end).
-    private func gateHole(tiles: Set<Int>?, from: UInt16, to: UInt16, out: inout [AssemblerOutput]) {
-        let last = to &- 1
-        guard everHadIDR, let tiles, interleaveBase != nil, scopeTiles(tiles) == tiles else {
-            gate(tiles: tiles, don: last, out: &out)
-            return
-        }
-        requestKeyframes(for: tiles, out: &out)
-        for t in tiles {
-            var d = last
-            while attributedTile(d) != t, d != from { d = d &- 1 }
-            setGate([t], don: d)
-        }
     }
 
     /// Adds gates; a tile already gated keeps the later of the two DONs.
