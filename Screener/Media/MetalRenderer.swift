@@ -14,8 +14,8 @@
 // drawables. A redraw with nothing drawable marks the version seen and keeps
 // the last presented picture on the layer (e.g. behind "Reconnecting…").
 //
-// Pacing (VideoFrameStore header; OPT-IN with SCREENER_PACING=1, for a
-// device A/B): pictures are queued with due times, so while any is queued
+// Pacing (VideoFrameStore header; OPT-IN: the "Smooth Playback" menu
+// toggle, or SCREENER_PACING=1/0 which overrides it — PacingConfig): pictures are queued with due times, so while any is queued
 // the view runs its display link (up to the screen's maximum rate) and each
 // vsync presents the newest due picture; `pacingIdle` after the queue
 // empties it goes back to on-demand drawing. A vsync with nothing new due
@@ -134,9 +134,8 @@ final class MetalRenderer: NSObject, MTKViewDelegate {
 
     static let colorPixelFormat: MTLPixelFormat = .bgra8Unorm
 
-    /// Presentation pacing, opt-in (SCREENER_PACING=1; see the header).
-    nonisolated static let pacing: VideoFrameStore.Pacing? =
-        ProcessInfo.processInfo.environment["SCREENER_PACING"] == "1" ? VideoFrameStore.Pacing() : nil
+    /// Presentation pacing, read once per renderer (= per session; PacingConfig).
+    let pacing: VideoFrameStore.Pacing? = PacingConfig.current()
     /// How long the display link keeps running after the queue empties.
     static let pacingIdle: Duration = .milliseconds(250)
 
@@ -194,10 +193,10 @@ final class MetalRenderer: NSObject, MTKViewDelegate {
         view.enableSetNeedsDisplay = true
         view.isPaused = true
         view.delegate = self
-        store.setPacing(Self.pacing)
-        if Self.pacing != nil {
+        store.setPacing(pacing)
+        if pacing != nil {
             view.preferredFramesPerSecond = 120             // capped to the screen's maximum
-            Log.video.info("M4 pacing ON (SCREENER_PACING=1): pictures presented on their RTP timeline")
+            Log.video.info("M4 pacing ON (\(PacingConfig.source)): pictures presented on their RTP timeline")
         }
         setLayerColorSpace(CGColorSpace.sRGB, on: view)
         let coalescer = RedrawCoalescer { [weak view] in view?.setNeedsDisplay() }
@@ -284,7 +283,7 @@ final class MetalRenderer: NSObject, MTKViewDelegate {
     /// Runs the view's display link while paced pictures are queued, and
     /// returns to on-demand drawing `pacingIdle` after the queue empties.
     private func updateDisplayLink(_ view: MTKView) {
-        guard Self.pacing != nil else { return }
+        guard pacing != nil else { return }
         let now = ContinuousClock.now
         if store.nextDue != nil {
             lastQueued = now

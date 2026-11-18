@@ -451,7 +451,11 @@ actor MediaTransport {
                                                      underlying: "\(error)")
             }
             channels[flow] = channel
-            pumps.append(Task { [weak self] in
+            // .high: decrypt + depacketize run here, decoupled from the socket
+            // drain (the userInteractive DispatchSource only copies each
+            // datagram and stamps its arrival), so a slow consumer grows this
+            // stream's buffer instead of the kernel's.
+            pumps.append(Task(priority: .high) { [weak self] in
                 for await (data, at) in stream {
                     guard let self else { return }
                     await self.ingest(flow, data, at)

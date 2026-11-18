@@ -226,6 +226,7 @@ private struct ControlPanel: View {
     let controls: SessionControls
     @State private var passwordArmed = false
     @State private var disarmTask: Task<Void, Never>?
+    @AppStorage(PacingConfig.defaultsKey) private var smoothPlayback = false
 
     var body: some View {
         ViewThatFits(in: .vertical) {
@@ -322,6 +323,12 @@ private struct ControlPanel: View {
             tile("Display", "display", hint: "Coming soon") {}.disabled(true)
             tile("Input Mode", "hand.point.up.left", hint: "Coming soon") {}.disabled(true)
             tile("Stats", "chart.bar", hint: "Coming soon") {}.disabled(true)
+            tile("Smooth Playback", smoothPlayback ? "waveform.path" : "waveform.path.ecg",
+                 selected: smoothPlayback,
+                 hint: "Presents frames on the Mac's timeline: smoother motion, a little more delay. "
+                    + "Takes effect on the next connection.") { smoothPlayback.toggle() }
+                .accessibilityValue(smoothPlayback ? "On" : "Off")
+                .accessibilityAddTraits(.isToggle)
             ShareLink(item: ShareLogButton.logURL, preview: SharePreview("screener.log")) {
                 tileLabel("Share Log", "doc.text.magnifyingglass", selected: false, destructive: false)
             }

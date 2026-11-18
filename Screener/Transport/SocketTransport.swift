@@ -87,6 +87,56 @@ enum BSDSocket {
         setsockopt(fd, level, name, &v, socklen_t(MemoryLayout<Int32>.size))
     }
 
+    static func getInt(_ fd: Int32, _ level: Int32, _ name: Int32) -> Int32? {
+        var v: Int32 = 0
+        var len = socklen_t(MemoryLayout<Int32>.size)
+        return getsockopt(fd, level, name, &v, &len) == 0 ? v : nil
+    }
+
+    /// SO_NET_SERVICE_TYPE (<sys/socket.h>): tells the stack — and on Wi-Fi
+    /// the driver, which picks the WMM access category and its power-save /
+    /// low-latency behaviour from it — what kind of traffic the socket
+    /// carries. The system derives the DSCP marking from it where its policy
+    /// allows (SO_NETSVC_MARKING_LEVEL), so IP_TOS is NOT set as well.
+    /// Returns (rc errno or 0, read-back type, marking level) for the log.
+    @discardableResult
+    static func setServiceType(_ fd: Int32, _ type: Int32) -> (errno: Int32, effective: Int32?, marking: Int32?) {
+        var v = type
+        let rc = setsockopt(fd, SOL_SOCKET, SO_NET_SERVICE_TYPE, &v, socklen_t(MemoryLayout<Int32>.size))
+        let e = rc == 0 ? 0 : errno
+        return (e, getInt(fd, SOL_SOCKET, SO_NET_SERVICE_TYPE), getInt(fd, SOL_SOCKET, SO_NETSVC_MARKING_LEVEL))
+    }
+
+    static func serviceTypeName(_ t: Int32?) -> String {
+        switch t {
+        case NET_SERVICE_TYPE_BE?: return "BE"
+        case NET_SERVICE_TYPE_BK?: return "BK"
+        case NET_SERVICE_TYPE_SIG?: return "SIG"
+        case NET_SERVICE_TYPE_VI?: return "VI"
+        case NET_SERVICE_TYPE_VO?: return "VO"
+        case NET_SERVICE_TYPE_RV?: return "RV"
+        case NET_SERVICE_TYPE_AV?: return "AV"
+        case NET_SERVICE_TYPE_OAM?: return "OAM"
+        case NET_SERVICE_TYPE_RD?: return "RD"
+        case let t?: return "\(t)"
+        case nil: return "?"
+        }
+    }
+
+    /// The media sockets' service type: NET_SERVICE_TYPE_VI (interactive
+    /// video, as AVConference marks its media) unless SCREENER_NETSVC says
+    /// otherwise (vi / rv / av / vo / be / off; off = leave the default).
+    static func mediaServiceType(_ env: [String: String] = ProcessInfo.processInfo.environment) -> Int32? {
+        switch env["SCREENER_NETSVC"]?.lowercased() {
+        case "off": return nil
+        case "rv": return NET_SERVICE_TYPE_RV
+        case "av": return NET_SERVICE_TYPE_AV
+        case "vo": return NET_SERVICE_TYPE_VO
+        case "be": return NET_SERVICE_TYPE_BE
+        default: return NET_SERVICE_TYPE_VI
+        }
+    }
+
     static func local(_ host: String?, port: UInt16) throws -> sockaddr_in {
         guard let host else { return any(port: port) }
         return try resolveIPv4(host, port: port)
@@ -345,6 +395,7 @@ final class SocketDatagramChannel: DatagramChannel, @unchecked Sendable {
         BSDSocket.setInt(s, SOL_SOCKET, SO_REUSEPORT, 1)
         BSDSocket.setInt(s, SOL_SOCKET, SO_NOSIGPIPE, 1)
         let rcvbuf = Self.setReceiveBuffer(s)
+        let svc = BSDSocket.mediaServiceType().map { BSDSocket.setServiceType(s, $0) }
         do {
             do {
                 try BSDSocket.bind(s, BSDSocket.local(localHost, port: localPort))
@@ -356,6 +407,14 @@ final class SocketDatagramChannel: DatagramChannel, @unchecked Sendable {
             _ = fcntl(s, F_SETFL, fcntl(s, F_GETFL) | O_NONBLOCK)
             emit("bound local=\(BSDSocket.localName(s)) remote=\(BSDSocket.describe(remote))")
             emit("rcvbuf requested=\(Self.preferredReceiveBuffer) accepted=\(rcvbuf.accepted) effective=\(rcvbuf.effective)")
+            if let svc {
+                let err = svc.errno == 0 ? "" : " error=\(String(cString: strerror(svc.errno)))(\(svc.errno))"
+                emit("netsvc requested=\(BSDSocket.serviceTypeName(BSDSocket.mediaServiceType())) "
+                     + "effective=\(BSDSocket.serviceTypeName(svc.effective)) marking_level=\(svc.marking.map(String.init) ?? "?")"
+                     + "\(err) qos=\(queue.qos.qosClass)")
+            } else {
+                emit("netsvc off (SCREENER_NETSVC=off) qos=\(queue.qos.qosClass)")
+            }
         } catch let e as DatagramChannelError {
             Darwin.close(s)
             throw e
@@ -582,6 +641,7 @@ final class SocketTCPByteStream: ByteStream, @unchecked Sendable {
         guard s >= 0 else { throw TransportError.failed("socket: \(errno)") }
         BSDSocket.setInt(s, SOL_SOCKET, SO_NOSIGPIPE, 1)
         BSDSocket.setInt(s, IPPROTO_TCP, TCP_NODELAY, 1)
+        BSDSocket.setServiceType(s, NET_SERVICE_TYPE_RD)   // as TCPByteStream's .responsiveData
         do {
             try BSDSocket.bind(s, BSDSocket.local(localAddress, port: 0))
         } catch {

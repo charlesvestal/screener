@@ -30,3 +30,5 @@ build-rel/
 .serena/
 build-bwe/
 build-chop/
+build-qos/
+build-qos-dev/

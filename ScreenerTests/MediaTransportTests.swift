@@ -375,7 +375,7 @@ final class MediaTransportTests: XCTestCase {
         try await waitUntil("rctl with loss") {
             for d in ch.video.sent where RTCP.isRTCP(d) {
                 guard let p = rtcpDec.unprotect(d).map({ [UInt8]($0) }), p.count == 32 else { continue }
-                XCTAssertEqual(Data(p[30..<32]).hex, "7530", "BWE = the 30000 kbps start value")
+                XCTAssertEqual(Data(p[30..<32]).hex, "c350", "BWE = the 50000 kbps start value")
                 if p[28] >> 4 == 5 { sawBurst = true }
             }
             return sawBurst

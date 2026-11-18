@@ -276,6 +276,10 @@ final class TCPByteStream: ByteStream, @unchecked Sendable {
     static func connect(endpoint: NWEndpoint, timeout: Duration) async throws -> TCPByteStream {
         let params = NWParameters.tcp
         params.allowLocalEndpointReuse = true
+        // Control carries keyboard / pointer input and the RFB messages:
+        // interactive, small, bursty (SO_NET_SERVICE_TYPE RD; Wi-Fi WMM best
+        // effort but a shorter queue than plain best effort).
+        params.serviceClass = .responsiveData
         if let tcp = params.defaultProtocolStack.transportProtocol as? NWProtocolTCP.Options {
             tcp.noDelay = true
         }
@@ -287,7 +291,7 @@ final class TCPByteStream: ByteStream, @unchecked Sendable {
             ip.version = .v4
         }
         let connection = NWConnection(to: endpoint, using: params)
-        let queue = DispatchQueue(label: "ByteStream.TCP")
+        let queue = DispatchQueue(label: "ByteStream.TCP", qos: .userInitiated)
 
         let resumeState = ResumeOnce()
 

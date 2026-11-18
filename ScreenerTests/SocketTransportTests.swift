@@ -345,3 +345,37 @@ final class SocketTransportTests: XCTestCase {
         listener.cancel()
     }
 }
+
+final class NetServiceTypeTests: XCTestCase {
+    func testMediaServiceTypeDefaultsToInteractiveVideoWithAnOverride() {
+        XCTAssertEqual(BSDSocket.mediaServiceType([:]), NET_SERVICE_TYPE_VI)
+        XCTAssertEqual(BSDSocket.mediaServiceType(["SCREENER_NETSVC": "rv"]), NET_SERVICE_TYPE_RV)
+        XCTAssertEqual(BSDSocket.mediaServiceType(["SCREENER_NETSVC": "BE"]), NET_SERVICE_TYPE_BE)
+        XCTAssertNil(BSDSocket.mediaServiceType(["SCREENER_NETSVC": "off"]))
+    }
+
+    func testServiceTypeSticksOnAUDPSocket() {
+        let s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)
+        XCTAssertGreaterThanOrEqual(s, 0)
+        defer { close(s) }
+        let r = BSDSocket.setServiceType(s, NET_SERVICE_TYPE_VI)
+        XCTAssertEqual(r.errno, 0)
+        XCTAssertEqual(r.effective, NET_SERVICE_TYPE_VI)
+        XCTAssertEqual(BSDSocket.serviceTypeName(r.effective), "VI")
+    }
+}
+
+final class PacingConfigTests: XCTestCase {
+    func testEnvironmentOverridesTheToggle() throws {
+        let d = try XCTUnwrap(UserDefaults(suiteName: "PacingConfigTests"))
+        d.removePersistentDomain(forName: "PacingConfigTests")
+        XCTAssertFalse(PacingConfig.isOn(env: [:], defaults: d), "off by default")
+        d.set(true, forKey: PacingConfig.defaultsKey)
+        XCTAssertTrue(PacingConfig.isOn(env: [:], defaults: d))
+        XCTAssertNotNil(PacingConfig.current(env: [:], defaults: d))
+        XCTAssertFalse(PacingConfig.isOn(env: ["SCREENER_PACING": "0"], defaults: d))
+        d.set(false, forKey: PacingConfig.defaultsKey)
+        XCTAssertTrue(PacingConfig.isOn(env: ["SCREENER_PACING": "1"], defaults: d))
+        d.removePersistentDomain(forName: "PacingConfigTests")
+    }
+}

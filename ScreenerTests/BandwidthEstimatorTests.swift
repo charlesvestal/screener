@@ -44,15 +44,15 @@ final class BandwidthEstimatorTests: XCTestCase {
 
     func testStartsAtTheInitialValueAndHoldsDuringStartupGrace() {
         var e = BandwidthEstimator()
-        XCTAssertEqual(e.bweKbps, 30_000)
+        XCTAssertEqual(e.bweKbps, 50_000)
         e.update(.init(rxBytes: 0, expected: 100, received: 10, recoveryEvents: 3), now: 0)
         e.update(.init(rxBytes: 0, expected: 100, received: 10, recoveryEvents: 3), now: 0.5)
         XCTAssertEqual(e.state, .startup)
-        XCTAssertEqual(e.bweKbps, 30_000)
+        XCTAssertEqual(e.bweKbps, 50_000)
     }
 
     func testConvergesUpOnACleanBusyLinkAndStopsAtTheCeiling() {
-        var e = BandwidthEstimator()
+        var e = BandwidthEstimator(config: .init(initialKbps: 30_000))
         let trace = run(&e, Link(), from: 0, seconds: 30)
         XCTAssertTrue(zip(trace, trace.dropFirst()).allSatisfy { $0 <= $1 }, "monotonic on a clean link")
         // 6 %/s from 30 Mbps after the 1 s grace: ~40 Mbps 5 s later.
@@ -63,32 +63,59 @@ final class BandwidthEstimatorTests: XCTestCase {
         XCTAssertEqual(e.decreases, 0)
     }
 
-    func testBacksOffOnALossBurstAndHoldsOffBeforeTheNextDecrease() {
-        var e = BandwidthEstimator(config: .init(initialKbps: 50_000))
-        run(&e, Link(demandKbps: 50_000), from: 0, seconds: 3)
-        let before = e.estimateKbps
-        // 30 % loss for 0.5 s.
-        var lossy = Link(demandKbps: 50_000); lossy.extraLoss = 0.3
-        let during = run(&e, lossy, from: 3, seconds: 0.5)
-        XCTAssertEqual(e.decreases, 1, "one decrease, then the hold-off")
-        XCTAssertLessThanOrEqual(during.last!, before * 0.85 + 1)
-        // The burst clears: the window still holds it for ≤ 1 s, then the dead band, then the increase hold-off.
-        let after = run(&e, Link(demandKbps: 50_000), from: 3.5, seconds: 1.5)
-        XCTAssertLessThanOrEqual(e.decreases, 2)
-        XCTAssertTrue(after.allSatisfy { $0 <= during.last! })
-        run(&e, Link(demandKbps: 50_000), from: 5, seconds: 5)
-        XCTAssertEqual(e.state, .increase, "recovers once the link is clean again")
+    /// iPad log 2026-11-18: Wi-Fi loses 13 % in one second, then is clean.
+    /// One lossy second alone never cuts; with the keyframe request it
+    /// causes, at most one ×0.9 cut, and the estimate is back within 3 s.
+    func testWiFiBurstBarelyMovesTheEstimateAndRecoversWithin3s() {
+        for triggersRecovery in [false, true] {
+            var e = BandwidthEstimator(config: .init(initialKbps: 50_000))
+            run(&e, Link(demandKbps: 50_000), from: 0, seconds: 3)
+            let before = e.estimateKbps
+            var burst = Link(demandKbps: 50_000); burst.extraLoss = 0.13
+            burst.lossTriggersRecovery = triggersRecovery
+            let during = run(&e, burst, from: 3, seconds: 1)
+            let after = run(&e, Link(demandKbps: 50_000), from: 4, seconds: 3)
+            let low = (during + after).min()!
+            XCTAssertGreaterThanOrEqual(low, before * 0.9 - 1, "recovery=\(triggersRecovery)")
+            XCTAssertLessThanOrEqual(e.decreases, triggersRecovery ? 1 : 0)
+            XCTAssertGreaterThanOrEqual(after.last!, before - 1, "back to the pre-burst estimate within 3 s")
+        }
     }
 
-    func testHeavyLossCutsTowardTheReceiveRate() {
-        var e = BandwidthEstimator(config: .init(initialKbps: 60_000))
-        // A 20 Mbps link: the host overshoots by 3×.
-        run(&e, Link(capacityKbps: 20_000), from: 0, seconds: 1.0)
-        run(&e, Link(capacityKbps: 20_000), from: 1.0, seconds: 0.05)
+    /// Loss over 10 % in two consecutive 1 s buckets: ×0.9 per bucket, and
+    /// the burst guard keeps the first 3 s of the episode at ≥ 0.6×.
+    func testSustainedLossBacksOffOncePerSecond() {
+        var e = BandwidthEstimator(config: .init(initialKbps: 50_000))
+        run(&e, Link(demandKbps: 50_000), from: 0, seconds: 3)
+        var lossy = Link(demandKbps: 50_000); lossy.extraLoss = 0.3
+        run(&e, lossy, from: 3, seconds: 1)
+        XCTAssertEqual(e.decreases, 0, "one lossy second is not sustained")
+        let before = e.estimateKbps
+        run(&e, lossy, from: 4, seconds: 1)
         XCTAssertEqual(e.decreases, 1)
-        XCTAssertEqual(e.estimateKbps, 30_000, accuracy: 1, "capped at halving per step")
-        run(&e, Link(capacityKbps: 20_000), from: 1.05, seconds: 1.0)
-        XCTAssertEqual(e.estimateKbps, 17_000, accuracy: 300, "0.85 × the 20 Mbps receive rate")
+        XCTAssertEqual(e.estimateKbps, before * 0.9, accuracy: 1)
+        run(&e, lossy, from: 5, seconds: 1)
+        XCTAssertEqual(e.decreases, 2, "one decrease per lossy second")
+        XCTAssertEqual(e.estimateKbps, before * 0.81, accuracy: 1)
+        // The loss clears: no further decrease, and the estimate climbs again.
+        let mid = e.estimateKbps
+        run(&e, Link(demandKbps: 50_000), from: 6, seconds: 6)
+        XCTAssertEqual(e.decreases, 2)
+        XCTAssertGreaterThan(e.estimateKbps, mid)
+    }
+
+    func testHeavyLossCutsTowardTheReceiveRateAfterTheBurstGuard() {
+        var e = BandwidthEstimator(config: .init(initialKbps: 60_000))
+        // A 20 Mbps link: the host overshoots by 3×. Buckets close at 1, 2, 3 s...
+        run(&e, Link(capacityKbps: 20_000), from: 0, seconds: 2.0)
+        XCTAssertEqual(e.decreases, 1, "second lossy second")
+        XCTAssertEqual(e.estimateKbps, 54_000, accuracy: 1, "plain ×0.9 inside the burst guard")
+        run(&e, Link(capacityKbps: 20_000), from: 2.0, seconds: 1.0)
+        XCTAssertEqual(e.estimateKbps, 48_600, accuracy: 1)
+        run(&e, Link(capacityKbps: 20_000), from: 3.0, seconds: 1.0)
+        XCTAssertEqual(e.estimateKbps, 29_160, accuracy: 1, "past the guard: toward the receive rate, ≤ 0.6× per step")
+        run(&e, Link(capacityKbps: 20_000), from: 4.0, seconds: 2.0)
+        XCTAssertEqual(e.estimateKbps, 18_000, accuracy: 300, "0.9 × the 20 Mbps receive rate")
     }
 
     func testHoldsWhenAppLimited() {
@@ -165,17 +192,23 @@ final class BandwidthEstimatorTests: XCTestCase {
         let top = e.estimateKbps
         e.update(.init(rxBytes: 250_000, expected: 100, received: 100, recoveryEvents: 2), now: 3.05)
         XCTAssertEqual(e.state, .decrease)
-        XCTAssertEqual(e.estimateKbps, top * 0.85, accuracy: 0.5)
-        // A re-request 1 s later (keyframe still pending): no second cut yet.
+        XCTAssertEqual(e.estimateKbps, top * 0.9, accuracy: 0.5)
+        // An isolated cut on a clean link climbs back fast (+10 %/s) to the pre-cut value.
         run(&e, Link(), from: 3.05, seconds: 1.0)
+        XCTAssertEqual(e.state, .recover)
+        XCTAssertGreaterThan(e.estimateKbps, top * 0.98)
+        XCTAssertLessThanOrEqual(e.estimateKbps, top)
+        // A re-request 1 s later (keyframe still pending): no second cut yet.
         e.update(.init(rxBytes: 250_000, expected: 100, received: 100, recoveryEvents: 1), now: 4.1)
         XCTAssertEqual(e.state, .holdoff)
         XCTAssertEqual(e.decreases, 1)
-        XCTAssertEqual(e.estimateKbps, top * 0.85, accuracy: 0.5, "no increase right after recovery")
-        // After the recovery hold-off: a backlog signal cuts again.
+        // After the recovery hold-off: a backlog signal cuts again, without fast recovery.
         run(&e, Link(), from: 4.1, seconds: 2.0)
+        let pre = e.estimateKbps
         e.update(.init(rxBytes: 250_000, expected: 100, received: 100, decodeBacklog: true), now: 6.2)
         XCTAssertEqual(e.decreases, 2)
+        run(&e, Link(), from: 6.2, seconds: 1.0)
+        XCTAssertEqual(e.estimateKbps, pre * 0.9, accuracy: 0.5, "a decode backlog is not undone; increase hold-off")
     }
 
     /// Late (reordered) packets fill a gap in the next tick: the windowed
