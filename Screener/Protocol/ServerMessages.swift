@@ -105,8 +105,10 @@ enum ServerEvent: Equatable, Sendable {
     case rekey(Data)
     /// 0x451. Receiver must re-arm (0x09 + non-incremental 0x03) on every one.
     case displayLayout(DisplayLayout)
-    /// 0x450 STORE: inflated `w*h*4` BGRA pixmap + separate `w*h` alpha plane.
-    case cursorStore(id: UInt32, hotspot: PixelPoint, size: PixelSize, bgra: Data, alpha: Data)
+    /// 0x450 STORE: the inflated `w*h*4` BGRA pixmap + `w*h` alpha plane,
+    /// already converted to premultiplied RGBA (`CursorImage.premultipliedRGBA`)
+    /// here, off the main actor. `w, h ≤ CursorImage.maxDimension`.
+    case cursorStore(id: UInt32, hotspot: PixelPoint, size: PixelSize, rgba: Data)
     /// 0x450 SELECT: re-apply a previously stored cursor.
     case cursorSelect(id: UInt32)
     /// 0x455.
@@ -351,7 +353,12 @@ struct ServerMessageParser {
         case 0x450:   // CursorImage
             guard have >= 8 else { return .needMore }
             let cacheID = u32(p), compLen = Int(u32(p + 4))
-            let px = rw * rh * 5
+            // A cursor is at most maxDimension² (real ones are ≤ 256²): larger
+            // claimed sizes are skipped, and the comp_len bound uses the
+            // capped size so a 65535×65535 header can't justify megabytes.
+            let maxSide = CursorImage.maxDimension
+            let oversized = rw > maxSide || rh > maxSide
+            let px = min(rw, maxSide) * min(rh, maxSide) * 5
             guard compLen <= max(4096, px + px / 100 + 64) else {
                 Log.control.error("cursor comp_len \(compLen) implausible for \(rw)x\(rh); aborting record")
                 return abortRect(&events, enc: enc, afterRekey: afterRekey, scanForAnswer: false)
@@ -359,6 +366,9 @@ struct ServerMessageParser {
             guard have >= 8 + compLen else { spanOK = true; return .needMore }
             if compLen == 0 {
                 events.append(.cursorSelect(id: cacheID))
+            } else if oversized {
+                Log.control.error("cursor \(rw)x\(rh) exceeds \(maxSide)x\(maxSide); skipped")
+                events.append(.unknown(type: 0x00, encoding: enc))
             } else if let e = cursorStore(id: cacheID, x: rx, y: ry, w: rw, h: rh, compressed: slice(p + 8, compLen)) {
                 events.append(e)
             }
@@ -452,19 +462,23 @@ struct ServerMessageParser {
     /// session._handle_cursor_rect STORE path: a fresh zlib stream per cursor
     /// (the reference uses a new `decompressobj()` each time); inflated bytes
     /// must be exactly w*h*4 BGRA + w*h alpha, else the rect is dropped.
+    /// Inflation is capped at w*h*5 bytes (w, h ≤ maxDimension), so a zlib
+    /// bomb — even one injected into the unauthenticated plaintext prelude —
+    /// stops at ≤ 1.25 MB. The premultiply runs here, off the main actor.
     private func cursorStore(id: UInt32, x: Int, y: Int, w: Int, h: Int, compressed: Data) -> ServerEvent? {
+        let px = w * h
         let raw: Data
-        do { raw = try Zlib.inflate(compressed) } catch {
-            Log.control.error("cursor zlib inflate failed: \(error)")
+        do { raw = try Zlib.inflate(compressed, maxOutput: px * 5) } catch {
+            Log.control.error("cursor zlib inflate failed (\(w)x\(h)): \(error)")
             return nil
         }
-        let px = w * h
         guard raw.count == px * 5 else {
             Log.control.debug("cursor size mismatch (got \(raw.count), expected \(px * 5) = \(w)x\(h)*5)")
             return nil
         }
-        return .cursorStore(id: id, hotspot: PixelPoint(x: x, y: y), size: PixelSize(width: w, height: h),
-                            bgra: Data(raw.prefix(px * 4)), alpha: Data(raw.suffix(px)))
+        guard let rgba = CursorImage.premultipliedRGBA(bgra: raw.prefix(px * 4), alpha: raw.suffix(px), pixels: px)
+        else { return nil }
+        return .cursorStore(id: id, hotspot: PixelPoint(x: x, y: y), size: PixelSize(width: w, height: h), rgba: rgba)
     }
 
     /// RFC §8.5: u16 header_count, u16 version, u16 value_count, u32 × value_count.

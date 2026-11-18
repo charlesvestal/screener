@@ -63,6 +63,49 @@ struct SSRCState: Equatable {
     var maxSeq: UInt16
 }
 
+/// RFC 3711 §3.3.2 replay list: a sliding window of `size` packet indices
+/// below (and including) the highest authenticated index. Only packets that
+/// passed authentication may `accept`; `isReplay` has no side effects.
+struct ReplayWindow: Equatable {
+    static let size: UInt64 = 128
+
+    private(set) var top: UInt64
+    /// Bit i set = index `top - i` was received (bit 0 = `top`).
+    private var lo: UInt64 = 1
+    private var hi: UInt64 = 0
+
+    init(first index: UInt64) { top = index }
+
+    /// True for an index already received, or too old to tell (≥ `size`
+    /// behind the highest one): RFC 3711 discards both.
+    func isReplay(_ index: UInt64) -> Bool {
+        guard index <= top else { return false }
+        let d = top - index
+        guard d < Self.size else { return true }
+        return d < 64 ? lo >> d & 1 == 1 : hi >> (d - 64) & 1 == 1
+    }
+
+    mutating func accept(_ index: UInt64) {
+        if index > top {
+            let shift = index - top
+            if shift >= 128 {
+                lo = 0; hi = 0
+            } else if shift >= 64 {
+                hi = lo << (shift - 64); lo = 0
+            } else {
+                hi = hi << shift | lo >> (64 - shift)
+                lo <<= shift
+            }
+            lo |= 1
+            top = index
+        } else {
+            let d = top - index
+            guard d < Self.size else { return }
+            if d < 64 { lo |= 1 << d } else { hi |= 1 << (d - 64) }
+        }
+    }
+}
+
 /// SRTP receiver: AES-256-CTR + HMAC-SHA1-80 with per-SSRC ROC (rollover counter) tracking.
 ///
 /// Apple's HP stream uses several SSRCs per quality tier (one per tile) whose sequence
@@ -77,6 +120,10 @@ final class SRTPDecryptor {
     private let salt: Data
     private var states: [UInt32: SSRCState] = [:]
     private var counts: [UInt32: Int] = [:]
+    /// RFC 3711 replay protection, per SSRC, over the 48-bit index ROC‖SEQ.
+    private var replay: [UInt32: ReplayWindow] = [:]
+    /// Authenticated packets discarded as replays (or too old to tell).
+    private(set) var replaysDropped = 0
 
     init(blob: Data) throws {
         let (key, masterSalt) = try SRTP.splitBlob(blob)
@@ -96,9 +143,12 @@ final class SRTPDecryptor {
     /// otherwise keep accumulating counts and trigger another adoption the moment the
     /// cool-down expires. Resetting forces a clean restart for any later-arriving stream.
     func forgetSSRCs(except keep: Set<UInt32>) {
-        for ssrc in counts.keys where !keep.contains(ssrc) {
+        // The replay window goes with the ROC state: a forgotten SSRC starts
+        // over at ROC 0 like a brand-new one (the reference behaviour).
+        for ssrc in Set(counts.keys).union(states.keys) where !keep.contains(ssrc) {
             counts.removeValue(forKey: ssrc)
             states.removeValue(forKey: ssrc)
+            replay.removeValue(forKey: ssrc)
         }
     }
 
@@ -134,7 +184,9 @@ final class SRTPDecryptor {
     func stateSnapshot() -> [UInt32: SSRCState] { states }
 
     /// Decrypts one SRTP packet. Returns `(header, payload, ssrc, seq)`, or `nil` if the
-    /// auth tag fails for every ROC candidate. On failure, ROC/count state is unchanged.
+    /// auth tag fails for every ROC candidate, or if the authenticated index was already
+    /// received / is more than 128 behind the newest (RFC 3711 §3.3.2 replay window).
+    /// On failure, ROC/count/replay state is unchanged.
     func decrypt(_ pkt: Data) -> (header: Data, payload: Data, ssrc: UInt32, seq: UInt16)? {
         guard pkt.count >= SRTP.rtpHeaderMinLength + SRTP.authTagLength else { return nil }
         let bytes = [UInt8](pkt)
@@ -167,6 +219,14 @@ final class SRTPDecryptor {
 
         for roc in candidates {
             if let result = tryDecrypt(bytes: bytes, bodyLen: bodyLen, seq: seq, ssrc: ssrc, roc: roc) {
+                // The tag covers ROC‖SEQ, so the index is authenticated: a
+                // replayed packet only verifies under its original ROC.
+                let index = UInt64(roc) << 16 | UInt64(seq)
+                if let w = replay[ssrc], w.isReplay(index) {
+                    replaysDropped += 1
+                    return nil
+                }
+                if replay[ssrc] == nil { replay[ssrc] = ReplayWindow(first: index) } else { replay[ssrc]!.accept(index) }
                 updateState(ssrc: ssrc, roc: roc, seq: seq)
                 counts[ssrc, default: 0] += 1
                 return (result.header, result.payload, ssrc, seq)
@@ -271,10 +331,16 @@ final class SRTPEncryptor {
 }
 
 /// SRTCP receiver. RTCP shares the same master key/salt as RTP but uses derivation labels 3/4/5.
+///
+/// Replay protection (RFC 3711 §3.3.2) per sender SSRC over the 31-bit SRTCP index:
+/// an authenticated packet whose index was already seen, or is ≥ 128 behind the
+/// newest, is discarded without changing any state. Not thread-safe (one owner task).
 final class SRTCPDecryptor {
     private let cipherKey: Data
     private let authKey: Data
     private let salt: Data
+    private var replay: [UInt32: ReplayWindow] = [:]
+    private(set) var replaysDropped = 0
 
     init(blob: Data) throws {
         let (key, masterSalt) = try SRTP.splitBlob(blob)
@@ -297,14 +363,26 @@ final class SRTCPDecryptor {
             | UInt32(bytes[eIndexOffset + 2]) << 8 | UInt32(bytes[eIndexOffset + 3])
         let encrypted = (eIndex & 0x8000_0000) != 0
         let index = eIndex & 0x7FFF_FFFF
+        let ssrc = UInt32(bytes[4]) << 24 | UInt32(bytes[5]) << 16 | UInt32(bytes[6]) << 8 | UInt32(bytes[7])
+        if let w = replay[ssrc], w.isReplay(UInt64(index)) {
+            replaysDropped += 1
+            return nil
+        }
         let header = Data(bytes[0..<8])
         let payload = Data(bytes[8..<eIndexOffset])
-        guard encrypted else { return header + payload }
+        guard encrypted else {
+            accept(ssrc: ssrc, index: index)
+            return header + payload
+        }
 
-        let ssrc = UInt32(bytes[4]) << 24 | UInt32(bytes[5]) << 16 | UInt32(bytes[6]) << 8 | UInt32(bytes[7])
         let iv = SRTP.rtcpIV(salt: salt, ssrc: ssrc, index: index)
         guard let plaintext = try? AES.ctr(key: cipherKey, iv: iv, data: payload) else { return nil }
+        accept(ssrc: ssrc, index: index)
         return header + plaintext
+    }
+
+    private func accept(ssrc: UInt32, index: UInt32) {
+        if replay[ssrc] == nil { replay[ssrc] = ReplayWindow(first: UInt64(index)) } else { replay[ssrc]!.accept(UInt64(index)) }
     }
 }
 

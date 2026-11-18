@@ -74,6 +74,8 @@ enum ControlSessionError: Error, Equatable, LocalizedError {
     case noRekey
     /// No usable canvas in the 0x1c answer after all re-queries.
     case mediaNegotiationFailed
+    /// A 0x44f rekey after the record layer was active (key rotation is unsupported).
+    case midSessionRekey
     case closed
     case alreadyStarted
 
@@ -89,6 +91,8 @@ enum ControlSessionError: Error, Equatable, LocalizedError {
             return "The Mac didn't enable encryption. This is most often rate limiting — wait 10–15 seconds and retry."
         case .mediaNegotiationFailed:
             return "The Mac didn't start a High Performance stream."
+        case .midSessionRekey:
+            return "The Mac changed the session's encryption keys, which Screener doesn't support. Reconnect to continue."
         case .closed:
             return "The connection was closed."
         case .alreadyStarted:
@@ -200,8 +204,9 @@ actor ControlSession {
         let serverInit: ServerInit
     }
 
-    /// Every server message after the rekey (and any plaintext ones before
-    /// it). Finishes when the session closes; read `failure` for the cause.
+    /// Every server message after the rekey (plaintext prelude messages are
+    /// unauthenticated and dropped). Finishes when the session closes; read
+    /// `failure` for the cause.
     nonisolated let events: AsyncStream<ServerEvent>
     private let continuation: AsyncStream<ServerEvent>.Continuation
 
@@ -362,7 +367,6 @@ actor ControlSession {
             try await Self.readUntilRekey(stream, wrapKey: wrapKey)
         }
         record = rekey.record
-        for e in rekey.events { continuation.yield(e) }
         Log.control.info("rekey received; record layer installed")
         cfg.onMilestone?(.recordLayerActive)
         let initial = rekey.tail
@@ -441,7 +445,6 @@ actor ControlSession {
     private struct RekeyResult: Sendable {
         let record: RecordLayer
         let tail: Data
-        let events: [ServerEvent]
     }
 
     /// Magic at the start of the 76-byte SessionSelect prompt (negotiation._SS_MAGIC).
@@ -449,7 +452,17 @@ actor ControlSession {
 
     /// negotiation._read_until_enc1103 + _read_ss_prompt: parse the plaintext
     /// stream until the FBU carrying the 0x44f rekey; return the record
-    /// layer, the ciphertext that followed, and any other messages seen.
+    /// layer and the ciphertext that followed.
+    ///
+    /// Everything else in the prelude is DROPPED (security review M1): it is
+    /// unauthenticated plaintext an on-path attacker can inject (cursor
+    /// shapes, a fake 0x451 layout, device/keyboard info, a forged answer).
+    /// The reference also parses and discards it. Nothing is lost: the
+    /// encrypted non-incremental 0x03 sent right after the rekey makes the
+    /// server re-send layout, cursor and metadata inside the record layer,
+    /// and the 0x1c answer is only ever awaited after the offer, which is
+    /// itself encrypted. Session-select detection (the first 4 bytes) is the
+    /// only other plaintext decision, and it can only end the connect.
     private static func readUntilRekey(_ s: ByteStream, wrapKey: Data) async throws -> RekeyResult {
         let first: Data
         do {
@@ -467,7 +480,7 @@ actor ControlSession {
         }
         var parser = ServerMessageParser(framing: .stream)
         var rekeyBody: Data?
-        var others: [ServerEvent] = []
+        var dropped = 0
         var chunk = first
         while true {
             #if DEBUG
@@ -477,7 +490,7 @@ actor ControlSession {
                 #if DEBUG
                 Log.control.info("wire rx plain event \(Self.eventSummary(e))")
                 #endif
-                if case .rekey(let body) = e { rekeyBody = body } else { others.append(e) }
+                if case .rekey(let body) = e { rekeyBody = body } else { dropped += 1 }
             }
             if parser.isHalted { break }
             do {
@@ -489,10 +502,11 @@ actor ControlSession {
         guard let rekeyBody else { throw ControlSessionError.noRekey }
         let record = try RecordLayer(rekeyBody: rekeyBody, wrapKey: wrapKey)
         let tail = parser.takeRemainder()
+        if dropped > 0 { Log.control.info("prelude: ignored \(dropped) unauthenticated plaintext event(s)") }
         #if DEBUG
         Log.control.info("wire rekey parsed; ciphertext tail \(tail.count)B")
         #endif
-        return RekeyResult(record: record, tail: tail, events: others)
+        return RekeyResult(record: record, tail: tail)
     }
 
     // MARK: answer hand-off
@@ -623,8 +637,12 @@ actor ControlSession {
                     Log.control.info("display: re-offer answer canvas=\(a.canvasWidth)x\(a.canvasHeight) tiles=\(a.tiles)")
                 }
             case .rekey:
-                // TODO: wrap-key rotation (RFC §6.2.1) is unobserved in captures and unported.
-                Log.control.error("mid-session rekey received; not supported, ignoring")
+                // Wrap-key rotation (RFC §6.2.1) is unobserved in captures and
+                // unported. Ignoring it would leave both sides on different
+                // keys (every later record fails its MAC) — end the session
+                // cleanly with a clear error instead.
+                Log.control.error("mid-session rekey received; not supported, closing")
+                throw ControlSessionError.midSessionRekey
             default:
                 break
             }
@@ -695,7 +713,7 @@ actor ControlSession {
         switch e {
         case .rekey: return "rekey"
         case .displayLayout(let l): return "layout(\(l.backingWidth)x\(l.backingHeight),\(l.displays.count)d)"
-        case .cursorStore(let id, _, let s, _, _): return "cursorStore(\(id),\(s.width)x\(s.height))"
+        case .cursorStore(let id, _, let s, _): return "cursorStore(\(id),\(s.width)x\(s.height))"
         case .cursorSelect(let id): return "cursorSelect(\(id))"
         case .keyboardSource(let s, let sec): return "kbdSource(\(s),\(sec))"
         case .deviceInfo(let m): return "deviceInfo(\(m))"

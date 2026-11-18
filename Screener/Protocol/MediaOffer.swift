@@ -361,15 +361,22 @@ enum MediaStreamOptions {
     /// a 0x3f2/0x3f3 rect payload, or a top-level 0x1c record. Every embedded
     /// `bplist` is tried in order; the first whose media blob's field 5 has a
     /// non-zero width and height wins.
+    ///
+    /// Bounded against a hostile answer (security review M1): at most
+    /// `maxAnswerCandidates` "bplist" markers are tried, each with at most
+    /// `maxPlistParsesPerCandidate` full plist parses (so many markers or many
+    /// self-consistent fake trailers cost O(candidates × n), not O(n²)), and
+    /// the media blob inflates to at most `maxMediaBlobBytes`.
     static func parseAnswer(_ data: Data) throws -> MediaAnswer {
         let b = [UInt8](data)
         let magic = Array("bplist".utf8)
-        var idx = 0
-        while let start = find(magic, in: b, from: idx) {
+        var idx = 0, candidates = 0
+        while candidates < maxAnswerCandidates, let start = find(magic, in: b, from: idx) {
             idx = start + magic.count
+            candidates += 1
             guard let plist = embeddedPlist(b, at: start),
                   let compressed = plist["avcMediaStreamNegotiatorMediaBlob"] as? Data, !compressed.isEmpty,
-                  let blob = try? Zlib.inflate(compressed) else { continue }
+                  let blob = try? Zlib.inflate(compressed, maxOutput: maxMediaBlobBytes) else { continue }
             var answer = MediaAnswer(canvasWidth: 0, canvasHeight: 0, tiles: 0)
             Protobuf.forEachField(blob) { field, value in
                 guard field == 5, case .bytes(let sub) = value else { return }
@@ -389,9 +396,17 @@ enum MediaStreamOptions {
         throw MediaAnswerError.noCanvas
     }
 
+    /// "bplist" markers tried per answer (a real answer carries one).
+    static let maxAnswerCandidates = 8
+    /// Full plist parses per marker (prefixes with a self-consistent trailer).
+    static let maxPlistParsesPerCandidate = 4
+    /// The inflated AVC media blob (a real one is a few hundred bytes).
+    static let maxMediaBlobBytes = 1 << 20
+
     private static func find(_ needle: [UInt8], in hay: [UInt8], from: Int) -> Int? {
         guard hay.count >= needle.count, from <= hay.count - needle.count else { return nil }
-        for i in from...(hay.count - needle.count) where hay[i] == needle[0] && Array(hay[i..<i + needle.count]) == needle {
+        for i in from...(hay.count - needle.count)
+        where hay[i] == needle[0] && hay[i..<i + needle.count].elementsEqual(needle) {
             return i
         }
         return nil
@@ -400,10 +415,12 @@ enum MediaStreamOptions {
     /// The shortest prefix starting at `start` that parses as a dictionary
     /// plist (the reference tries growing prefixes with plistlib). A prefix is
     /// only handed to PropertyListSerialization when its last 32 bytes form a
-    /// self-consistent bplist trailer, which keeps the scan cheap.
+    /// self-consistent bplist trailer (an O(1) check per end offset), and at
+    /// most `maxPlistParsesPerCandidate` times per marker.
     private static func embeddedPlist(_ b: [UInt8], at start: Int) -> [String: Any]? {
         let minLen = 8 + 1 + 32
         guard b.count - start >= minLen else { return nil }
+        var parses = 0
         for end in (start + minLen)...b.count {
             let t = end - 32
             let offsetSize = Int(b[t + 6]), refSize = Int(b[t + 7])
@@ -411,6 +428,8 @@ enum MediaStreamOptions {
             let count = be64(b, t + 8), tableOffset = be64(b, t + 24)
             guard count > 0, count < 1 << 20, tableOffset < UInt64(end - start),
                   tableOffset + count * UInt64(offsetSize) + 32 == UInt64(end - start) else { continue }
+            guard parses < maxPlistParsesPerCandidate else { return nil }
+            parses += 1
             let slice = Data(b[start..<end])
             if let d = try? PropertyListSerialization.propertyList(from: slice, format: nil) as? [String: Any] {
                 return d

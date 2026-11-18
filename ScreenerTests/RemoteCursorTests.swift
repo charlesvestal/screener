@@ -48,6 +48,18 @@ final class RemoteCursorTests: XCTestCase {
         XCTAssertNotNil(c.image)
     }
 
+    func testPremultipliedStoreEnforcesTheSizeCapAndLength() {
+        let c = RemoteCursor()
+        let m = CursorImage.maxDimension
+        c.store(id: 1, hotspot: PixelPoint(x: 0, y: 0), size: PixelSize(width: m + 1, height: 1),
+                rgba: Data(count: (m + 1) * 4))
+        XCTAssertNil(c.image, "wider than maxDimension")
+        c.store(id: 2, hotspot: PixelPoint(x: 0, y: 0), size: PixelSize(width: 2, height: 2), rgba: Data(count: 15))
+        XCTAssertNil(c.image, "length mismatch")
+        c.store(id: 3, hotspot: PixelPoint(x: 0, y: 0), size: PixelSize(width: m, height: m), rgba: Data(count: m * m * 4))
+        XCTAssertEqual(c.image?.width, m)
+    }
+
     func testPositionAndVisibility() {
         let c = RemoteCursor()
         var changes = 0

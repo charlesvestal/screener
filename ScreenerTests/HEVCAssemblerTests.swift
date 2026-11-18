@@ -406,6 +406,25 @@ final class HEVCAssemblerTests: XCTestCase {
         XCTAssertEqual(a.stats.groupsIncomplete, 0)
     }
 
+    /// Security review L7: one RTP timestamp can't grow without bound.
+    func testGroupBeyondThePacketCapIsDroppedAsLoss() {
+        var c = HEVCAssembler.Config()
+        c.maxPacketsPerGroup = 8
+        c.maxPendingGroupsPerSSRC = 1000
+        let (a, s) = warm(c)
+        let nal = Sender.slice(type: 1, don: 1, size: 200)
+        let frags = Sender.fuPayloads(nal, don: 1, parts: 20)
+        var out: [AssemblerOutput] = []
+        for p in frags.dropLast() { out += a.ingest(s.packet(tile: 0, ts: 2000, marker: false, p)) }
+        XCTAssertEqual(a.stats.oversizedGroups, 1)
+        XCTAssertEqual(a.stats.groupsEvicted, 1)
+        XCTAssertTrue(out.compactMap(\.au).isEmpty)
+        // The rest of that timestamp (incl. its marker) is ignored as late.
+        let late = a.stats.latePackets
+        XCTAssertEqual(a.ingest(s.packet(tile: 0, ts: 2000, marker: true, frags.last!)).compactMap(\.au), [])
+        XCTAssertEqual(a.stats.latePackets, late + 1)
+    }
+
     func testGroupWhoseMarkerIsLostCountsAsLoss() {
         let (a, s) = warm()
         var lostTail = s.picture(tile: 0, ts: 2000, don: 1, fragments: 3)

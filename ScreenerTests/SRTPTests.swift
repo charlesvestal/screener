@@ -153,6 +153,75 @@ final class SRTPTests: XCTestCase {
         XCTAssertNil(dec.unprotect(Data(tampered)))
     }
 
+    // MARK: - Replay protection (RFC 3711 §3.3.2, security review L1)
+
+    func testReplayWindowBitmapAcrossBothWords() {
+        var w = ReplayWindow(first: 1000)
+        XCTAssertTrue(w.isReplay(1000))
+        XCTAssertFalse(w.isReplay(1001))
+        XCTAssertFalse(w.isReplay(999), "never seen, inside the window")
+        w.accept(1070)                                  // shift 70: 1000 moves into the high word
+        XCTAssertTrue(w.isReplay(1000))
+        XCTAssertTrue(w.isReplay(1070))
+        XCTAssertFalse(w.isReplay(1069))
+        w.accept(1069); w.accept(943)                   // 943 = 1070 - 127, the oldest slot
+        XCTAssertTrue(w.isReplay(1069))
+        XCTAssertTrue(w.isReplay(943))
+        XCTAssertTrue(w.isReplay(942), "128 behind: too old to tell, discarded")
+        w.accept(1070 + 200)                            // jump past the whole window
+        XCTAssertFalse(w.isReplay(1269))
+        XCTAssertTrue(w.isReplay(1270))
+        XCTAssertTrue(w.isReplay(1070))
+    }
+
+    func testReplayedSRTPPacketIsDroppedWithoutStateChange() throws {
+        let fx = try SRTPFixture()
+        let enc = try SRTPEncryptor(blob: fx.blob, ssrc: 0x1234)
+        let dec = try SRTPDecryptor(blob: fx.blob)
+        let wires = try (0..<10).map { try enc.encrypt(Data([UInt8($0)])) }
+        for w in wires { XCTAssertNotNil(dec.decrypt(w)) }
+        let count = dec.ssrcCounts[0x1234], state = dec.stateSnapshot()[0x1234]
+        XCTAssertNil(dec.decrypt(wires[5]), "exact replay")
+        XCTAssertNil(dec.decrypt(wires[9]), "replay of the newest")
+        XCTAssertEqual(dec.replaysDropped, 2)
+        XCTAssertEqual(dec.ssrcCounts[0x1234], count)
+        XCTAssertEqual(dec.stateSnapshot()[0x1234], state)
+    }
+
+    func testReorderedSRTPPacketInsideTheWindowIsAcceptedOnce() throws {
+        let fx = try SRTPFixture()
+        let enc = try SRTPEncryptor(blob: fx.blob, ssrc: 0x1234)
+        let dec = try SRTPDecryptor(blob: fx.blob)
+        let wires = try (0..<300).map { try enc.encrypt(Data([UInt8($0 & 0xff)])) }
+        for (i, w) in wires.enumerated() where i != 150 && i != 50 && i < 200 { XCTAssertNotNil(dec.decrypt(w)) }
+        XCTAssertEqual(dec.decrypt(wires[150])?.seq, 150, "late but inside the 128 window")
+        XCTAssertNil(dec.decrypt(wires[150]))
+        XCTAssertNil(dec.decrypt(wires[50]), "149 behind the newest: outside the window")
+        XCTAssertNotNil(dec.decrypt(wires[299]))
+    }
+
+    func testReplayAcrossROCRolloverUsesTheFullIndex() throws {
+        let fx = try SRTPFixture()
+        let dec = try SRTPDecryptor(blob: fx.blob)
+        for pkt in fx.packets { XCTAssertNotNil(dec.decrypt(pkt.wire)) }   // 65534, 65535, 0 (ROC 1)
+        for pkt in fx.packets { XCTAssertNil(dec.decrypt(pkt.wire), "seq \(pkt.seq) replayed") }
+        XCTAssertEqual(dec.stateSnapshot()[fx.ssrc]?.roc, 1)
+    }
+
+    func testReplayedSRTCPPacketIsDropped() throws {
+        let fx = try SRTPFixture()
+        let enc = try SRTCPEncryptor(blob: fx.blob)
+        let dec = try SRTCPDecryptor(blob: fx.blob)
+        let wires = try (0..<200).map { _ in try enc.protect(fx.rtcpPktForSample) }
+        XCTAssertNotNil(dec.unprotect(wires[0]))
+        XCTAssertNil(dec.unprotect(wires[0]), "same index again")
+        XCTAssertNotNil(dec.unprotect(wires[2]))
+        XCTAssertNotNil(dec.unprotect(wires[1]), "reordered, inside the window")
+        XCTAssertNotNil(dec.unprotect(wires[199]))
+        XCTAssertNil(dec.unprotect(wires[3]), "index must not fall ≥ 128 behind")
+        XCTAssertEqual(dec.replaysDropped, 2)
+    }
+
     // MARK: - get_primary_ssrc_group
 
     func testGetPrimarySSRCGroupPicksConsecutiveGroupWithMostPackets() throws {

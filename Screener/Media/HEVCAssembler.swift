@@ -145,6 +145,10 @@ final class HEVCAssembler {
         var lateDONLimit = 16
         /// Pending (unflushed) groups kept per SSRC.
         var maxPendingGroupsPerSSRC = 32
+        /// Packets one (SSRC, timestamp) group may collect before it is
+        /// dropped as loss (memory bound against a hostile/broken sender; a
+        /// 4K IDR tile is a few hundred packets).
+        var maxPacketsPerGroup = 4096
         /// A pending group that got no packet for this long lost its marker
         /// and is evicted as loss (`tick`). Separate from `reorderWindow`:
         /// a DON hole stops waiting for a stalled group long before that.
@@ -171,6 +175,8 @@ final class HEVCAssembler {
         var groupsFlushed = 0
         var groupsIncomplete = 0
         var groupsEvicted = 0
+        /// Groups dropped for exceeding `Config.maxPacketsPerGroup`.
+        var oversizedGroups = 0
         var lossEvents = 0
         var donHoles = 0
         var duplicateDONs = 0
@@ -326,7 +332,14 @@ final class HEVCAssembler {
         group.lastArrival = max(group.lastArrival, pkt.arrival)
 
         var entries: [Entry] = []
-        if group.hasMarker {
+        if group.packets.count >= config.maxPacketsPerGroup && !group.hasMarker {
+            // Unbounded group: give it up as loss (recentlyFlushed then
+            // ignores the rest of its packets).
+            state.pending[pkt.timestamp] = nil
+            state.markFlushed(pkt.timestamp)
+            stats.oversizedGroups += 1
+            entries = [evicted(group, timestamp: pkt.timestamp, tile: tile, ssrc: pkt.ssrc)]
+        } else if group.hasMarker {
             state.pending[pkt.timestamp] = nil
             entries = flush(group, timestamp: pkt.timestamp, ssrc: pkt.ssrc, tile: tile, state: &state)
         } else {

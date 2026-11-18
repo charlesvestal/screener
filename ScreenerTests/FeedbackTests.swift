@@ -466,6 +466,17 @@ final class FeedbackEmissionTests: XCTestCase {
 // MARK: minimap geometry
 
 final class MinimapGeometryTests: XCTestCase {
+    func testThumbnailSizeIsClampedWhateverTheLayoutAspect() {
+        // Security review L7: the aspect comes from the server's 0x451.
+        XCTAssertEqual(MetalRenderer.thumbnailSize(canvas: CGSize(width: 2560, height: 1600)).height, 160)
+        XCTAssertEqual(MetalRenderer.thumbnailSize(canvas: CGSize(width: 1, height: 65535)).height,
+                       MetalRenderer.thumbnailMaxHeight)
+        XCTAssertEqual(MetalRenderer.thumbnailSize(canvas: CGSize(width: 65535, height: 1)).height, 1)
+        XCTAssertEqual(MetalRenderer.thumbnailSize(canvas: CGSize(width: 0, height: 100)).height, 1)
+        XCTAssertEqual(MetalRenderer.thumbnailSize(canvas: CGSize(width: 1, height: 65535)).width,
+                       MetalRenderer.thumbnailWidth)
+    }
+
     func testViewportRectInContentUnits() {
         // 16:10 picture letterboxed in a 4:3 view: content spans y 0.0625…0.9375.
         let content = MinimapGeometry.unitContent(CGRect(x: 0, y: 48, width: 1024, height: 640),

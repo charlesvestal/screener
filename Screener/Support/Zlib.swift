@@ -9,14 +9,21 @@ import zlib
 enum ZlibError: Error, Equatable {
     case initFailed(Int32)
     case stream(Int32)
+    /// The inflated output would exceed the caller's `maxOutput` (zlib bomb
+    /// or a lying length); inflation stopped at the cap.
+    case outputLimit(Int)
 }
 
 enum Zlib {
     /// Inflates one complete zlib-wrapped blob on a fresh stream. Accepts
     /// Z_SYNC_FLUSH-terminated input (no final block), like
     /// `zlib.decompressobj().decompress(d) + flush()` in the reference.
-    static func inflate(_ data: Data) throws -> Data {
-        try Inflater().inflate(data)
+    /// `maxOutput` is a hard cap: inflation stops (and throws
+    /// `.outputLimit`) as soon as more than `maxOutput` bytes would be
+    /// produced, so a small hostile blob can't make us allocate more than
+    /// about `maxOutput` + one 16 KB chunk.
+    static func inflate(_ data: Data, maxOutput: Int = .max) throws -> Data {
+        try Inflater().inflate(data, maxOutput: maxOutput)
     }
 
     /// A persistent inflate stream: dictionary/window state carries across
@@ -45,10 +52,14 @@ enum Zlib {
             strm.deinitialize(count: 1); strm.deallocate()
         }
 
-        func inflate(_ input: Data) throws -> Data {
+        /// Inflates `input`, throwing `.outputLimit` once this call's output
+        /// passes `maxOutput` (the stream is then mid-message and should be
+        /// discarded). Memory stays bounded by `maxOutput` + one chunk.
+        func inflate(_ input: Data, maxOutput: Int = .max) throws -> Data {
             guard !input.isEmpty else { return Data() }
             var out = Data()
-            var chunk = [UInt8](repeating: 0, count: max(16_384, input.count * 4))
+            // Scratch buffer: ≥ 16 KB, ≤ 1 MB (input × 4 in between).
+            var chunk = [UInt8](repeating: 0, count: max(16_384, min(input.count, 1 << 18) * 4))
             let local = Data(input)   // contiguous, 0-based
             try local.withUnsafeBytes { (src: UnsafeRawBufferPointer) in
                 strm.pointee.next_in = UnsafeMutablePointer(mutating: src.bindMemory(to: Bytef.self).baseAddress!)
@@ -67,6 +78,9 @@ enum Zlib {
                         // Z_BUF_ERROR = no progress possible (input exhausted); not fatal.
                         guard rc == Z_OK || rc == Z_STREAM_END || rc == Z_BUF_ERROR else { throw ZlibError.stream(rc) }
                         return dst.count - Int(strm.pointee.avail_out)
+                    }
+                    guard produced <= maxOutput - out.count else {
+                        throw ZlibError.outputLimit(maxOutput)
                     }
                     out.append(contentsOf: chunk[0..<produced])
                     // Stop once all input is consumed and the output buffer

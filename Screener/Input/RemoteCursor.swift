@@ -20,6 +20,11 @@ import CoreGraphics
 import Foundation
 
 struct CursorImage: Equatable {
+    /// Largest cursor side accepted anywhere (parser, cache, texture). macOS
+    /// cursors are ≤ 256 px even at large accessibility sizes; a hostile or
+    /// corrupt server can't make us allocate more than 512² × 5 bytes.
+    static let maxDimension = 512
+
     var width: Int
     var height: Int
     var hotspot: PixelPoint
@@ -71,10 +76,28 @@ final class RemoteCursor {
     private var order: [UInt32] = []
     private var serial = 0
 
+    /// Raw BGRA + alpha plane (converted here; the session path hands over
+    /// premultiplied pixels instead — see `store(id:hotspot:size:rgba:)`).
     func store(id: UInt32, hotspot: PixelPoint, size: PixelSize, bgra: Data, alpha: Data) {
-        guard let rgba = CursorImage.premultipliedRGBA(bgra: bgra, alpha: alpha, pixels: size.width * size.height)
+        guard size.width >= 0, size.height >= 0,
+              size.width <= CursorImage.maxDimension, size.height <= CursorImage.maxDimension,
+              let rgba = CursorImage.premultipliedRGBA(bgra: bgra, alpha: alpha, pixels: size.width * size.height)
         else {
-            Log.input.debug("cursor \(id): size mismatch, ignored")
+            Log.input.debug("cursor \(id): bad size, ignored")
+            return
+        }
+        store(id: id, hotspot: hotspot, size: size, rgba: rgba)
+    }
+
+    /// Premultiplied RGBA8 (`ServerEvent.cursorStore`, converted off the main
+    /// actor by the parser). Ignored unless w, h ≤ `maxDimension` and
+    /// `rgba` is exactly w × h × 4 bytes.
+    func store(id: UInt32, hotspot: PixelPoint, size: PixelSize, rgba: Data) {
+        guard size.width >= 0, size.height >= 0,
+              size.width <= CursorImage.maxDimension, size.height <= CursorImage.maxDimension,
+              rgba.count == size.width * size.height * 4
+        else {
+            Log.input.debug("cursor \(id): bad size \(size.width)x\(size.height), ignored")
             return
         }
         serial += 1

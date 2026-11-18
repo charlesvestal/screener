@@ -251,6 +251,12 @@ actor MediaTransport {
         var adoptStall: Duration = .seconds(2)              // _SSRC_ADOPT_STALL_S
         var keyframeMinInterval: Duration = .milliseconds(250) // _FIR_MIN_INTERVAL_S
         var rawBufferLimit = 16_384                         // _UDP_DRAIN_QUEUE_MAX
+        /// Before activation the datagrams are unauthenticated (anyone on the
+        /// LAN can send to our ports): the buffer is also capped by total
+        /// bytes, and anything larger than one Ethernet-MTU datagram (the
+        /// server's RTP/RTCP never is) is dropped instead of buffered.
+        var pendingByteLimit = 32 << 20
+        var maxPendingDatagram = 1500
         /// `video` / `audio` stream buffers for a lagging consumer (newest kept).
         /// Large enough for a whole start burst (≤ rawBufferLimit) released at once.
         var videoBufferLimit = 16_384
@@ -374,6 +380,7 @@ actor MediaTransport {
 
     // Before activation: raw datagrams wait here (reference: burst drained into a list).
     private var pending: [(Flow, Data, ContinuousClock.Instant)] = []
+    private var pendingBytes = 0
 
     // After activation.
     private var activation: Activation?
@@ -512,9 +519,10 @@ actor MediaTransport {
         let k = a.keys
         videoDecryptor = try SRTPDecryptor(blob: k.videoKeyS)
         audioDecryptor = try SRTPDecryptor(blob: k.audioKeyS)
-        let videoRTCP = try SRTCPDecryptor(blob: k.videoKeyS)
-        let audioRTCP = try SRTCPDecryptor(blob: k.audioKeyS)
-        rtcpDecryptors = [.video: [videoRTCP, audioRTCP], .audio: [audioRTCP, videoRTCP]]
+        // One decryptor per (port, key): each keeps its own SRTCP replay
+        // window, so the two ports' index spaces never collide.
+        rtcpDecryptors = [.video: [try SRTCPDecryptor(blob: k.videoKeyS), try SRTCPDecryptor(blob: k.audioKeyS)],
+                          .audio: [try SRTCPDecryptor(blob: k.audioKeyS), try SRTCPDecryptor(blob: k.videoKeyS)]]
         rtcpEncryptor = try SRTCPEncryptor(blob: k.videoKeyV)
         audioRTCPEncryptor = try SRTCPEncryptor(blob: k.audioKeyV)
         if let s = a.ourAudioSSRC { keepaliveEncryptor = try SRTPEncryptor(blob: k.audioKeyV, ssrc: s) }
@@ -524,7 +532,7 @@ actor MediaTransport {
                        "buffered=\(pending.count)")
 
         let buffered = pending
-        pending = []
+        pending = []; pendingBytes = 0
         for (flow, data, at) in buffered { process(flow, data, at) }
 
         let deadline = tuning.burstDeadline
@@ -586,7 +594,7 @@ actor MediaTransport {
         groupLocked = false; burstLockScheduled = false
         burstVideo = []; burstResult = nil
         expectedGroupBuffer = []
-        pending = []
+        pending = []; pendingBytes = 0
         counters = Stats()
         Log.media.info("media transport reset for a fresh handshake (sockets kept)")
         if isOpen { startPunching() }
@@ -714,10 +722,22 @@ actor MediaTransport {
         case .audio: counters.audioDatagrams += 1; counters.audioBytes += data.count
         }
         guard activation != nil else {
-            if pending.count < tuning.rawBufferLimit { pending.append((flow, data, at)) } else { drops.increment() }
+            bufferPending(flow, data, at)
             return
         }
         process(flow, data, at)
+    }
+
+    /// Pre-activation buffering, bounded by count, total bytes and datagram size.
+    private func bufferPending(_ flow: Flow, _ data: Data, _ at: ContinuousClock.Instant) {
+        guard data.count <= tuning.maxPendingDatagram,
+              pending.count < tuning.rawBufferLimit,
+              pendingBytes + data.count <= tuning.pendingByteLimit else {
+            drops.increment()
+            return
+        }
+        pending.append((flow, data, at))
+        pendingBytes += data.count
     }
 
     private func process(_ flow: Flow, _ data: Data, _ at: ContinuousClock.Instant) {

@@ -45,9 +45,10 @@ final class ControlSessionTests: XCTestCase {
         /// rekey, immediately followed (same TCP write) by an encrypted 0x14
         /// heartbeat record — the ciphertext tail the prelude parser must hand
         /// to the record layer.
-        func sendRekeyWithEncryptedTail() async throws {
+        func sendRekeyWithEncryptedTail(injectedBefore: Data = Data()) async throws {
             mirror = try RecordLayer(rekeyBody: rekeyBody, wrapKey: ControlSessionTests.wrapKey)
             var w = ByteWriter()
+            w.bytes(injectedBefore)
             w.u8(0); w.u8(0); w.u16(2)
             w.zeros(8); w.u32(0x3F2); w.u16(3); w.bytes([1, 2, 3])
             w.zeros(8); w.u32(0x44F); w.bytes(rekeyBody)
@@ -370,6 +371,50 @@ final class ControlSessionTests: XCTestCase {
         let failure = await session.failure
         XCTAssertEqual(failure as? RecordLayerError, .integrity)
         do { try await session.send(ClientMessage.setMode(1)); XCTFail("send after close") } catch {}
+    }
+
+    /// Security review M1: plaintext prelude messages are unauthenticated —
+    /// an on-path attacker could inject a layout, cursor shapes or a fake
+    /// answer before the rekey. None of them may reach the event stream.
+    func testPlaintextPreludeEventsAreDropped() async throws {
+        let (client, server) = MemoryPipe.pair()
+        let fake = FakeServer(server)
+        let bplist = try Self.answerBplist()
+        let session = makeSession(client, order: .reference)
+        var inj = ByteWriter()
+        inj.u8(0x14); inj.u8(0); inj.u16(4); inj.u16(1); inj.u16(2)        // 0x14 cmd 2 (clipboard changed)
+        inj.u8(0); inj.u8(0); inj.u16(3)                                   // FBU, 3 rects
+        inj.zeros(8); inj.u32(0x451)                                       // fake layout 7680x4320
+        inj.u16(12); inj.u16(0); inj.u16(0); inj.u16(3840); inj.u16(2160); inj.u16(7680); inj.u16(4320)
+        inj.zeros(8); inj.u32(0x450); inj.u32(77); inj.u32(0)              // cursor SELECT 77
+        inj.zeros(8); inj.u32(0x3F2); inj.u16(UInt16(bplist.count)); inj.bytes(bplist)   // forged answer
+        let serverTask = Task {
+            try await fake.handshakeAndServerInit()
+            _ = try await server.read(exactly: 78)
+            try await fake.sendRekeyWithEncryptedTail(injectedBefore: inj.data)
+            _ = try await fake.readPlainSetDisplayConfiguration()
+            _ = try await fake.readPlainSetEncodings()
+            _ = try await server.read(exactly: 8)
+            for _ in 0..<3 { _ = try await fake.readRecord() }
+            try await fake.sendAnswer(bplist)
+        }
+        _ = try await session.start()
+        try await serverTask.value
+        var it = session.events.makeAsyncIterator()
+        let first = await it.next()
+        XCTAssertEqual(first, .miscStatus(cmd: 12), "the first event must be the encrypted heartbeat")
+        await session.close()
+    }
+
+    func testMidSessionRekeyClosesTheSessionWithAnError() async throws {
+        let (session, fake) = try await startedSession()
+        var w = ByteWriter()
+        w.u8(0); w.u8(0); w.u16(1)
+        w.zeros(8); w.u32(0x44F); w.bytes(fake.rekeyBody)
+        try await fake.sendRecord(w.data)
+        for await _ in session.events {}   // returns once the stream finishes
+        let failure = await session.failure
+        XCTAssertEqual(failure as? ControlSessionError, .midSessionRekey)
     }
 
     // MARK: errors

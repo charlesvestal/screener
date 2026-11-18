@@ -159,7 +159,7 @@ final class MetalRenderer: NSObject, MTKViewDelegate {
     private var thumbVersion: Int?
     private var thumbRetryPending = false
     static let thumbnailInterval = 0.25
-    static let thumbnailWidth = 256
+    nonisolated static let thumbnailWidth = 256
     /// The scene texture is released after this long without ripples.
     static let sceneIdle = 3.0
     private let cursor: RemoteCursor?
@@ -572,8 +572,7 @@ final class MetalRenderer: NSObject, MTKViewDelegate {
             }
             return
         }
-        let w = Self.thumbnailWidth
-        let h = max(1, Int((CGFloat(w) * layout.canvas.height / layout.canvas.width).rounded()))
+        let (w, h) = Self.thumbnailSize(canvas: layout.canvas)
         if thumbTexture?.width != w || thumbTexture?.height != h {
             let desc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: Self.colorPixelFormat, width: w, height: h,
                                                                 mipmapped: false)
@@ -600,6 +599,19 @@ final class MetalRenderer: NSObject, MTKViewDelegate {
                 MainActor.assumeIsolated { feedback?.setThumbnail(sendable.image) }
             }
         }
+    }
+
+    /// Largest thumbnail side: the canvas aspect comes from the server's
+    /// 0x451, so a degenerate 1×65535 layout must not size a 256×16M texture.
+    nonisolated static let thumbnailMaxHeight = 4 * thumbnailWidth
+
+    /// `thumbnailWidth` wide, canvas-aspect tall, clamped to
+    /// 1…`thumbnailMaxHeight` (and 1 for a non-finite / empty aspect).
+    nonisolated static func thumbnailSize(canvas: CGSize) -> (width: Int, height: Int) {
+        let w = thumbnailWidth
+        let ratio = canvas.width > 0 ? canvas.height / canvas.width : 0
+        guard ratio.isFinite, ratio > 0 else { return (w, 1) }
+        return (w, Int(min(max(1, (CGFloat(w) * ratio).rounded()), CGFloat(thumbnailMaxHeight))))
     }
 
     /// A BGRA8 shared texture → CGImage (sRGB).
@@ -667,6 +679,9 @@ final class MetalRenderer: NSObject, MTKViewDelegate {
 
     private func cursorTexture(for img: CursorImage) -> MTLTexture? {
         if cursorTextureSerial == img.serial, let t = cursorTexture { return t }
+        // RemoteCursor already enforces this; the texture never trusts it.
+        guard img.width <= CursorImage.maxDimension, img.height <= CursorImage.maxDimension,
+              img.rgba.count == img.width * img.height * 4 else { return nil }
         let desc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba8Unorm, width: img.width,
                                                             height: img.height, mipmapped: false)
         desc.usage = .shaderRead

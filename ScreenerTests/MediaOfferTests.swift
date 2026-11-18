@@ -93,6 +93,33 @@ final class MediaOfferTests: XCTestCase {
         XCTAssertThrowsError(try MediaStreamOptions.parseAnswer(Data()))
     }
 
+    // MARK: hostile answers (security review M1)
+
+    func testParseAnswerOnManyBplistMarkersIsBounded() {
+        // 64 KB of "bplist00" = 8192 markers: the old scan tried every one
+        // against every end offset (~O(n²)); now ≤ 8 markers × n cheap checks.
+        let junk = Data((0..<8192).flatMap { _ in Array("bplist00".utf8) })
+        let t0 = Date()
+        XCTAssertThrowsError(try MediaStreamOptions.parseAnswer(junk))
+        XCTAssertLessThan(Date().timeIntervalSince(t0), 1.0)
+    }
+
+    func testParseAnswerStillFindsARealAnswerAfterAFewJunkMarkers() throws {
+        var d = Data("bplist00xx".utf8) + Data("bplistyy".utf8)
+        d.append(Data(hexArg("answer_msg").dropFirst()))
+        let a = try MediaStreamOptions.parseAnswer(d)
+        XCTAssertEqual([a.canvasWidth, a.canvasHeight], [3840, 2160])
+    }
+
+    func testParseAnswerMediaBlobBombIsCapped() throws {
+        let bomb = try ZlibTests.bomb(megabytes: 64)
+        let plist = try PropertyListSerialization.data(fromPropertyList: ["avcMediaStreamNegotiatorMediaBlob": bomb],
+                                                       format: .binary, options: 0)
+        let before = ZlibTests.peakFootprint()
+        XCTAssertThrowsError(try MediaStreamOptions.parseAnswer(plist))
+        XCTAssertLessThan(ZlibTests.peakFootprint() &- before, 32 << 20)
+    }
+
     func testEndpointModelOverride() {
         setenv("SCREENER_ENDPOINT_MODEL", "Mac16,10", 1)
         defer { unsetenv("SCREENER_ENDPOINT_MODEL") }

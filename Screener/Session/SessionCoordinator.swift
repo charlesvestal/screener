@@ -665,8 +665,8 @@ final class SessionCoordinator {
                     cursor.setPointScale(hostPointScale)
                 }
             }
-        case .cursorStore(let id, let hotspot, let size, let bgra, let alpha):
-            cursor.store(id: id, hotspot: hotspot, size: size, bgra: bgra, alpha: alpha)
+        case .cursorStore(let id, let hotspot, let size, let rgba):
+            cursor.store(id: id, hotspot: hotspot, size: size, rgba: rgba)
         case .cursorSelect(let id):
             cursor.select(id: id)
         case .miscStatus, .clipboard:

@@ -154,7 +154,7 @@ final class ServerMessagesTests: XCTestCase {
         XCTAssertEqual(try p.feed(msg.prefix(cut)), [], "incomplete rect must wait for the next record")
         let events = try p.feed(msg.dropFirst(cut))
         XCTAssertEqual(events, [.cursorStore(id: 1001, hotspot: PixelPoint(x: 3, y: 4), size: PixelSize(width: 2, height: 2),
-                                             bgra: bgra, alpha: alpha)])
+                                             rgba: CursorImage.premultipliedRGBA(bgra: bgra, alpha: alpha, pixels: 4)!)])
         // The parser is idle again: a fresh record parses normally.
         XCTAssertEqual(try p.feed(Data(hex: "1400000400010002")), [.miscStatus(cmd: 2)])
     }
@@ -180,7 +180,7 @@ final class ServerMessagesTests: XCTestCase {
         XCTAssertEqual(try p.feed(msg[c1..<c2]), [])
         XCTAssertEqual(try p.feed(msg.dropFirst(c2)),
                        [.cursorStore(id: 1001, hotspot: PixelPoint(x: 3, y: 4), size: PixelSize(width: 2, height: 2),
-                                     bgra: bgra, alpha: alpha)])
+                                     rgba: CursorImage.premultipliedRGBA(bgra: bgra, alpha: alpha, pixels: 4)!)])
     }
 
     func testCursorCutBeforeLengthIsDropped() throws {
@@ -198,6 +198,42 @@ final class ServerMessagesTests: XCTestCase {
         var p = ServerMessageParser()
         XCTAssertEqual(try p.feed(fbu([rect(0x450, w: 2, h: 2, body.data)])), [.unknown(type: 0x00, encoding: 0x450)])
         XCTAssertEqual(try p.feed(Data(hex: "1400000400010002")), [.miscStatus(cmd: 2)])
+    }
+
+    func testOversizedCursorIsSkippedAndTheWalkContinues() throws {
+        // 513×4 exceeds CursorImage.maxDimension: no STORE, reported as
+        // unknown, the rect is consumed by its comp_len and the next rect parses.
+        let w = CursorImage.maxDimension + 1
+        let z = zlibStored(Data(count: w * 4 * 5))
+        var body = ByteWriter(); body.u32(1003); body.u32(UInt32(z.count)); body.bytes(z)
+        var sel = ByteWriter(); sel.u32(1000); sel.u32(0)
+        var p = ServerMessageParser()
+        XCTAssertEqual(try p.feed(fbu([rect(0x450, w: UInt16(w), h: 4, body.data), rect(0x450, sel.data)])),
+                       [.unknown(type: 0x00, encoding: 0x450), .cursorSelect(id: 1000)])
+    }
+
+    func testHugeCursorDimensionsDoNotJustifyAHugeCompLen() throws {
+        // 65535×65535 used to allow a ~21 GB comp_len; the bound now uses the
+        // capped size, so a 4 MB claim aborts the record immediately.
+        var body = ByteWriter(); body.u32(1001); body.u32(4 << 20); body.bytes(Data(count: 16))
+        var p = ServerMessageParser()
+        XCTAssertEqual(try p.feed(fbu([rect(0x450, w: 0xFFFF, h: 0xFFFF, body.data)])),
+                       [.unknown(type: 0x00, encoding: 0x450)])
+        XCTAssertEqual(try p.feed(Data(hex: "1400000400010002")), [.miscStatus(cmd: 2)])
+    }
+
+    func testCursorZlibBombIsDroppedAtTheSizeCap() throws {
+        // 128×128 cursor (80 KB expected) whose zlib stream inflates to 64 MB:
+        // inflation stops at w*h*5 and the STORE is dropped.
+        let z = try ZlibTests.bomb(megabytes: 64)
+        XCTAssertLessThanOrEqual(z.count, 128 * 128 * 5)
+        var body = ByteWriter(); body.u32(1004); body.u32(UInt32(z.count)); body.bytes(z)
+        var sel = ByteWriter(); sel.u32(1000); sel.u32(0)
+        var p = ServerMessageParser()
+        let before = ZlibTests.peakFootprint()
+        XCTAssertEqual(try p.feed(fbu([rect(0x450, w: 128, h: 128, body.data), rect(0x450, sel.data)])),
+                       [.cursorSelect(id: 1000)])
+        XCTAssertLessThan(ZlibTests.peakFootprint() &- before, 32 << 20)
     }
 
     func testCursorSelect() throws {

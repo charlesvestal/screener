@@ -171,6 +171,35 @@ final class MediaTransportTests: XCTestCase {
         await t.close()
     }
 
+    /// Security review L2: before activation nothing is authenticated, so
+    /// the buffer drops jumbo datagrams and stops at its byte budget.
+    func testPreActivationBufferDropsOversizedDatagramsAndHonoursItsByteBudget() async throws {
+        let ch = FakeChannels()
+        var tuning = fastTuning
+        tuning.pendingByteLimit = 3000
+        let t = make(ch, tuning: tuning)
+        try await t.open()
+        let enc = try videoSender(0x2000)
+        ch.video.deliver(Data(count: 1501))                                   // jumbo: dropped
+        ch.video.deliver(Data(count: 65_000))                                 // jumbo: dropped
+        var sizes: [Int] = []
+        for _ in 0..<5 {
+            let w = try enc.encrypt(Data(count: 900), pt: 100)                 // ~922 B each
+            sizes.append(w.count)
+            ch.video.deliver(w)
+        }
+        try await waitUntil("raw seen") { await t.stats.videoDatagrams == 7 }
+        try await t.activate(activation)
+        let s = await t.stats
+        let fit = sizes.reduce(into: (n: 0, bytes: 0)) { acc, n in
+            if acc.bytes + n <= 3000 { acc.n += 1; acc.bytes += n }
+        }.n
+        XCTAssertEqual(fit, 3)
+        XCTAssertEqual(s.videoPackets, fit, "only what fits the byte budget is kept")
+        XCTAssertEqual(s.droppedDatagrams, 2 + (5 - fit))
+        await t.close()
+    }
+
     // MARK: RTCP routing
 
     func testServerRTCPIsRoutedToSRTCPAndFeedsTheReceiverReport() async throws {
