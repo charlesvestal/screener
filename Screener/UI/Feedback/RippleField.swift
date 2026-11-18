@@ -21,6 +21,15 @@
 // refraction, no growth); the pulse is a static faint ring (not animated, so
 // it costs no frames).
 //
+// Visibility on any background: refraction and a white crest vanish over
+// white windows, so every ring also carries a thin tinted rim (`rimTint`,
+// the app's indigo→teal accent; the right click's echo keeps its own
+// `echoRimTint`). The shader makes the rim luminance-adaptive: over light
+// pixels it darkens toward a deeper tint (multiply-like), over dark ones it
+// glows lighter (screen-like) — see Shaders.metal `rippleFragment`. Clicks get
+// a faint rim; the drag pulse, a state indicator, a solid-ish breathing ring
+// with a soft outer glow. All the rim strengths are the constants below.
+//
 // At most `maxCount` ripples exist (the shader's uniform array): a new one
 // beyond that replaces the oldest transient one. Times are seconds on one
 // monotonic clock (FeedbackCenter.now); points are BASE view points.
@@ -57,6 +66,16 @@ struct RippleSample: Equatable, Sendable {
     var highlight: CGFloat
     /// Highlight colour (linear-ish RGB).
     var tint: SIMD3<Float>
+    /// Tinted rim: peak opacity (0 = none), drawn at `rimRadius`.
+    var rim: CGFloat = 0
+    /// Tinted rim radius (points); usually `radius`.
+    var rimRadius: CGFloat = 0
+    /// Tinted rim half-width (points) of its solid core (edges are soft).
+    var rimWidth: CGFloat = 1
+    /// Soft outer glow around the rim: opacity (0 = none); spreads 5 × `rimWidth`.
+    var rimGlow: CGFloat = 0
+    /// Rim colour.
+    var rimTint = RippleField.rimTint
 }
 
 struct RippleField: Equatable, Sendable {
@@ -83,6 +102,29 @@ struct RippleField: Equatable, Sendable {
 
     static let white = SIMD3<Float>(1, 1, 1)
     static let echoTint = SIMD3<Float>(0.55, 0.78, 1)
+
+    // MARK: tinted rim (visible on white as well as dark — see the header)
+
+    /// The rim's accent: a soft blue-teal between the icon's indigo and teal.
+    static let rimTint = SIMD3<Float>(0.16, 0.60, 0.92)
+    /// The right click's echo rim: indigo, distinct from the plain rim.
+    static let echoRimTint = SIMD3<Float>(0.45, 0.38, 1.0)
+    /// Click rings: rim peak opacity at birth (fades linearly over the ring's life,
+    /// a little slower than the crest, so it still reads on white mid-ring).
+    static let clickRimAlpha: CGFloat = 0.34
+    /// Click rings: rim half-width (points).
+    static let clickRimWidth: CGFloat = 0.9
+    /// Drag pulse: the breathing rim's opacity range (min…max).
+    static let pulseRimAlpha: ClosedRange<CGFloat> = 0.5...0.68
+    /// Drag pulse: the rim's radius (points), ± `pulseRimBreath` with the breath.
+    static let pulseRimRadius: CGFloat = 22
+    static let pulseRimBreath: CGFloat = 1.5
+    /// Drag pulse: rim half-width (points): a ~2.5 pt ring.
+    static let pulseRimWidth: CGFloat = 1.25
+    /// Drag pulse: soft outer glow opacity.
+    static let pulseGlowAlpha: CGFloat = 0.22
+    /// Reduce Motion: the static/fading rim's opacity.
+    static let reducedRimAlpha: CGFloat = 0.45
 
     /// Transient ripples, oldest first.
     private(set) var ripples: [Ripple] = []
@@ -171,27 +213,42 @@ struct RippleField: Equatable, Sendable {
         let age = now - r.start
         guard age >= 0, age < duration(r) else { return nil }
         let tint = r.echo ? echoTint : white
+        let rimTint = r.echo ? echoRimTint : rimTint
         switch r.kind {
         case .ring:
             let p = CGFloat(age / ringDuration)
             let e = 1 - pow(1 - p, 3)                               // easeOutCubic
             let k = r.echo ? echoStrength : 1
-            return RippleSample(center: r.center, radius: 4 + (ringMaxRadius - 4) * e,
-                                // Gentler decay than the radius ease: stays visible longer.
-                                amplitude: ringAmplitude * pow(1 - p, 1.5) * k,
-                                width: 14 + 10 * p, highlight: 0.32 * pow(1 - p, 1.5) * k, tint: tint)
+            let radius = 4 + (ringMaxRadius - 4) * e
+            // Gentler decay than the radius ease: stays visible longer.
+            let decay = pow(1 - p, 1.5)
+            return RippleSample(center: r.center, radius: radius, amplitude: ringAmplitude * decay * k,
+                                width: 14 + 10 * p, highlight: 0.32 * decay * k, tint: tint,
+                                rim: clickRimAlpha * (1 - p) * k, rimRadius: radius, rimWidth: clickRimWidth,
+                                rimTint: rimTint)
         case .fade:
             let p = CGFloat(age / fadeDuration)
             return RippleSample(center: r.center, radius: 24, amplitude: 0, width: 6,
-                                highlight: 0.45 * (1 - p), tint: tint)
+                                highlight: 0.45 * (1 - p), tint: tint,
+                                rim: reducedRimAlpha * (1 - p), rimRadius: 24, rimWidth: clickRimWidth,
+                                rimTint: rimTint)
         case .pulse:
             if r.reduced {
-                return RippleSample(center: r.center, radius: 26, amplitude: 0, width: 5, highlight: 0.2, tint: tint)
+                return RippleSample(center: r.center, radius: 26, amplitude: 0, width: 5, highlight: 0.2, tint: tint,
+                                    rim: reducedRimAlpha, rimRadius: pulseRimRadius, rimWidth: pulseRimWidth,
+                                    rimGlow: pulseGlowAlpha * 0.7, rimTint: rimTint)
             }
             let phase = CGFloat((age / pulsePeriod).truncatingRemainder(dividingBy: 1))
+            // The breath: 0 → 1 → 0 over a period, smooth at the wrap.
+            let breath = 0.5 - 0.5 * cos(2 * .pi * phase)
             return RippleSample(center: r.center, radius: 18 + 30 * phase,
                                 amplitude: 3.5 * 4 * phase * (1 - phase), width: 10,
-                                highlight: 0.22 * (1 - phase), tint: tint)
+                                highlight: 0.22 * (1 - phase), tint: tint,
+                                rim: pulseRimAlpha.lowerBound
+                                    + (pulseRimAlpha.upperBound - pulseRimAlpha.lowerBound) * breath,
+                                rimRadius: pulseRimRadius + pulseRimBreath * (2 * breath - 1),
+                                rimWidth: pulseRimWidth, rimGlow: pulseGlowAlpha * (0.7 + 0.3 * breath),
+                                rimTint: rimTint)
         }
     }
 }

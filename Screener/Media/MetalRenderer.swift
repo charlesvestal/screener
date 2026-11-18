@@ -512,8 +512,12 @@ final class MetalRenderer: NSObject, MTKViewDelegate {
     }
 
     /// Ripple uniforms: [size.x, size.y, count, 0] then per ripple
-    /// [cx, cy, radius, amplitude] [width, highlight, 0, 0] [tint.rgb, 0]
-    /// (pixels). Shaders.metal `rippleFragment`.
+    /// [cx, cy, radius, amplitude] [width, highlight, rim, rimWidth]
+    /// [tint.rgb, rimGlow] [rimTint.rgb, rimRadius] (pixels).
+    /// Shaders.metal `rippleFragment`.
+    /// float4s per ripple in `rippleUniforms` (Shaders.metal `rippleFragment`).
+    static let rippleStride = 4
+
     static func rippleUniforms(_ ripples: [RippleSample], size: CGSize, pixelsPerPoint k: CGFloat,
                                zoom: Viewport) -> [SIMD4<Float>] {
         let list = ripples.prefix(RippleField.maxCount)
@@ -521,10 +525,12 @@ final class MetalRenderer: NSObject, MTKViewDelegate {
         for r in list {
             let c = zoom.toScreen(CGPoint(x: r.center.x * k, y: r.center.y * k), viewSize: size)
             u.append(SIMD4(Float(c.x), Float(c.y), Float(r.radius * k), Float(r.amplitude * k)))
-            u.append(SIMD4(Float(max(1, r.width * k)), Float(r.highlight), 0, 0))
-            u.append(SIMD4(r.tint, 0))
+            u.append(SIMD4(Float(max(1, r.width * k)), Float(r.highlight), Float(r.rim),
+                           Float(max(0.5, r.rimWidth * k))))
+            u.append(SIMD4(r.tint, Float(r.rimGlow)))
+            u.append(SIMD4(r.rimTint, Float(r.rimRadius * k)))
         }
-        while u.count < 1 + 3 * RippleField.maxCount { u.append(.zero) }
+        while u.count < 1 + Self.rippleStride * RippleField.maxCount { u.append(.zero) }
         return u
     }
 

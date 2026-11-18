@@ -54,6 +54,12 @@ final class RippleFieldTests: XCTestCase {
         XCTAssertEqual(s.count, 2)
         XCTAssertEqual(s[0].tint, RippleField.white)
         XCTAssertEqual(s[1].tint, RippleField.echoTint)
+        // Both carry a tinted rim; the echo's is its own colour.
+        XCTAssertEqual(s[0].rimTint, RippleField.rimTint)
+        XCTAssertEqual(s[1].rimTint, RippleField.echoRimTint)
+        XCTAssertNotEqual(RippleField.rimTint, RippleField.echoRimTint)
+        XCTAssertGreaterThan(s[0].rim, 0)
+        XCTAssertEqual(s[0].rimRadius, s[0].radius)
         let plain = RippleField.sample(Ripple(kind: .ring, center: p, start: 0), at: 0.01)!
         XCTAssertLessThan(s[1].amplitude, plain.amplitude)
     }
@@ -84,6 +90,21 @@ final class RippleFieldTests: XCTestCase {
         XCTAssertFalse(f.isAnimating(at: 102))
     }
 
+    func testDragPulseHasAStrongerBreathingTintedRim() {
+        var f = RippleField()
+        f.setPulse(at: p, now: 0, reduceMotion: false)
+        let rims = stride(from: 0.0, to: RippleField.pulsePeriod, by: 0.05).map { f.samples(at: $0)[0] }
+        for s in rims {
+            XCTAssertTrue(RippleField.pulseRimAlpha.contains(s.rim))
+            XCTAssertEqual(s.rimTint, RippleField.rimTint)
+            XCTAssertGreaterThan(s.rimGlow, 0)
+            XCTAssertEqual(s.rimRadius, RippleField.pulseRimRadius, accuracy: RippleField.pulseRimBreath + 1e-6)
+        }
+        // It breathes, and is always stronger than a click's rim at birth.
+        XCTAssertGreaterThan(rims.map(\.rim).max()! - rims.map(\.rim).min()!, 0.1)
+        XCTAssertGreaterThan(rims.map(\.rim).min()!, RippleField.clickRimAlpha)
+    }
+
     func testReduceMotionGivesInPlaceFadesWithoutDistortion() {
         for v in [RippleVariant.click, .doubleClick, .rightClick] {
             var f = RippleField()
@@ -99,6 +120,8 @@ final class RippleFieldTests: XCTestCase {
         f.setPulse(at: p, now: 0, reduceMotion: true)
         XCTAssertFalse(f.isAnimating(at: 1))
         XCTAssertEqual(f.samples(at: 1).first?.amplitude, 0)
+        XCTAssertEqual(f.samples(at: 1), f.samples(at: 2))                // static
+        XCTAssertGreaterThan(f.samples(at: 1).first?.rim ?? 0, 0)         // a tinted ring
     }
 }
 
@@ -561,17 +584,20 @@ final class RippleRenderTests: XCTestCase {
 
     func testRippleUniformsMapThroughZoomAndPixels() {
         let s = RippleSample(center: CGPoint(x: 50, y: 25), radius: 10, amplitude: 4, width: 6, highlight: 0.3,
-                             tint: RippleField.echoTint)
+                             tint: RippleField.echoTint, rim: 0.25, rimRadius: 11, rimWidth: 1.5, rimGlow: 0.125,
+                             rimTint: RippleField.echoRimTint)
         var zoom = Viewport()
         zoom.zoom(by: 2, around: .zero, viewSize: CGSize(width: 200, height: 100),
                   content: CGRect(x: 0, y: 0, width: 200, height: 100))
         let u = MetalRenderer.rippleUniforms([s], size: CGSize(width: 400, height: 200), pixelsPerPoint: 2, zoom: zoom)
-        XCTAssertEqual(u.count, 1 + 3 * RippleField.maxCount)
+        XCTAssertEqual(MetalRenderer.rippleStride, 4)
+        XCTAssertEqual(u.count, 1 + MetalRenderer.rippleStride * RippleField.maxCount)
         XCTAssertEqual(u[0], SIMD4(400, 200, 1, 0))
         // (50, 25) pt → (100, 50) px → ×2 about the origin → (200, 100).
         XCTAssertEqual(u[1], SIMD4(200, 100, 20, 8))
-        XCTAssertEqual(u[2], SIMD4(12, 0.3, 0, 0))
-        XCTAssertEqual(u[3], SIMD4(RippleField.echoTint, 0))
+        XCTAssertEqual(u[2], SIMD4(12, 0.3, 0.25, 3))                      // rim width in pixels
+        XCTAssertEqual(u[3], SIMD4(RippleField.echoTint, 0.125))
+        XCTAssertEqual(u[4], SIMD4(RippleField.echoRimTint, 22))            // rim radius in pixels
         // At most maxCount ripples reach the shader.
         let many = MetalRenderer.rippleUniforms(Array(repeating: s, count: 12), size: CGSize(width: 1, height: 1),
                                                 pixelsPerPoint: 1, zoom: .identity)
