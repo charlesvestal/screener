@@ -115,6 +115,7 @@ struct RemoteScreenView: UIViewRepresentable {
         // the pointer position for keeping the pill out of the cursor's way.
         view.remoteInput.modifiers = menu.modifiers
         menu.sink = view.remoteInput
+        view.remoteInput.controlMenu = menu
         let expanded = $menuExpanded
         view.remoteInput.onToggleMenu = { expanded.wrappedValue.toggle() }
         view.remoteInput.onInputReleased = { [weak menu] in menu?.inputWasReleased() }
@@ -127,6 +128,7 @@ struct RemoteScreenView: UIViewRepresentable {
         view.remoteInput.input = nil
         view.remoteInput.cursor = nil
         view.remoteInput.modifiers = nil
+        view.remoteInput.controlMenu = nil
         view.remoteInput.onPointerMoved = nil
         coordinator.renderer?.detach()
         coordinator.renderer = nil

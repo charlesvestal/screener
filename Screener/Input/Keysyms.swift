@@ -88,6 +88,57 @@ enum Keysyms {
         }
     }
 
+    /// The US-layout unshifted keysym of a shifted printable keysym ("A" → "a",
+    /// "?" → "/", "!" → "1"), nil if `keysym` isn't one. A soft-keyboard
+    /// character under a sticky ⌘/⌥/⌃ goes as this plus Shift, as a hardware
+    /// chord does (⌘⇧/ sends Super + Shift + '/').
+    static func usUnshifted(_ keysym: UInt32) -> UInt32? { unshiftOf[keysym] }
+
+    /// The US-layout shifted keysym of an unshifted printable keysym ("a" →
+    /// "A", "1" → "!"), nil if it has none. A soft-keyboard character under a
+    /// sticky ⇧ alone goes as the final (shifted) character, as hardware does.
+    static func usShifted(_ keysym: UInt32) -> UInt32? { shiftOf[keysym] }
+
+    private static let unshiftOf: [UInt32: UInt32] = {
+        var m: [UInt32: UInt32] = [:]
+        for (_, pair) in printable where pair.0 != pair.1 {
+            m[pair.1.unicodeScalars.first!.value] = pair.0.unicodeScalars.first!.value
+        }
+        return m
+    }()
+
+    private static let shiftOf: [UInt32: UInt32] = {
+        var m: [UInt32: UInt32] = [:]
+        for (_, pair) in printable where pair.0 != pair.1 {
+            m[pair.0.unicodeScalars.first!.value] = pair.1.unicodeScalars.first!.value
+        }
+        return m
+    }()
+
+    /// The modifier flag a modifier key sets (nil for Caps Lock and non-modifiers):
+    /// used to drop a hardware modifier hold whose key-up never arrived.
+    static func modifierFlag(_ usage: UIKeyboardHIDUsage) -> UIKeyModifierFlags? {
+        switch usage {
+        case .keyboardLeftControl, .keyboardRightControl: .control
+        case .keyboardLeftShift, .keyboardRightShift: .shift
+        case .keyboardLeftAlt, .keyboardRightAlt: .alternate
+        case .keyboardLeftGUI, .keyboardRightGUI: .command
+        default: nil
+        }
+    }
+
+    /// Each chord modifier flag with its left keysym and both sides' keysyms,
+    /// in press order (⌃ ⌥ ⇧ ⌘, as StickyModifier).
+    static let flagKeysyms: [(flag: UIKeyModifierFlags, left: UInt32, sides: Set<UInt32>)] = [
+        (.control, 0xffe3, [0xffe3, 0xffe4]),
+        (.alternate, 0xffe9, [0xffe9, 0xffea]),
+        (.shift, shiftL, [shiftL, 0xffe2]),
+        (.command, superL, [superL, 0xffec]),
+    ]
+
+    /// The canonical press order of the left modifier keysyms.
+    static let modifierPressOrder: [UInt32] = flagKeysyms.map(\.left)
+
     private static let shiftedCharacters: Set<Unicode.Scalar> = {
         var s = Set("ABCDEFGHIJKLMNOPQRSTUVWXYZ".unicodeScalars)
         for (_, pair) in printable where pair.0 != pair.1 { s.insert(pair.1.unicodeScalars.first!) }
@@ -188,6 +239,16 @@ struct HardwareKeyState {
         guard let ks else { return nil }
         held[usage.rawValue] = ks
         return ks
+    }
+
+    /// The key is down (its key-up hasn't been seen).
+    func isHeld(_ usage: UIKeyboardHIDUsage) -> Bool { held[usage.rawValue] != nil }
+
+    /// The modifier keys (Shift/Control/Option/Command, either side; not Caps
+    /// Lock) currently down.
+    var heldModifierUsages: [UIKeyboardHIDUsage] {
+        held.keys.compactMap { UIKeyboardHIDUsage(rawValue: $0) }
+            .filter { Keysyms.modifierFlag($0) != nil }
     }
 
     /// The keysym to send as key-up (nil if the key never went down).

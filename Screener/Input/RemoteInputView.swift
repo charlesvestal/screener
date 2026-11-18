@@ -42,13 +42,36 @@
 // (buttons 0 at the last host position) are released when focus is lost,
 // the app resigns active or the view's scene deactivates, before `input` is
 // switched (on the OLD controller), and on `releaseAll()` (session teardown).
-// iPadOS system shortcuts (⌘H, ⌘Tab, …) are not captured here (Task 22).
 // Sticky modifiers (the floating menu's ⌘ ⌥ ⌃ ⇧, `modifiers`) are held
 // around the next hardware key, soft-keyboard character, Delete, or pointer
 // click/drag (latched ones then clear). Every modifier hold — hardware,
 // sticky, the menu's shortcuts — is reference-counted per keysym, so the Mac
 // sees one down and one up however many sources hold it (no double-downs).
 // ⌘⌥M toggles the floating menu (a UIKeyCommand; the M is not forwarded).
+//
+// Modifier chords on every key path — the Mac sees, for e.g. ⌥⌫:
+//   Alt_L↓ BackSpace↓ [BackSpace↓ … while held] BackSpace↑ Alt_L↑
+//   - Hardware: the modifier keys are forwarded as their own holds. Each
+//     non-modifier key-down is also checked against UIKey.modifierFlags:
+//     a modifier the flags report but whose key-down never reached us (held
+//     before focus arrived, eaten by iPadOS) is held around the key, and a
+//     hardware modifier hold whose flag is gone (its key-up was lost) is
+//     released — the Mac never keeps a stuck ⌘.
+//   - Hardware chords iPadOS might take before pressesBegan (the iPadOS 26
+//     menu bar's ⌘W/⌘Q/⌘M/⌘N/…, standard edit actions) are claimed as
+//     UIKeyCommands with wantsPriorityOverSystemBehavior and forwarded as a
+//     key tap (`forwardedChords`). System-reserved chords (⌘Tab, ⌘Space, ⌘H,
+//     ⌘⇧3/4/5, Globe chords) never reach any app: the floating menu's Mac
+//     Shortcuts send those.
+//   - On-screen keyboard: characters and Delete get the sticky modifiers.
+//     Under ⌘/⌥/⌃ a character goes as its unshifted US keysym (+ Shift if it
+//     needed one), as a hardware chord does; under ⇧ alone as the shifted US
+//     character. The keyboard repeats a held Delete itself: deletes that
+//     follow within `softDeleteCarry` keep the modifiers the first one used,
+//     so a held ⌥⌫ keeps deleting words.
+//   - The keyboard accessory row (KeyboardAccessoryBar: ⌘ ⌥ ⌃ ⇧ esc ⇥ ← ↑
+//     ↓ →) and the menu's special keys go through ControlMenuModel (sticky +
+//     fn layer, hold-to-repeat with the modifiers held).
 import UIKit
 
 @MainActor
@@ -102,6 +125,11 @@ final class RemoteInputView: UIView, UIPointerInteractionDelegate, UIGestureReco
     var modifiers: StickyModifiers?
     /// ⌘⌥M on a hardware keyboard.
     var onToggleMenu: (() -> Void)?
+    /// The floating menu's model: the keyboard accessory row's keys go
+    /// through it (shared sticky modifiers, fn layer, repeat).
+    weak var controlMenu: ControlMenuModel? {
+        didSet { keyboardAccessory.menu = controlMenu }
+    }
     /// Everything held was released on the wire (focus loss, teardown, a
     /// controller switch): holders such as the menu forget their holds.
     var onInputReleased: (() -> Void)?
@@ -116,6 +144,17 @@ final class RemoteInputView: UIView, UIPointerInteractionDelegate, UIGestureReco
     private var stickyForKey: [Int: [UInt32]] = [:]
     /// Sticky modifiers held for the current pointer press until buttons 0.
     private var stickyForPointer: [UInt32] = []
+    /// Non-modifier keys down via the sink (the menu's special keys, the
+    /// accessory row): released with everything else on focus loss.
+    private var sinkHeld: Set<UInt32> = []
+    /// The modifiers (and fn) the last on-screen-keyboard Delete used, and when.
+    private var lastSoftDelete: (mods: [UInt32], fn: Bool, at: TimeInterval)?
+    /// The on-screen keyboard repeats a held Delete as more deleteBackward
+    /// calls (first after ≈0.5 s, then faster): one within this of the
+    /// previous keeps its modifiers.
+    static let softDeleteCarry: TimeInterval = 0.6
+    /// Clock for `softDeleteCarry` (injected by tests).
+    var now: () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }
 
     private var buttons = 0
     private var lastHost: (x: Int, y: Int)?
@@ -127,6 +166,7 @@ final class RemoteInputView: UIView, UIPointerInteractionDelegate, UIGestureReco
     private var lastTranslation: [ObjectIdentifier: CGPoint] = [:]
     private var pointerInteraction: UIPointerInteraction?
     private let keyboardProxy = SoftKeyboardProxy(frame: CGRect(x: 0, y: 0, width: 1, height: 1))
+    let keyboardAccessory = KeyboardAccessoryBar()
 
     override convenience init(frame: CGRect) {
         self.init(frame: frame, repeatSchedule: KeyRepeater.runLoopTimer)
@@ -198,6 +238,7 @@ final class RemoteInputView: UIView, UIPointerInteractionDelegate, UIGestureReco
         keyboardProxy.onDelete = { [weak self] in self?.softDelete() }
         keyboardProxy.onPresses = { [weak self] presses, down in self?.handle(presses, down: down) ?? presses }
         keyboardProxy.onResign = { [weak self] in self?.softwareKeyboardResigned() }
+        keyboardProxy.accessory = keyboardAccessory
         addSubview(keyboardProxy)
     }
 
@@ -237,6 +278,7 @@ final class RemoteInputView: UIView, UIPointerInteractionDelegate, UIGestureReco
     // MARK: modifier holds (RemoteKeySink)
 
     func sendKey(down: Bool, keysym: UInt32) {
+        if down { sinkHeld.insert(keysym) } else { sinkHeld.remove(keysym) }
         input?.key(down: down, keysym: keysym)
     }
 
@@ -265,10 +307,36 @@ final class RemoteInputView: UIView, UIPointerInteractionDelegate, UIGestureReco
     /// Holds the active sticky modifiers; latched ones clear. Returns what
     /// was held, to release later.
     private func holdSticky() -> [UInt32] {
-        let mods = sticky.pressedKeysyms()
+        hold(sticky.pressedKeysyms())
+    }
+
+    /// Holds `extra` plus the active sticky modifiers (each once, ⌃ ⌥ ⇧ ⌘
+    /// order); latched ones clear. Returns what was held, to release later.
+    private func hold(_ extra: [UInt32]) -> [UInt32] {
+        let want = Set(extra).union(sticky.pressedKeysyms())
+        let mods = Keysyms.modifierPressOrder.filter(want.contains)
         for m in mods { holdModifier(m) }
         modifiers?.consumeLatched()
         return mods
+    }
+
+    /// The modifiers `flags` reports that nothing holds on the wire (their
+    /// key-down never reached this view), as left keysyms.
+    private func impliedModifiers(_ flags: UIKeyModifierFlags) -> [UInt32] {
+        Keysyms.flagKeysyms.compactMap { f in
+            guard flags.contains(f.flag), f.sides.allSatisfy({ modifierHolds[$0] == nil }) else { return nil }
+            return f.left
+        }
+    }
+
+    /// Releases hardware modifier holds whose flag `flags` no longer reports
+    /// (their key-up was lost), so nothing sticks on the Mac.
+    private func releaseStaleModifiers(_ flags: UIKeyModifierFlags) {
+        for usage in keys.heldModifierUsages {
+            guard let f = Keysyms.modifierFlag(usage), !flags.contains(f),
+                  let ks = keys.release(usage) else { continue }
+            releaseModifier(ks)
+        }
     }
 
     private func pressStickyForPointer() {
@@ -288,7 +356,64 @@ final class RemoteInputView: UIView, UIPointerInteractionDelegate, UIGestureReco
         let toggle = UIKeyCommand(title: "Show/Hide Control Menu", action: #selector(toggleControlMenu(_:)),
                                   input: "m", modifierFlags: [.command, .alternate])
         toggle.wantsPriorityOverSystemBehavior = true
-        return [toggle]
+        return [toggle] + Self.forwardedKeyCommands
+    }
+
+    /// A hardware chord claimed from iPadOS and forwarded to the Mac.
+    struct ForwardedChord: Sendable {
+        var input: String
+        var flags: UIKeyModifierFlags
+        var usage: UIKeyboardHIDUsage
+    }
+
+    /// Chords the app's own (iPadOS 26 menu bar) key commands could take
+    /// before pressesBegan: window commands (Close ⌘W, Quit ⌘Q, Minimize ⌘M,
+    /// New Window ⌘N/⇧⌘N, Settings ⌘,, cycle windows ⌘`, Full Screen ⌃⌘F) and
+    /// the standard edit actions (⌘C/X/V/A/Z, ⇧⌘Z, ⌘F). Each is a tap (no
+    /// key-up timing or repeat matters for these). Arrows, Tab, Delete,
+    /// Escape and plain letters stay on pressesBegan so they keep their real
+    /// key-up and auto-repeat. System-reserved chords (⌘Tab, ⌘Space, ⌘H,
+    /// ⇧⌘3/4/5, ⌥⌘D, Globe chords) can't be claimed by any app.
+    static let forwardedChords: [ForwardedChord] = [
+        ForwardedChord(input: "w", flags: .command, usage: .keyboardW),
+        ForwardedChord(input: "q", flags: .command, usage: .keyboardQ),
+        ForwardedChord(input: "m", flags: .command, usage: .keyboardM),
+        ForwardedChord(input: "n", flags: .command, usage: .keyboardN),
+        ForwardedChord(input: "n", flags: [.command, .shift], usage: .keyboardN),
+        ForwardedChord(input: ",", flags: .command, usage: .keyboardComma),
+        ForwardedChord(input: "`", flags: .command, usage: .keyboardGraveAccentAndTilde),
+        ForwardedChord(input: "f", flags: [.command, .control], usage: .keyboardF),
+        ForwardedChord(input: "f", flags: .command, usage: .keyboardF),
+        ForwardedChord(input: "c", flags: .command, usage: .keyboardC),
+        ForwardedChord(input: "x", flags: .command, usage: .keyboardX),
+        ForwardedChord(input: "v", flags: .command, usage: .keyboardV),
+        ForwardedChord(input: "a", flags: .command, usage: .keyboardA),
+        ForwardedChord(input: "z", flags: .command, usage: .keyboardZ),
+        ForwardedChord(input: "z", flags: [.command, .shift], usage: .keyboardZ),
+    ]
+
+    private static var forwardedKeyCommands: [UIKeyCommand] {
+        forwardedChords.map { c in
+            let k = UIKeyCommand(input: c.input, modifierFlags: c.flags, action: #selector(forwardKeyCommand(_:)))
+            k.wantsPriorityOverSystemBehavior = true
+            return k
+        }
+    }
+
+    @objc func forwardKeyCommand(_ sender: UIKeyCommand) {
+        guard let chord = Self.forwardedChords.first(where: {
+            $0.input == sender.input && $0.flags == sender.modifierFlags
+        }) else { return }
+        Log.input.debug("forwarded key command \(chord.input) flags \(chord.flags.rawValue)")
+        forward(chord)
+    }
+
+    /// Sends a claimed chord as one tap of its key. The modifiers its flags
+    /// report are already held by their own key-downs; any that are not are
+    /// held around the tap (impliedModifiers).
+    func forward(_ chord: ForwardedChord) {
+        guard keyDown(chord.usage, modifiers: chord.flags, characters: "") else { return }
+        keyUp(chord.usage)
     }
 
     @objc func toggleControlMenu(_ sender: Any?) {
@@ -558,18 +683,30 @@ final class RemoteInputView: UIView, UIPointerInteractionDelegate, UIGestureReco
     func keyDown(_ usage: UIKeyboardHIDUsage, modifiers flags: UIKeyModifierFlags, characters: String) -> Bool {
         guard let input, !Self.isMenuShortcut(usage, modifiers: flags) else { return false }
         if Keysyms.isModifier(usage) {
+            // A second down without an up (a lost key-up) must not add a
+            // second hold, or one key-up would leave it stuck on the Mac.
+            if keys.isHeld(usage) { return true }
             guard let ks = keys.press(usage, modifiers: flags, characters: characters) else { return false }
             holdModifier(ks)
             return true
         }
-        var flags = flags
-        // A sticky ⌘/⌥/⌃ chord sends the unshifted US keysym, as a hardware chord does.
-        if sticky.commandLikeActive { flags.insert(.command) }
-        guard let ks = keys.press(usage, modifiers: flags, characters: characters) else { return false }
+        releaseStaleModifiers(flags)
+        let state = sticky
+        var keyFlags = flags
+        var chars = characters
+        if state.commandLikeActive {
+            // A sticky ⌘/⌥/⌃ chord sends the unshifted US keysym, as a hardware chord does.
+            keyFlags.insert(.command)
+        } else if state[.shift] != .off, !Keysyms.isSpecial(usage) {
+            // A sticky ⇧ alone: the final (shifted) character, as with a held Shift.
+            keyFlags.insert(.shift)
+            chars = Self.shiftedLayoutCharacter(characters)
+        }
+        guard let ks = keys.press(usage, modifiers: keyFlags, characters: chars) else { return false }
         if let old = stickyForKey.removeValue(forKey: usage.rawValue) {   // a repeated down without an up
             for m in old.reversed() { releaseModifier(m) }
         }
-        let mods = holdSticky()
+        let mods = hold(impliedModifiers(flags))
         if !mods.isEmpty { stickyForKey[usage.rawValue] = mods }
         input.key(down: true, keysym: ks)
         repeater.keyDown(usage: usage.rawValue, keysym: ks)
@@ -590,9 +727,19 @@ final class RemoteInputView: UIView, UIPointerInteractionDelegate, UIGestureReco
         return true
     }
 
+    /// A layout character as typed with Shift: an uppercased letter, or ""
+    /// (the US table's shifted keysym) for anything else.
+    static func shiftedLayoutCharacter(_ characters: String) -> String {
+        let upper = characters.uppercased()
+        return upper != characters && upper.unicodeScalars.count == 1 ? upper : ""
+    }
+
     private func releaseHeldKeys() {
         repeater.cancel()
+        lastSoftDelete = nil
         for ks in keys.releaseAll() where modifierHolds[ks] == nil { input?.key(down: false, keysym: ks) }
+        for ks in sinkHeld.sorted() where modifierHolds[ks] == nil { input?.key(down: false, keysym: ks) }
+        sinkHeld.removeAll()
         for ks in modifierOrder.reversed() { input?.key(down: false, keysym: ks) }
         modifierHolds.removeAll()
         modifierOrder.removeAll()
@@ -605,33 +752,54 @@ final class RemoteInputView: UIView, UIPointerInteractionDelegate, UIGestureReco
 
     /// Soft-keyboard text. Each character gets the sticky modifiers (a
     /// latched one applies to the first character only). Under a sticky
-    /// ⌘/⌥/⌃ a letter goes as its lowercase keysym (Shift stays a separate
-    /// key), as a hardware chord does: latched ⌘ + "c" = ⌘C.
+    /// ⌘/⌥/⌃ a character goes as its unshifted US keysym, Shift as a separate
+    /// key when it needed one, as a hardware chord does: latched ⌘ + "c" = ⌘C,
+    /// ⌘ + "?" = ⌘⇧/. Under a sticky ⇧ alone it goes as the shifted US
+    /// character ("a" → "A"). Newline/tab are Return/Tab (with the modifiers).
     func typeText(_ text: String) {
         guard let input else { return }
         for ch in text {
-            let commandLike = sticky.commandLikeActive
+            let state = sticky
+            let commandLike = state.commandLikeActive
+            let shiftSticky = state[.shift] != .off
             let mods = holdSticky()
             for t in Keysyms.typed(ch) {
                 var ks = t.keysym
-                if commandLike, (0x41...0x5a).contains(ks) { ks += 0x20 }
-                if t.shift { holdModifier(Keysyms.shiftL) }
+                var shift = t.shift
+                if commandLike, let u = Keysyms.usUnshifted(ks) {
+                    ks = u
+                } else if !commandLike, shiftSticky, let s = Keysyms.usShifted(ks) {
+                    ks = s
+                    shift = true
+                }
+                if shift { holdModifier(Keysyms.shiftL) }
                 input.key(down: true, keysym: ks)
                 input.key(down: false, keysym: ks)
-                if t.shift { releaseModifier(Keysyms.shiftL) }
+                if shift { releaseModifier(Keysyms.shiftL) }
             }
             for m in mods.reversed() { releaseModifier(m) }
         }
     }
 
-    /// Soft-keyboard Delete: with the sticky modifiers; fn makes it forward Delete.
+    /// Soft-keyboard Delete: with the sticky modifiers; fn makes it forward
+    /// Delete. A Delete within `softDeleteCarry` of the previous one (the
+    /// keyboard's own repeat of a held Delete) keeps that one's modifiers,
+    /// so latched ⌥ + held Delete deletes word after word.
     func softDelete() {
         guard input != nil else { return }
-        let key: SpecialKey = sticky.fnActive ? SpecialKey.backspace.withFn : .backspace
-        let mods = holdSticky()
+        let t = now()
+        var carried: [UInt32] = []
+        var fn = sticky.fnActive
+        if let last = lastSoftDelete, t - last.at <= Self.softDeleteCarry {
+            carried = last.mods
+            fn = fn || last.fn
+        }
+        let key: SpecialKey = fn ? SpecialKey.backspace.withFn : .backspace
+        let mods = hold(carried)
         input?.key(down: true, keysym: key.keysym)
         input?.key(down: false, keysym: key.keysym)
         for m in mods.reversed() { releaseModifier(m) }
+        lastSoftDelete = mods.isEmpty && !fn ? nil : (mods, fn, t)
     }
 
     private func softwareKeyboardResigned() {
@@ -658,6 +826,10 @@ final class SoftKeyboardProxy: UIView, UIKeyInput {
     /// (presses, down) → the presses not handled.
     var onPresses: ((Set<UIPress>, Bool) -> Set<UIPress>)?
     var onResign: (() -> Void)?
+    /// Shown above the on-screen keyboard (the modifier/arrow row).
+    var accessory: UIView?
+
+    override var inputAccessoryView: UIView? { accessory }
 
     // UITextInputTraits: a raw key stream, no text services.
     var autocorrectionType: UITextAutocorrectionType = .no

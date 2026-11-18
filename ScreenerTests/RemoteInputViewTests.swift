@@ -277,8 +277,11 @@ final class RemoteInputViewTests: XCTestCase {
 
     func testSoftDeleteWithFnIsForwardDelete() async {
         let (view, input, sink, sticky) = makeSticky()
+        var t: TimeInterval = 0
+        view.now = { t }
         sticky.tap(.fn)
         view.softDelete()
+        t = 1                                                    // a new press, not the keyboard's repeat
         view.softDelete()
         let got = await events(input, sink)
         XCTAssertEqual(got, [
