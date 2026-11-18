@@ -76,3 +76,4 @@ build-fb2/
 build-fb2-dev/
 build-pip/
 build-pip-dev/
+.claude/worktrees/
