@@ -22,6 +22,7 @@ struct SettingsView: View {
     @AppStorage(PointerScaling.pointerSpeedKey) private var pointerSpeed = PointerScaling.defaultSpeed
     @AppStorage(PointerScaling.touchPointerSpeedKey) private var touchPointerSpeed = PointerScaling.defaultSpeed
     @AppStorage(ResumeOnLaunch.enabledKey) private var reconnectOnLaunch = ResumeOnLaunch.enabledDefault
+    @AppStorage(ScreenerSettings.pipAutoStartKey) private var pipAutoStart = ScreenerSettings.pipAutoStartDefault
     @State private var showAcknowledgements = false
     @State private var showHelp = false
 
@@ -122,6 +123,7 @@ struct SettingsView: View {
                     Toggle("Mute Audio", isOn: $audioMuted)
                     Toggle("Keep Screen Awake", isOn: $keepAwake)
                     Toggle("Reconnect to Last Mac on Launch", isOn: $reconnectOnLaunch)
+                    Toggle("Picture in Picture When Leaving the App", isOn: $pipAutoStart)
                 } header: {
                     Text("Session")
                 } footer: {
@@ -130,7 +132,10 @@ struct SettingsView: View {
                          + "sent automatically, and text from the Mac stays on this iPad (not shared with your other "
                          + "devices via Universal Clipboard). Keep Screen Awake stops the iPad from locking while "
                          + "connected. Reconnect to Last Mac on Launch connects to the Mac you used last when "
-                         + "Screener opens, if its password is saved (you can cancel it).")
+                         + "Screener opens, if its password is saved (you can cancel it). Picture in Picture When "
+                         + "Leaving the App keeps the Mac in a floating window when you switch apps (the session "
+                         + "stays connected until you close it); when off, leaving the app ends the session and "
+                         + "it reconnects when you return.")
                 }
 
                 Section {

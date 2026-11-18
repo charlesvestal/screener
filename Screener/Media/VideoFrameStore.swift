@@ -244,15 +244,25 @@ final class VideoFrameStore: @unchecked Sendable {   // all state behind `lock`
 
     /// Called after every change (VideoToolbox threads, the main actor, ...).
     var onChange: (@Sendable () -> Void)? {
-        get { lock.withLock { _onChange } }
-        set { lock.withLock { _onChange = newValue } }
+        get { lock.withLock { rendererOnChange } }
+        set { lock.withLock { rendererOnChange = newValue } }
     }
-    private var _onChange: (@Sendable () -> Void)?
+    private var rendererOnChange: (@Sendable () -> Void)?
     private var onChangeOwner: ObjectIdentifier?
+    /// Extra change observers (Picture in Picture's compositor), called after
+    /// `onChange`; keyed by `addObserver`'s token.
+    private var observers: [Int: @Sendable () -> Void] = [:]
+    private var nextObserver = 0
+    /// What every change notifies (read under `lock`).
+    private var _onChange: (@Sendable () -> Void)? {
+        guard !observers.isEmpty else { return rendererOnChange }
+        let renderer = rendererOnChange, extra = Array(observers.values)
+        return { renderer?(); for cb in extra { cb() } }
+    }
 
     /// Installs `onChange` on behalf of `owner` (a renderer).
     func setOnChange(owner: AnyObject, _ cb: @escaping @Sendable () -> Void) {
-        lock.withLock { _onChange = cb; onChangeOwner = ObjectIdentifier(owner) }
+        lock.withLock { rendererOnChange = cb; onChangeOwner = ObjectIdentifier(owner) }
     }
 
     /// Removes `onChange` only if `owner` installed it (a dismantled view must
@@ -260,9 +270,21 @@ final class VideoFrameStore: @unchecked Sendable {   // all state behind `lock`
     func clearOnChange(owner: AnyObject) {
         lock.withLock {
             guard onChangeOwner == ObjectIdentifier(owner) else { return }
-            _onChange = nil; onChangeOwner = nil
+            rendererOnChange = nil; onChangeOwner = nil
         }
     }
+
+    /// Adds a change observer next to the renderer's `onChange` (same
+    /// threads and timing). Returns the token for `removeObserver`.
+    func addObserver(_ cb: @escaping @Sendable () -> Void) -> Int {
+        lock.withLock { nextObserver += 1; observers[nextObserver] = cb; return nextObserver }
+    }
+
+    func removeObserver(_ token: Int) { lock.withLock { _ = observers.removeValue(forKey: token) } }
+
+    /// The committed presentable set, without touching the pacing queue the
+    /// renderer presents from (Picture in Picture reads this).
+    func latestPicture() -> Snapshot { lock.withLock { committedSnapshotLocked() } }
 
     /// Forget everything and start a new session epoch (frees the pixel
     /// buffers). Returns the new epoch.

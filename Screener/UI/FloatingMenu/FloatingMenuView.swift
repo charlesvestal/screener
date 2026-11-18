@@ -88,6 +88,10 @@ struct SessionControls {
     var openCoach: (() -> Void)? = nil
     /// "Switch Mac": the saved Macs to switch to (nil: no tile).
     var switchMac: MacSwitcher? = nil
+    /// "Picture in Picture": starts / stops PiP (nil: unsupported, no tile).
+    var togglePictureInPicture: (() -> Void)? = nil
+    var pictureInPicturePossible = false
+    var pictureInPictureActive = false
 }
 
 struct FloatingMenuView: View {
@@ -394,6 +398,16 @@ private struct ControlPanel: View {
                 controls.openCoach?()
             }
             .disabled(controls.openCoach == nil)
+            if let togglePiP = controls.togglePictureInPicture {
+                tile("Picture in Picture", controls.pictureInPictureActive ? "pip.exit" : "pip.enter",
+                     selected: controls.pictureInPictureActive,
+                     hint: "Keeps the Mac in a floating window while you use other apps.") {
+                    expanded = false
+                    togglePiP()
+                }
+                .disabled(!controls.pictureInPictureActive && !controls.pictureInPicturePossible)
+                .accessibilityValue(controls.pictureInPictureActive ? "On" : "Off")
+            }
             if let switcher = controls.switchMac {
                 SwitchMacTile(switcher: switcher) { expanded = false }
             }

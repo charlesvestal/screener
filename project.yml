@@ -47,6 +47,9 @@ targets:
         NSLocalNetworkUsageDescription: Screener connects to Macs on your local network for screen sharing.
         NSBonjourServices: [_rfb._tcp]
         UIApplicationSupportsIndirectInputEvents: true
+        # Picture in Picture (Media/PiP): PiP needs the audio background mode.
+        # Without PiP the session still closes on backgrounding (LifecyclePolicy).
+        UIBackgroundModes: [audio]
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.vestal.screener

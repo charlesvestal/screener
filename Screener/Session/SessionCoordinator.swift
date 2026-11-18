@@ -58,7 +58,11 @@
 // memory); becoming active reconnects with `isReconnecting` set, so the
 // session view stays up with "Reconnecting…" over the last picture until the
 // resumed session decodes. Errors reach the UI only through
-// UserFacingError.message (never raw errno text).
+// UserFacingError.message (never raw errno text). Picture in Picture
+// (Media/PiP) is the exception: while it shows the session, backgrounding
+// keeps it up (`pictureInPictureWillStart`); closing PiP in the background
+// closes it then (`pictureInPictureDidStop`). View size changes reported in
+// the background (snapshot resizes) are applied only when active again.
 //
 // Closing (teardown): the TCP control connection is closed FIRST and its
 // close awaited (FIN out, NWConnection `.cancelled`, capped at
@@ -139,6 +143,9 @@ final class SessionCoordinator {
         /// Longest wait, at teardown, for queued input (the releases sent by
         /// `releaseInput`) to reach the control channel before it's closed.
         var inputFlushTimeout: Duration = .milliseconds(150)
+        /// Backgrounding with automatic Picture in Picture armed: how long to
+        /// wait for PiP to start before closing the session as usual.
+        var pipStartGrace: Duration = .milliseconds(800)
     }
 
     /// Injection points for tests.
@@ -223,6 +230,20 @@ final class SessionCoordinator {
     /// The last connect request (cleared by a user disconnect).
     private(set) var lastRequest: ConnectRequest?
     private(set) var lifecycle = LifecyclePolicy()
+    /// Picture in Picture is starting or showing this session.
+    private(set) var pipActive = false
+    /// Automatic PiP will start when the app leaves the foreground (set by
+    /// SessionView: Settings toggle on, PiP possible, a picture on screen).
+    @ObservationIgnored var pipAutoStartArmed = false
+    /// Stops PiP (SessionView's PiPController): the session ended for good
+    /// (a failure shows its error when the user returns), or was disconnected.
+    @ObservationIgnored var stopPictureInPicture: (() -> Void)?
+    /// Bumped on every background / active transition (enterBackground's grace).
+    @ObservationIgnored private var phaseSerial = 0
+    /// A view size reported while in the background (app-switcher snapshots
+    /// resize the scene): applied when active again, never sent to the Mac
+    /// while Picture in Picture shows the session.
+    @ObservationIgnored private var deferredViewGeometry: (points: CGSize, scale: CGFloat)?
     /// The session view is up: connected, suspended, or reconnecting.
     var isSessionActive: Bool {
         switch state {
@@ -353,6 +374,7 @@ final class SessionCoordinator {
 
     func disconnect() async {
         lifecycle.userDisconnected()
+        stopPictureInPicture?()
         lastRequest = nil
         isReconnecting = false
         generation += 1
@@ -364,21 +386,46 @@ final class SessionCoordinator {
 
     // MARK: background / foreground
 
-    /// The scene went to the background: close a session (or a connect in
-    /// progress) now, so the Mac ends sharing; reconnect on `becomeActive`.
-    func enterBackground() async {
-        let status: LifecyclePolicy.SessionStatus = switch state {
+    private var sessionStatus: LifecyclePolicy.SessionStatus {
+        switch state {
         case .connected: .connected
         case .connecting: .connecting
         default: .none
         }
-        guard lifecycle.didEnterBackground(session: status) == .suspend else { return }
+    }
+
+    /// The scene went to the background: close a session (or a connect in
+    /// progress) now, so the Mac ends sharing; reconnect on `becomeActive`.
+    /// Unless Picture in Picture shows it (LifecyclePolicy): then it stays up.
+    func enterBackground() async {
+        phaseSerial += 1
+        let serial = phaseSerial
+        // Automatic PiP usually reports `willStart` before the scene reaches
+        // the background, but give it a moment before closing the session.
+        if pipAutoStartArmed, !lifecycle.pipActive, sessionStatus != .none, policy.pipStartGrace > .zero {
+            let deadline = ContinuousClock.now + policy.pipStartGrace
+            while !lifecycle.pipActive, ContinuousClock.now < deadline {
+                try? await Task.sleep(for: .milliseconds(20))
+            }
+            guard serial == phaseSerial else { return }   // active again meanwhile
+        }
+        guard lifecycle.didEnterBackground(session: sessionStatus) == .suspend else {
+            if lifecycle.pipActive, sessionStatus != .none {
+                Log.app.info("app backgrounded: Picture in Picture keeps the session up")
+            }
+            return
+        }
         Log.app.info("app backgrounded: closing the session (will reconnect when active)")
         await suspend(background: true)
     }
 
     /// The scene is active again: resume a suspended session.
     func becomeActive() async {
+        phaseSerial += 1
+        if let g = deferredViewGeometry {
+            deferredViewGeometry = nil
+            viewSizeChanged(points: g.points, scale: g.scale)
+        }
         switch lifecycle.didBecomeActive(canReconnect: lastRequest != nil) {
         case .reconnect:
             await reconnect()
@@ -386,6 +433,26 @@ final class SessionCoordinator {
             if state == .suspended { state = .idle; isReconnecting = false }
             clipboard.appBecameActive()
         }
+    }
+
+    // MARK: Picture in Picture (PiPController, wired by SessionView)
+
+    /// PiP is about to show the session: it must survive the background.
+    /// Touch input stops with the app in the background; release anything held.
+    func pictureInPictureWillStart() {
+        lifecycle.pipStarted()
+        pipActive = true
+        releaseInput?()
+    }
+
+    /// PiP went away (`restoring`: back to the app, the session carries on).
+    /// Closed while the app is still in the background: close the session
+    /// now, as backgrounding without PiP does (the Mac's display returns).
+    func pictureInPictureDidStop(restoring: Bool) async {
+        pipActive = false
+        guard lifecycle.pipStopped(restoring: restoring, session: sessionStatus) == .suspend else { return }
+        Log.app.info("Picture in Picture closed in the background: closing the session (will reconnect when active)")
+        await suspend(background: true)
     }
 
     private func suspend(background: Bool = false) async {
@@ -400,8 +467,9 @@ final class SessionCoordinator {
     private func reconnect() async {
         guard let r = lastRequest else { return }
         // A reconnect scheduled by a failure may run after the app left the
-        // foreground: never connect from the background; resume on activation.
-        guard lifecycle.isForeground else {
+        // foreground: never connect from the background (unless Picture in
+        // Picture shows the session); resume on activation.
+        guard lifecycle.sessionMayRun else {
             Log.app.info("reconnect deferred: app not in the foreground")
             lifecycle.deferReconnect()
             return
@@ -602,6 +670,7 @@ final class SessionCoordinator {
     private func end(_ gen: Int, _ final: State) async {
         guard gen == generation else { return }
         isReconnecting = false
+        stopPictureInPicture?()
         // Nothing will reconnect with them: drop the credentials.
         if !lifecycle.pendingReconnect { lastRequest = nil }
         generation += 1
@@ -990,6 +1059,7 @@ final class SessionCoordinator {
     /// debounces it into a dynamic 0x1d when the session is up.
     func viewSizeChanged(points: CGSize, scale: CGFloat) {
         guard points.width > 0, points.height > 0 else { return }
+        guard lifecycle.isForeground else { deferredViewGeometry = (points, scale); return }
         Log.app.info("display: view \(Int(points.width))x\(Int(points.height))pt @\(scale)x")
         viewGeometry = (points, scale)
         display.viewChanged(points: points, scale: scale)

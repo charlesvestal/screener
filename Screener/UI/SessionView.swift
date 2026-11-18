@@ -29,13 +29,17 @@ struct SessionView: View {
     /// Pure policy (SessionLifecycle.swift): covers only on `.background`,
     /// not on every `.inactive` (see its doc comment for the trade-off).
     @State private var privacyCover = PrivacyCoverPolicy()
+    /// Picture in Picture (Media/PiP): its layer sits behind the video.
+    @State private var pip: PiPController?
+    @AppStorage(ScreenerSettings.pipAutoStartKey) private var pipAutoStart = ScreenerSettings.pipAutoStartDefault
 
     var body: some View {
         ZStack {
             Color.black.ignoresSafeArea()
             RemoteScreenView(model: model, store: model.frames, cursor: model.cursor, input: model.input,
                              menu: menu, keyboardVisible: $keyboardVisible, menuExpanded: $menuExpanded,
-                             touchMode: TouchInputMode(rawValue: touchModeRaw) ?? .default, feedback: feedback)
+                             touchMode: TouchInputMode(rawValue: touchModeRaw) ?? .default, feedback: feedback,
+                             pip: pip)
                 .overlay { FeedbackOverlayView(center: feedback) }
                 .ignoresSafeArea()
             // Stages / first-picture reveal / "Reconnecting…" (SessionOverlays.swift).
@@ -46,7 +50,11 @@ struct SessionView: View {
                                                        getClipboard: { model.clipboard.fetchFromMac() },
                                                        sendClipboard: { model.clipboard.sendToMac() },
                                                        openCoach: { showCoach = true },
-                                                       switchMac: switchMac))
+                                                       switchMac: switchMac,
+                                                       togglePictureInPicture: pip?.isSupported == true
+                                                           ? { pip?.toggle() } : nil,
+                                                       pictureInPicturePossible: pip?.isPossible ?? false,
+                                                       pictureInPictureActive: pip?.isActive ?? false))
             if showCoach {
                 GestureCoachOverlay { showCoach = false }
             }
@@ -63,6 +71,20 @@ struct SessionView: View {
         }
         .onChange(of: scenePhase, initial: true) { _, phase in
             privacyCover.phaseChanged(to: PrivacyCoverPolicy.Phase(phase))
+        }
+        .onAppear { setUpPictureInPicture() }
+        .onDisappear {
+            model.pipAutoStartArmed = false
+            model.stopPictureInPicture = nil
+            pip?.shutdown()
+        }
+        .onChange(of: model.isSessionActive, initial: true) { _, active in pip?.setFeeding(active) }
+        .onChange(of: pipArmed, initial: true) { _, armed in
+            pip?.setAutoStart(armed)
+            model.pipAutoStartArmed = armed && (pip?.isPossible ?? false)
+        }
+        .onChange(of: pip?.isPossible) { _, possible in
+            model.pipAutoStartArmed = pipArmed && possible == true
         }
         .onAppear {
             // Read on demand from the in-memory connect request (cleared on
@@ -82,6 +104,34 @@ struct SessionView: View {
         .sessionPolish(model, savedFor: savedFor)
         .statusBarHidden(true)
         .persistentSystemOverlays(.hidden)
+    }
+}
+
+extension SessionView {
+    /// Automatic PiP on leaving the app: the setting is on and a connected
+    /// session shows a picture.
+    private var pipArmed: Bool {
+        guard pipAutoStart, model.hasFirstFrame, case .connected = model.state else { return false }
+        return true
+    }
+
+    private func setUpPictureInPicture() {
+        guard pip == nil else { return }
+        let controller = PiPController(store: model.frames)
+        let coordinator = model
+        controller.onWillStart = { [weak coordinator] in coordinator?.pictureInPictureWillStart() }
+        controller.onDidStop = { [weak coordinator] restoring in
+            // Closed in the background: the session close must get out first.
+            let token = BackgroundTask.begin("pip stopped")
+            Task {
+                await coordinator?.pictureInPictureDidStop(restoring: restoring)
+                token.end()
+            }
+        }
+        model.stopPictureInPicture = { [weak controller] in controller?.stop() }
+        pip = controller
+        controller.setFeeding(model.isSessionActive)
+        controller.setAutoStart(pipArmed)
     }
 }
 
@@ -145,12 +195,15 @@ struct RemoteScreenView: UIViewRepresentable {
     @Binding var menuExpanded: Bool
     let touchMode: TouchInputMode
     let feedback: FeedbackCenter
+    let pip: PiPController?
 
     final class Coordinator {
         var renderer: MetalRenderer?
     }
 
     final class Container: UIView {
+        /// Picture in Picture's layer, behind the video (PiPLayerHostView).
+        let pipHost = PiPLayerHostView(frame: .zero)
         let video = MTKView(frame: .zero)
         let remoteInput = RemoteInputView(frame: .zero)
         /// Zoom/pan: changed by the input view, drawn by the renderer.
@@ -176,7 +229,7 @@ struct RemoteScreenView: UIViewRepresentable {
             super.init(frame: frame)
             backgroundColor = .black
             video.backgroundColor = .black
-            for v in [video, remoteInput] as [UIView] {
+            for v in [pipHost, video, remoteInput] as [UIView] {
                 v.frame = bounds
                 v.autoresizingMask = [.flexibleWidth, .flexibleHeight]
                 addSubview(v)
@@ -211,6 +264,7 @@ struct RemoteScreenView: UIViewRepresentable {
     }
 
     func updateUIView(_ view: Container, context: Context) {
+        if view.pipHost.controller !== pip { view.pipHost.controller = pip }
         view.remoteInput.input = input
         view.remoteInput.touchMode = touchMode
         view.remoteInput.menuOpen = menuExpanded
@@ -238,6 +292,7 @@ struct RemoteScreenView: UIViewRepresentable {
         view.remoteInput.controlMenu = nil
         view.remoteInput.onPointerMoved = nil
         view.onSizeChange = nil
+        view.pipHost.controller = nil
         coordinator.renderer?.detach()
         coordinator.renderer = nil
     }

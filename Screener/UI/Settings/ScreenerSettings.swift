@@ -26,6 +26,14 @@ enum ScreenerSettings {
     static let statsOverlayKey = "session.statsOverlay"
     static let statsOverlayDefault = false
 
+    /// Picture in Picture starts when you leave the app during a session.
+    static let pipAutoStartKey = "pip.autoStart"
+    static let pipAutoStartDefault = true
+
+    static func pipAutoStart(_ d: UserDefaults = .standard) -> Bool {
+        bool(pipAutoStartKey, default: pipAutoStartDefault, d)
+    }
+
     static func visualFeedback(_ d: UserDefaults = .standard) -> Bool {
         bool(visualFeedbackKey, default: visualFeedbackDefault, d)
     }

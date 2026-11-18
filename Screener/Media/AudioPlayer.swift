@@ -25,9 +25,11 @@
 // the jitter accounting and the buffer free list. Lock order: control → state;
 // the player node is never stopped while `state` is held.
 //
-// AVAudioSession: .playback + .mixWithOthers, activated on the first
-// scheduled PCM and deactivated on mute / stop. No background audio mode: the
-// session (and so the audio) ends when the app goes to the background.
+// AVAudioSession: .playback + .mixWithOthers, claimed (AudioSessionArbiter)
+// on the first scheduled PCM and released on mute / stop; Picture in Picture
+// holds its own claim while a session is up. The audio background mode is
+// for PiP: without PiP the session still closes when the app goes to the
+// background (LifecyclePolicy), and the audio with it.
 import AudioToolbox
 import AVFoundation
 import Foundation
@@ -436,9 +438,7 @@ final class AudioPlayer: @unchecked Sendable {
         if let retryAt, now < retryAt { return false }
         do {
             if !sessionActive {
-                let session = AVAudioSession.sharedInstance()
-                try session.setCategory(.playback, mode: .default, options: [.mixWithOthers])
-                try session.setActive(true)
+                try AudioSessionArbiter.shared.acquireOrThrow(.remoteAudio)
                 sessionActive = true
             }
             let (engine, node) = output ?? makeOutput()
@@ -460,13 +460,11 @@ final class AudioPlayer: @unchecked Sendable {
     }
 
     private func deactivateSession() {
-        guard sessionActive else { return }
+        // Not guarded by `sessionActive`: an interruption clears that flag
+        // while the claim stays (release is idempotent).
         sessionActive = false
-        do {
-            try AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
-        } catch {
-            Log.audio.error("audio session deactivate failed: \(error)")
-        }
+        // Picture in Picture may still hold the session (AudioSessionArbiter).
+        AudioSessionArbiter.shared.release(.remoteAudio)
     }
 
     private func logStatsIfChanged() {

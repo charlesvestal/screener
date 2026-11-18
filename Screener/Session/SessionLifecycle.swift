@@ -9,6 +9,10 @@
 //     host + credentials in memory;
 //   * active again → reconnect automatically; the session view stays up with
 //     "Reconnecting…" over the last picture;
+//   * Picture in Picture showing the session (PiPController) → backgrounding
+//     keeps it up, and it may reconnect in the background; PiP closed while
+//     the app is still in the background → close it then (as above);
+//     "return to app" from PiP → the session just carries on;
 //   * a connection that is aborted while connected and in the foreground is
 //     reconnected too (a few times), and failures never show raw errno text.
 //
@@ -180,10 +184,31 @@ struct LifecyclePolicy: Equatable, Sendable {
     private(set) var isForeground = true
     private(set) var pendingReconnect = false
     private(set) var autoReconnects = 0
+    /// Picture in Picture is starting or showing the session.
+    private(set) var pipActive = false
 
+    /// The session may run (and reconnect): in the foreground, or in the
+    /// background while Picture in Picture shows it.
+    var sessionMayRun: Bool { isForeground || pipActive }
+
+    /// With PiP showing, the session stays up in the background (the user is
+    /// watching it); otherwise it closes now and resumes when active again.
     mutating func didEnterBackground(session: SessionStatus) -> Action {
         isForeground = false
-        guard session != .none else { return .none }
+        guard session != .none, !pipActive else { return .none }
+        pendingReconnect = true
+        return .suspend
+    }
+
+    /// PiP is about to show the session.
+    mutating func pipStarted() { pipActive = true }
+
+    /// PiP went away. `restoring`: the user tapped "return to app" (the app
+    /// becomes active and the session carries on). Closed while the app is
+    /// still in the background: close the session as backgrounding would have.
+    mutating func pipStopped(restoring: Bool, session: SessionStatus) -> Action {
+        pipActive = false
+        guard !restoring, !isForeground, session != .none else { return .none }
         pendingReconnect = true
         return .suspend
     }
@@ -199,7 +224,7 @@ struct LifecyclePolicy: Equatable, Sendable {
     /// A session ended with an error of `kind`.
     mutating func sessionFailed(kind: UserFacingError.Kind, wasConnected: Bool, canReconnect: Bool) -> Action {
         guard canReconnect else { return .none }
-        if !isForeground {
+        if !sessionMayRun {
             // Whatever iOS did to the sockets while we were away: come back quietly.
             pendingReconnect = true
             return .suspend
