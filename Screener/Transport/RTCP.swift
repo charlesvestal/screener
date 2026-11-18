@@ -106,6 +106,37 @@ enum RTCP {
         return w.data
     }
 
+    /// APP name "RCTL" (0x5243544C): AVConference's receiver rate-control
+    /// feedback (VCRC), what the native viewer sends every 50 ms on P+1.
+    /// Layout from AVConference's -[VCVideoStreamRateAdaptationFeedbackOnly
+    /// sendRateControlFeedback] → VCMediaControlInfoSerializeWithData (type 2,
+    /// 20 bytes) → RTPSendRTCP's "RCTL" custom report (macOS 27 build):
+    ///
+    ///     [0]      0x85            0x80 | info flags 5
+    ///     [1]      u8              interval-ish field (stats+0x40 × 1000 / 20); 0
+    ///     [2..3]   0x0004          length of the info in words - 1
+    ///     [4..5]   u16  echo       echoed media timestamp (last received RTP ts)
+    ///     [6..9]   0
+    ///     [10..11] u16  echoDelay  ms since that packet arrived (clamped 0xFFFF)
+    ///     [12..13] u16  now        receiver clock in 1/1024 s
+    ///     [14..15] u16  owrd       one-way relative delay, RTPPackDouble (0 = none)
+    ///     [16..17] u16             burstyLoss << 12 | (loss field & 0xFFF)
+    ///     [18..19] u16  bwe        receiver bandwidth estimate (units unverified; kbps assumed)
+    static let rctlName: UInt32 = 0x5243_544C
+
+    static func appRCTL(senderSSRC: UInt32, echo: UInt16, echoDelayMs: UInt16, now1024: UInt16,
+                        owrd: UInt16 = 0, burstyLoss: UInt8 = 0, lossField: UInt16 = 0, bwe: UInt16) -> Data {
+        var w = ByteWriter()
+        w.u8(0x80); w.u8(204); w.u16(7); w.u32(senderSSRC)
+        w.u32(rctlName)
+        w.u8(0x85); w.u8(0); w.u16(4)
+        w.u16(echo); w.zeros(4)
+        w.u16(echoDelayMs); w.u16(now1024); w.u16(owrd)
+        w.u16(UInt16(min(burstyLoss, 15)) << 12 | lossField & 0x0FFF)
+        w.u16(bwe)
+        return w.data
+    }
+
     /// build_empty_sr: an empty Sender Report so AVConference sees a live sender.
     static func emptySR(senderSSRC: UInt32, now: Date = Date()) -> Data {
         let t = now.timeIntervalSince1970

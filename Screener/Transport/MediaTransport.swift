@@ -40,6 +40,12 @@
 //     compound, rate-limited to one per SSRC per 0.25 s
 // and, on P+1, APP LTR acks (VideoPipeline drives those, opt-in: the
 // reference's macOS VideoToolbox path never sends any).
+// Beyond the reference (Feedback, see docs/research/2026-11-18-native-feedback.md):
+//   * on P+1 every 50 ms: APP "RCTL" rate-control feedback (videoKeyV, our
+//     video SSRC), as the native viewer sends. ON by default: the host's
+//     encoder target follows its bandwidth estimate (BWE, kbps) — without it
+//     the encoder holds a flat ~20 Mbps while a window is dragged;
+//   * opt-in (SCREENER_FB_RR=1): native-style RRs per port at 1 s.
 // Every 2 s the stats line adds the video payload kbps/pps, the server's
 // RTCP packet types, the SR source SSRCs and the last RR we sent.
 //
@@ -232,6 +238,42 @@ actor MediaTransport {
         /// Large enough for a whole start burst (≤ rawBufferLimit) released at once.
         var videoBufferLimit = 16_384
         var audioBufferLimit = 1024
+        /// Native-viewer feedback shape (docs/research/2026-11-18-native-feedback.md).
+        var feedback = Feedback.fromEnvironment()
+        var rateControlInterval: Duration = .milliseconds(50)
+    }
+
+    /// What the native viewer sends that the reference does not. Each piece
+    /// can be toggled for A/B with an environment variable (simctl:
+    /// SIMCTL_CHILD_<name>, devicectl: DEVICECTL_CHILD_<name>).
+    struct Feedback: Sendable, Equatable {
+        /// SCREENER_FB_RR: Receiver Reports per port, once a second like the
+        /// native viewer: the video tile SSRCs on P+1 (our video SSRC,
+        /// videoKeyV, plus the empty SR every 10th tick), the server audio
+        /// SSRC on P (our audio SSRC, audioKeyV). Off: the reference's one RR
+        /// over the video SSRCs to P every 0.5 s.
+        var splitReports = false
+        /// SCREENER_FB_RCTL (default ON; =0 turns it off): APP "RCTL"
+        /// rate-control feedback on P+1 every `rateControlInterval` (native:
+        /// 50 ms) while video arrives. Without it the host's encoder sits at a
+        /// flat ~20 Mbps while a window is dragged; with it, 40–60 Mbps (live
+        /// A/B 2026-11-18, docs/research/2026-11-18-native-feedback.md).
+        var rateControl = true
+        /// SCREENER_RCTL_BWE: the bandwidth estimate RCTL carries, in kbps
+        /// (assumed unit; u16 on the wire). 0 = the measured receive rate.
+        var rctlBWE: UInt16 = 60_000
+        /// SCREENER_RCTL_ECHO=low: echo the RTP timestamp >> 8 (AVConference's
+        /// useLowPrecisionEchoTimeStamp) instead of its low 16 bits.
+        var rctlLowPrecisionEcho = false
+
+        static func fromEnvironment(_ env: [String: String] = ProcessInfo.processInfo.environment) -> Feedback {
+            var f = Feedback()
+            if let v = env["SCREENER_FB_RR"] { f.splitReports = v == "1" }
+            if let v = env["SCREENER_FB_RCTL"] { f.rateControl = v == "1" }
+            if let v = env["SCREENER_RCTL_BWE"], let n = UInt16(v) { f.rctlBWE = n }
+            if let v = env["SCREENER_RCTL_ECHO"] { f.rctlLowPrecisionEcho = v == "low" }
+            return f
+        }
     }
 
     struct Stats: Sendable, Equatable {
@@ -243,6 +285,8 @@ actor MediaTransport {
         /// Packets the `video` / `audio` streams dropped because the consumer lagged.
         var videoStreamDrops = 0, audioStreamDrops = 0
         var punchesSent = 0, keepalivesSent = 0, reportsSent = 0, keyframeRequestsSent = 0, ltrAcksSent = 0
+        /// Split-report mode: RRs sent on the video / audio port; RCTL feedback packets.
+        var videoReportsSent = 0, audioReportsSent = 0, rateControlSent = 0
         var serverSRs = 0
         /// Decrypted video RTP payload bytes (what the encoder spent).
         var videoPayloadBytes = 0
@@ -297,6 +341,14 @@ actor MediaTransport {
     private var rtcpKeyLogged: Set<Flow> = []
     private var keepaliveEncryptor: SRTPEncryptor?
     private var rtcpEncryptor: SRTCPEncryptor?
+    /// audioKeyV SRTCP context for the split-mode RR on P (own SRTCP index).
+    private var audioRTCPEncryptor: SRTCPEncryptor?
+    private var rateControlTask: Task<Void, Never>?
+    /// RCTL inputs: newest video RTP timestamp + its arrival, server audio SSRC, receive-rate window.
+    private var lastVideoRTP: (ts: UInt32, at: ContinuousClock.Instant)?
+    private var serverAudioSSRC: UInt32?
+    private var rateWindow: (start: ContinuousClock.Instant, bytes: Int)?
+    private var measuredKbps = 0
     private var serverSR: [UInt32: RTCP.SRInfo] = [:]
     private var tick = 0
     private var lastKeyframeRequest: [UInt32: ContinuousClock.Instant] = [:]
@@ -403,6 +455,7 @@ actor MediaTransport {
         let audioRTCP = try SRTCPDecryptor(blob: k.audioKeyS)
         rtcpDecryptors = [.video: [videoRTCP, audioRTCP], .audio: [audioRTCP, videoRTCP]]
         rtcpEncryptor = try SRTCPEncryptor(blob: k.videoKeyV)
+        audioRTCPEncryptor = try SRTCPEncryptor(blob: k.audioKeyV)
         if let s = a.ourAudioSSRC { keepaliveEncryptor = try SRTPEncryptor(blob: k.audioKeyV, ssrc: s) }
         tracker = SSRCGroupTracker(groupSize: a.tilesPerGroup, threshold: tuning.adoptThreshold, stall: tuning.adoptStall)
         activation = a
@@ -427,6 +480,17 @@ actor MediaTransport {
                 try? await Task.sleep(for: interval)
             }
         }
+        if tuning.feedback.rateControl {
+            let every = tuning.rateControlInterval
+            rateControlTask = Task { [weak self] in
+                while !Task.isCancelled {
+                    try? await Task.sleep(for: every)
+                    guard let self else { return }
+                    await self.sendRateControl()
+                }
+            }
+        }
+        Log.media.info("feedback: \(tuning.feedback)")
     }
 
     /// Resolves once the session-start burst has been judged (SSRC group
@@ -443,12 +507,14 @@ actor MediaTransport {
     func resetForRetry() {
         guard !isClosed, failure == nil else { return }
         txTask?.cancel(); txTask = nil
+        rateControlTask?.cancel(); rateControlTask = nil
         burstTimer?.cancel(); burstTimer = nil
         resolveBurst(.starved(packets: counters.videoPackets), ifUnresolvedOnly: true)
         activation = nil
         videoDecryptor = nil; audioDecryptor = nil
         rtcpDecryptors = [:]; rtcpKeyLogged = []
-        keepaliveEncryptor = nil; rtcpEncryptor = nil
+        keepaliveEncryptor = nil; rtcpEncryptor = nil; audioRTCPEncryptor = nil
+        lastVideoRTP = nil; serverAudioSSRC = nil; rateWindow = nil; measuredKbps = 0
         serverSR = [:]; tick = 0
         lastKeyframeRequest = [:]; lastLTRAcked = nil
         decoderDrivesPublish = false
@@ -465,7 +531,7 @@ actor MediaTransport {
     func close() async {
         guard !isClosed else { return }
         isClosed = true
-        punchTask?.cancel(); txTask?.cancel(); burstTimer?.cancel()
+        punchTask?.cancel(); txTask?.cancel(); burstTimer?.cancel(); rateControlTask?.cancel()
         let open = Array(channels.values)
         channels = [:]
         for f in finishers { f() }
@@ -582,10 +648,12 @@ actor MediaTransport {
         switch flow {
         case .audio:
             counters.audioPackets += 1
+            serverAudioSSRC = pkt.ssrc
             emitAudio(pkt)
         case .video:
             counters.videoPackets += 1
             counters.videoPayloadBytes += pkt.payload.count
+            noteVideoArrival(pkt, bytes: data.count)
             handleVideo(pkt)
         }
     }
@@ -720,7 +788,11 @@ actor MediaTransport {
         guard !isClosed else { return }
         tick += 1
         sendHeartbeat()
-        sendReport()
+        if tuning.feedback.splitReports {
+            if tick % 2 == 1 { sendSplitReports() }
+        } else {
+            sendReport()
+        }
         if tick % tuning.statsEveryNTicks == 0 { Log.media.info(statsLine()) }
     }
 
@@ -752,6 +824,72 @@ actor MediaTransport {
         counters.reportsSent += 1
     }
 
+    /// Native-style RRs (Feedback.splitReports): the video tile SSRCs on P+1,
+    /// the server's audio SSRC on P, each from that flow's own SSRC and key.
+    private func sendSplitReports() {
+        let now = Date()
+        if let sender = activation?.ourVideoSSRC, let enc = rtcpEncryptor, let channel = channels[.video] {
+            let sources = tracker.active
+            let states = videoDecryptor?.stateSnapshot() ?? [:]
+            var stats: [UInt32: RTCP.SourceStats] = [:]
+            for s in sources { stats[s] = RTCP.SourceStats(maxSeq: states[s]?.maxSeq ?? 0, roc: states[s]?.roc ?? 0) }
+            var rr = RTCP.receiverReport(senderSSRC: sender, sources: sources, stats: stats, srData: serverSR, now: now)
+            let withSR = sources.compactMap { serverSR[$0] }
+            lastReport = (sources.count, withSR.count,
+                          withSR.map { Int(now.timeIntervalSince($0.arrival) * 1000) }.max() ?? 0,
+                          sources.first.flatMap { stats[$0] }.map { ($0.roc & 0xFFFF) << 16 | UInt32($0.maxSeq) } ?? 0)
+            if tick % tuning.srEveryNTicks == 1 { rr = RTCP.emptySR(senderSSRC: sender) + rr }
+            if let wire = try? enc.protect(rr) {
+                channel.send(wire)
+                counters.reportsSent += 1
+                counters.videoReportsSent += 1
+            }
+        }
+        if let sender = activation?.ourAudioSSRC, let enc = audioRTCPEncryptor, let channel = channels[.audio] {
+            let sources = serverAudioSSRC.map { [$0] } ?? []
+            let states = audioDecryptor?.stateSnapshot() ?? [:]
+            var stats: [UInt32: RTCP.SourceStats] = [:]
+            for s in sources { stats[s] = RTCP.SourceStats(maxSeq: states[s]?.maxSeq ?? 0, roc: states[s]?.roc ?? 0) }
+            let rr = RTCP.receiverReport(senderSSRC: sender, sources: sources, stats: stats, srData: serverSR, now: now)
+            if let wire = try? enc.protect(rr) {
+                channel.send(wire)
+                counters.audioReportsSent += 1
+            }
+        }
+    }
+
+    private func noteVideoArrival(_ p: MediaPacket, bytes: Int) {
+        lastVideoRTP = (p.timestamp, p.arrival)
+        guard var w = rateWindow else { rateWindow = (p.arrival, bytes); return }
+        w.bytes += bytes
+        let span = p.arrival - w.start
+        if span >= .milliseconds(500) {
+            let secs = Double(span.components.seconds) + Double(span.components.attoseconds) / 1e18
+            measuredKbps = Int(Double(w.bytes) * 8 / secs / 1000)
+            w = (p.arrival, 0)
+        }
+        rateWindow = w
+    }
+
+    /// One RCTL feedback packet (Feedback.rateControl) on P+1, only once video flows.
+    private func sendRateControl() {
+        guard !isClosed, let last = lastVideoRTP, let sender = activation?.ourVideoSSRC,
+              let enc = rtcpEncryptor, let channel = channels[.video] else { return }
+        let now = clock.now
+        let delay = now - last.at
+        let delayMs = Double(delay.components.seconds) * 1000 + Double(delay.components.attoseconds) / 1e15
+        let uptime = ProcessInfo.processInfo.systemUptime
+        let fb = tuning.feedback
+        let bwe = fb.rctlBWE != 0 ? fb.rctlBWE : UInt16(clamping: measuredKbps)
+        let echo = fb.rctlLowPrecisionEcho ? UInt16(truncatingIfNeeded: last.ts >> 8) : UInt16(truncatingIfNeeded: last.ts)
+        let pkt = RTCP.appRCTL(senderSSRC: sender, echo: echo,
+                               echoDelayMs: UInt16(clamping: Int(delayMs)),
+                               now1024: UInt16(truncatingIfNeeded: Int(uptime * 1024)), bwe: bwe)
+        guard let wire = try? enc.protect(pkt) else { return }
+        channel.send(wire)
+        counters.rateControlSent += 1
+    }
+
     private func statsLine() -> String {
         let s = stats
         let now = clock.now
@@ -771,7 +909,8 @@ actor MediaTransport {
             + " rtcpfail=\(s.rtcpAuthFailures) drop=\(s.droppedDatagrams) streamdrop=\(s.videoStreamDrops)/\(s.audioStreamDrops)"
             + " sr=\(s.serverSRs)"
             + " tx ka=\(s.keepalivesSent) rr=\(s.reportsSent) fir=\(s.keyframeRequestsSent) punch=\(s.punchesSent)"
-            + " ltr=\(s.ltrAcksSent)\(rate) rtcp_rx={\(types)} sr_from=[\(s.srSSRCs.sorted().map(hex).joined(separator: ","))]"
+            + " ltr=\(s.ltrAcksSent) rr_v/a=\(s.videoReportsSent)/\(s.audioReportsSent) rctl=\(s.rateControlSent)"
+            + " rx_kbps=\(measuredKbps)\(rate) rtcp_rx={\(types)} sr_from=[\(s.srSSRCs.sorted().map(hex).joined(separator: ","))]"
             + " rr_last={blocks=\(r.blocks) ext0=\(r.extSeq0) lsr=\(r.withLSR)/\(r.blocks) dlsr_max_ms=\(r.maxDLSRms)}"
     }
 }

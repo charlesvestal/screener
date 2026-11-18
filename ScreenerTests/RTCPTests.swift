@@ -86,6 +86,20 @@ final class RTCPTests: XCTestCase {
         XCTAssertEqual(pkt.hex, r)
     }
 
+    /// RCTL layout from AVConference's VCMediaControlInfoSerializeWithData
+    /// (type 2, 20-byte info) inside the "RCTL" APP: 32 bytes, length field 7.
+    func testAppRCTLLayout() {
+        let pkt = RTCP.appRCTL(senderSSRC: 0x4014_2F36, echo: 0xA1B2, echoDelayMs: 0x0012, now1024: 0x3456,
+                               owrd: 0x0001, burstyLoss: 20, lossField: 0x1ABC, bwe: 60_000)
+        XCTAssertEqual(pkt.count, 32)
+        XCTAssertEqual(pkt.hex, "80cc0007" + "40142f36" + "5243544c"
+                       + "85000004" + "a1b2" + "00000000" + "0012" + "3456" + "0001"
+                       + "fabc"          // burstyLoss clamped to 15 << 12 | 0xABC
+                       + "ea60")         // 60000
+        XCTAssertTrue(RTCP.isRTCP(pkt))
+        XCTAssertEqual(RTCP.packetTypes(pkt), [204])
+    }
+
     func testEmptySenderReportLayout() {
         let now = Date(timeIntervalSince1970: 1_700_000_000.25)
         let pkt = RTCP.emptySR(senderSSRC: 0xDEAD_BEEF, now: now)

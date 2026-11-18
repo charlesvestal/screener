@@ -30,6 +30,9 @@
 //     reference's VideoToolbox decoder never acks (only its libav path does,
 //     hevc.py:448). Opt in with the environment variable SCREENER_LTR_ACK=1
 //     (devicectl: DEVICECTL_CHILD_SCREENER_LTR_ACK=1) for an A/B test;
+//     SCREENER_FB_ACKALL=1 acks every tile's picture as the native viewer
+//     does (one APP per marker). Both stay off: on 2026-11-18 the per-tile
+//     acks did not raise the bitrate and coincided with decode stalls;
 //   * every 2 s: `video fps=… decode_ms=… tiles=[…] kbps=… au_avg=[…]
 //     au_max=[…] idr=… partial=…` (AU payload bytes of what was fed;
 //     `partial` = pictures shown with a strip missing).
@@ -48,8 +51,24 @@ actor VideoPipeline {
         var ackLTR: (@Sendable (UInt16) async -> Void)? = nil
     }
 
-    /// SCREENER_LTR_ACK=1 turns LTR acks on (see the header).
-    static let ltrAcksEnabled = ProcessInfo.processInfo.environment["SCREENER_LTR_ACK"] == "1"
+    /// Which decoded pictures are acknowledged (APP name 5 + DON on P+1).
+    enum LTRAckMode: Sendable, Equatable {
+        case off
+        /// Reference: the newest tile-0 DON (SCREENER_LTR_ACK=1).
+        case tile0
+        /// Native viewer: one ack per decoded picture of every tile, right
+        /// after it decodes (≈1–3 ms after the tile's marker packet; one 30-byte
+        /// SRTCP APP per marker in the native capture). SCREENER_FB_ACKALL=1.
+        case allTiles
+
+        static func fromEnvironment(_ env: [String: String] = ProcessInfo.processInfo.environment) -> LTRAckMode {
+            if env["SCREENER_FB_ACKALL"] == "1" { return .allTiles }
+            if env["SCREENER_LTR_ACK"] == "1" { return .tile0 }
+            return .off
+        }
+    }
+
+    static let ltrAckMode = LTRAckMode.fromEnvironment()
 
     nonisolated let store: VideoFrameStore
     private let hooks: Hooks
@@ -64,22 +83,26 @@ actor VideoPipeline {
     private var interval = IntervalStats()
     private let publishThrottle = PublishThrottle()
 
-    init(store: VideoFrameStore, hooks: Hooks, ltrAcks: Bool = VideoPipeline.ltrAcksEnabled) {
+    init(store: VideoFrameStore, hooks: Hooks, ltrAcks: LTRAckMode = VideoPipeline.ltrAckMode) {
         self.store = store
         self.hooks = hooks
         let throttle = publishThrottle
         let weakSelf = WeakBox<VideoPipeline>()
         let epoch = store.currentEpoch
-        let ackLTR = ltrAcks ? hooks.ackLTR : nil
+        let ackLTR = ltrAcks != .off ? hooks.ackLTR : nil
+        let ackAll = ltrAcks == .allTiles
         let lastDON = LatestDON()
-        if ackLTR != nil { Log.video.info("video: LTR acks ON (tile-0 DON per decoded picture)") }
+        if ackLTR != nil { Log.video.info("video: LTR acks ON (\(ackAll ? "every tile" : "tile-0") DON per decoded picture)") }
         self.decoder = VideoDecoder { event in
             switch event {
             case .frame(let f):
                 store.publish(f, epoch: epoch)
                 if throttle.shouldNotify() { Task { await hooks.notePublished() } }
                 // Tasks may run out of order: each sends the newest DON at that moment.
-                if f.tile == 0, let ackLTR {
+                if ackAll, let ackLTR {
+                    let don = f.don
+                    Task { await ackLTR(don) }
+                } else if f.tile == 0, let ackLTR {
                     lastDON.set(f.don)
                     Task { if let don = lastDON.get() { await ackLTR(don) } }
                 }

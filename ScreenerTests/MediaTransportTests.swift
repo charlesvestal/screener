@@ -284,6 +284,91 @@ final class MediaTransportTests: XCTestCase {
         XCTAssertFalse(ch.audio.sent.contains { RTCP.isRTCP($0) && rtcpDec.unprotect($0)?[1] == 204 })
     }
 
+    // MARK: native-style feedback
+
+    func testFeedbackFlagsFromEnvironment() {
+        let d = MediaTransport.Feedback.fromEnvironment([:])
+        XCTAssertTrue(d.rateControl)
+        XCTAssertFalse(d.splitReports)
+        XCTAssertEqual(d.rctlBWE, 60_000)
+        XCTAssertFalse(d.rctlLowPrecisionEcho)
+        let f = MediaTransport.Feedback.fromEnvironment(["SCREENER_FB_RCTL": "0", "SCREENER_FB_RR": "1",
+                                                         "SCREENER_RCTL_BWE": "0", "SCREENER_RCTL_ECHO": "low"])
+        XCTAssertFalse(f.rateControl)
+        XCTAssertTrue(f.splitReports)
+        XCTAssertEqual(f.rctlBWE, 0)
+        XCTAssertTrue(f.rctlLowPrecisionEcho)
+        XCTAssertEqual(VideoPipeline.LTRAckMode.fromEnvironment([:]), .off)
+        XCTAssertEqual(VideoPipeline.LTRAckMode.fromEnvironment(["SCREENER_LTR_ACK": "1"]), .tile0)
+        XCTAssertEqual(VideoPipeline.LTRAckMode.fromEnvironment(["SCREENER_FB_ACKALL": "1"]), .allTiles)
+    }
+
+    /// RCTL (the native viewer's 50 ms rate-control feedback) goes to the
+    /// VIDEO port with videoKeyV and our video SSRC, only once video arrives,
+    /// and echoes the newest video RTP timestamp.
+    func testRateControlFeedbackGoesToTheVideoPortOnceVideoFlows() async throws {
+        let ch = FakeChannels()
+        var tuning = fastTuning
+        tuning.txInterval = .seconds(60)
+        tuning.rateControlInterval = .milliseconds(10)
+        tuning.feedback = .init(splitReports: false, rateControl: true, rctlBWE: 45_000)
+        let t = make(ch, tuning: tuning)
+        try await t.open()
+        try await t.activate(activation)
+        try await Task.sleep(for: .milliseconds(60))
+        let before = await t.stats.rateControlSent
+        XCTAssertEqual(before, 0, "no RCTL before any video")
+
+        let group: [UInt32] = [0x1000, 0x1001, 0x1002, 0x1003]
+        for j in 0..<4 {
+            let enc = try SRTPEncryptor(blob: keys.videoKeyS, ssrc: group[j], seq: 1, ts: 0x0012_3456)
+            for i in 0..<10 { ch.video.deliver(try enc.encrypt(Data("t\(j)-\(i)".utf8), pt: 100, marker: i == 9)) }
+        }
+        try await waitUntil("rctl") { await t.stats.rateControlSent >= 2 }
+        await t.close()
+
+        let rtcpDec = try SRTCPDecryptor(blob: keys.videoKeyV)
+        let rctl = ch.video.sent.filter { RTCP.isRTCP($0) }.compactMap { rtcpDec.unprotect($0) }
+        XCTAssertGreaterThanOrEqual(rctl.count, 2)
+        let p = [UInt8](try XCTUnwrap(rctl.last))
+        XCTAssertEqual(p.count, 32)
+        XCTAssertEqual(Data(p[0..<16]).hex, "80cc0007" + "40142f36" + "5243544c" + "85000004")
+        // The newest packet: tile 3, #9 → ts 0x123456 + 9 × 480.
+        XCTAssertEqual(Data(p[16..<18]).hex, "4536", "echoes the low 16 bits of the newest RTP timestamp")
+        XCTAssertEqual(Data(p[30..<32]).hex, "afc8", "BWE 45000")
+        XCTAssertFalse(ch.audio.sent.contains { RTCP.isRTCP($0) && rtcpDec.unprotect($0)?[1] == 204 })
+    }
+
+    /// Split reports: the video RR from our video SSRC on P+1 (videoKeyV),
+    /// the audio RR from our audio SSRC on P (audioKeyV).
+    func testSplitReportsSendVideoRROnTheVideoPortAndAudioRROnTheAudioPort() async throws {
+        let ch = FakeChannels()
+        var tuning = fastTuning
+        tuning.feedback = .init(splitReports: true, rateControl: false)
+        let t = make(ch, tuning: tuning)
+        try await t.open()
+        try await t.activate(activation)
+        try await waitUntil("split reports") { await t.stats.audioReportsSent >= 2 }
+        await t.close()
+
+        let videoDec = try SRTCPDecryptor(blob: keys.videoKeyV)
+        let audioDec = try SRTCPDecryptor(blob: keys.audioKeyV)
+        let videoRRs = ch.video.sent.filter { RTCP.isRTCP($0) }.compactMap { videoDec.unprotect($0) }
+        let audioRRs = ch.audio.sent.filter { RTCP.isRTCP($0) }.compactMap { audioDec.unprotect($0) }
+        XCTAssertGreaterThanOrEqual(videoRRs.count, 2)
+        XCTAssertGreaterThanOrEqual(audioRRs.count, 2)
+        for p in videoRRs {
+            XCTAssertTrue(RTCP.packetTypes(p).contains(201))
+            XCTAssertEqual(p.subdata(in: 4..<8), Data([0x40, 0x14, 0x2F, 0x36]))
+        }
+        for p in audioRRs {
+            XCTAssertEqual(RTCP.packetTypes(p), [201])
+            XCTAssertEqual(p.subdata(in: 4..<8), Data([0x0A, 0x69, 0xA4, 0xFF]))
+        }
+        // Nothing protected with videoKeyV goes to P any more.
+        XCTAssertFalse(ch.audio.sent.contains { RTCP.isRTCP($0) && videoDec.unprotect($0) != nil })
+    }
+
     // MARK: burst starvation + adoption
 
     func testBurstWithTooFewPacketsIsStarved() async throws {
