@@ -34,6 +34,17 @@
 // VideoToolbox fills from the stream's VUI (Apple's stream: ITU_R_709_2);
 // BT.709 when absent, as gpu.py hard-codes. The range comes from the pixel
 // format ('444f' = full range, as the reference). Logged once per change.
+// Measured end to end (2026-11-18, simulator, test card on the Mac's Display
+// P3 virtual display; DEBUG `-colorDump`, RenderDump.swift): decoded and
+// drawn pixels equal the Mac's within 1/255 per patch (levels 0…255, no
+// 16–235 compression; P3 and sRGB primaries), 1-px patterns bit-exact.
+//
+// Sampling: when the canvas maps 1:1 onto the drawable (Fit Retina,
+// unzoomed: CompositeLayout.isOneToOne) the strips are sampled
+// nearest-neighbour, so each drawable pixel is exactly one decoded pixel;
+// otherwise bilinear. The letterbox origin is rounded to whole drawable
+// pixels (CompositeLayout.pixelAlignedFit): a half-pixel bar would blend
+// every row with its neighbour.
 //
 // TCP-only fallback (Task 19): a 32BGRA pixel buffer (FramebufferPipeline,
 // one tile = the whole canvas) is wrapped as one bgra8Unorm texture and drawn
@@ -83,7 +94,8 @@ import simd
 struct StripUniforms {
     var dstRect: SIMD4<Float>
     var texExtent: SIMD2<Float>
-    var pad = SIMD2<Float>(0, 0)
+    /// x: 1 = sample nearest-neighbour (exact 1:1 mapping), 0 = bilinear.
+    var opts = SIMD2<Float>(0, 0)
     var range: SIMD4<Float>
     var coeffs: SIMD4<Float>
 }
@@ -142,6 +154,25 @@ enum YCbCrMatrix: String {
     }
 }
 
+/// The exact maths of Shaders.metal `stripFragment` on the CPU (unit tests,
+/// DEBUG dumps): normalized Y, Cb, Cr (0…1, as the texture sampler returns
+/// them) → shader RGB (0…1, clamped).
+enum YCbCrConversion {
+    static func rgb(y: Float, cb: Float, cr: Float, range r: SIMD4<Float>, coeffs k: SIMD4<Float>) -> SIMD3<Float> {
+        let yy = (y - r.x) * r.y
+        let b = (cb - r.z) * r.w, c = (cr - r.z) * r.w
+        let out = SIMD3<Float>(yy + k.x * c, yy - k.y * b - k.z * c, yy + k.w * b)
+        return simd_clamp(out, .zero, SIMD3(repeating: 1))
+    }
+
+    /// 8-bit code values in, 8-bit RGB out (rounded).
+    static func rgb8(y: UInt8, cb: UInt8, cr: UInt8, format: YCbCrFormat, matrix: YCbCrMatrix) -> SIMD3<UInt8> {
+        let v = rgb(y: Float(y) / 255, cb: Float(cb) / 255, cr: Float(cr) / 255, range: format.range,
+                    coeffs: matrix.coefficients)
+        return SIMD3<UInt8>((v * 255).rounded(.toNearestOrAwayFromZero))
+    }
+}
+
 @MainActor
 final class MetalRenderer: NSObject, MTKViewDelegate {
     let device: MTLDevice
@@ -189,6 +220,11 @@ final class MetalRenderer: NSObject, MTKViewDelegate {
     private(set) var framesDrawn = 0
     /// Called on the main actor after the first picture is presented.
     var onFirstDraw: (() -> Void)?
+    #if DEBUG
+    /// RenderDump: when the dump is due (set at the first draw), and whether done.
+    private var dumpDue: ContinuousClock.Instant?
+    private var dumpDone = false
+    #endif
 
     static let colorPixelFormat: MTLPixelFormat = .bgra8Unorm
 
@@ -256,6 +292,9 @@ final class MetalRenderer: NSObject, MTKViewDelegate {
         view.device = device
         view.colorPixelFormat = Self.colorPixelFormat
         view.framebufferOnly = true
+        #if DEBUG
+        if RenderDump.requestedDelay != nil { view.framebufferOnly = false }     // drawable readback
+        #endif
         view.clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 1)
         view.enableSetNeedsDisplay = true
         view.isPaused = true
@@ -350,6 +389,9 @@ final class MetalRenderer: NSObject, MTKViewDelegate {
             lastDrawableSize = size
             return
         }
+        #if DEBUG
+        dumpIfDue(snap, view: view, drawable: drawable, cmd: cmd)
+        #endif
         cmd.present(drawable)
         cmd.commit()
         if snap.version != lastVersion { store.noteDrawn(changedAt: snap.changedAt, rtpTimestamp: snap.rtpTimestamp) }
@@ -362,6 +404,65 @@ final class MetalRenderer: NSObject, MTKViewDelegate {
         framesDrawn += 1
         if framesDrawn == 1 { onFirstDraw?() }
     }
+
+    #if DEBUG
+    /// RenderDump (`-colorDump <s>`): geometry log, CPU decode, drawable readback.
+    private func dumpIfDue(_ snap: VideoFrameStore.Snapshot, view: MTKView, drawable: CAMetalDrawable,
+                           cmd: MTLCommandBuffer) {
+        guard !dumpDone, let delay = RenderDump.requestedDelay else { return }
+        let now = ContinuousClock.now
+        guard let due = dumpDue else {
+            dumpDue = now + .milliseconds(Int(delay * 1000))
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay + 0.05) { [weak self, weak view] in
+                MainActor.assumeIsolated {
+                    self?.lastFeedbackRevision = nil      // force a redraw of the same picture
+                    view?.setNeedsDisplay()
+                }
+            }
+            return
+        }
+        guard now >= due, let layout = lastLayout else { return }
+        dumpDone = true
+        let size = view.drawableSize
+        let layer = view.layer as? CAMetalLayer
+        let zoom = viewport?.value ?? .identity
+        var geo = "DEBUG colorDump geometry: bounds=\(view.bounds.size) contentScaleFactor=\(view.contentScaleFactor) "
+            + "drawableSize=\(size) layer.contentsScale=\(layer?.contentsScale ?? 0) layer.bounds=\(layer?.bounds.size ?? .zero) "
+            + "screen.nativeScale=\(view.window?.screen.nativeScale ?? 0) pixelFormat=\(view.colorPixelFormat.rawValue) "
+            + "layer.pixelFormat=\(layer?.pixelFormat.rawValue ?? 0) colorspace=\(layerColorSpace.map { $0 as String } ?? "nil") "
+            + "edr=\(layer?.wantsExtendedDynamicRangeContent ?? false) canvas=\(layout.canvas) "
+            + "fit=\(CompositeLayout.pixelAlignedFit(layout.canvas, in: size)) oneToOne=\(layout.isOneToOne(in: size)) "
+            + "zoomed=\(zoom.isZoomed)"
+        for strip in layout.strips {
+            geo += " strip\(strip.tile)=\(zoom.toScreen(layout.viewRect(of: strip, in: size), viewSize: size))"
+        }
+        Log.video.info(geo)
+        let cpu = RenderDump.cpuComposite(snap, layout: layout)
+        let space = layerColorSpace.flatMap { CGColorSpace(name: $0) }
+        RenderDump.writePNG(cpu.ycc, width: cpu.w, height: cpu.h, space: nil, bgra: false, name: "ycc.png")
+        RenderDump.writePNG(cpu.rgb, width: cpu.w, height: cpu.h, space: space, bgra: false, name: "decoded.png")
+        try? cpu.notes.write(to: RenderDump.directory.appendingPathComponent("attachments.txt"), atomically: true,
+                             encoding: .utf8)
+        let tex = drawable.texture
+        let row = tex.width * 4
+        guard tex.pixelFormat == .bgra8Unorm,
+              let buffer = device.makeBuffer(length: row * tex.height, options: .storageModeShared),
+              let blit = cmd.makeBlitCommandEncoder() else {
+            Log.video.error("DEBUG colorDump: drawable readback unavailable (format \(tex.pixelFormat.rawValue))")
+            return
+        }
+        blit.copy(from: tex, sourceSlice: 0, sourceLevel: 0, sourceOrigin: MTLOrigin(x: 0, y: 0, z: 0),
+                  sourceSize: MTLSize(width: tex.width, height: tex.height, depth: 1), to: buffer,
+                  destinationOffset: 0, destinationBytesPerRow: row, destinationBytesPerImage: row * tex.height)
+        blit.endEncoding()
+        let w = tex.width, h = tex.height
+        let box = DumpBox(buffer: buffer, space: space)
+        cmd.addCompletedHandler { _ in
+            let bytes = [UInt8](UnsafeRawBufferPointer(start: box.buffer.contents(), count: row * h))
+            RenderDump.writePNG(bytes, width: w, height: h, space: box.space, bgra: true, name: "drawable.png")
+        }
+    }
+    #endif
 
     /// Runs the view's display link while paced pictures are queued (back
     /// to on-demand drawing `pacingIdle` after the queue empties) or while a
@@ -465,11 +566,14 @@ final class MetalRenderer: NSObject, MTKViewDelegate {
     private func drawStrips(_ enc: MTLRenderCommandEncoder, _ strips: [PreparedStrip], layout: CompositeLayout,
                             size: CGSize, zoom: Viewport) {
         var current: MTLRenderPipelineState?
+        // Fit Retina (canvas = drawable, unzoomed): nearest-neighbour, bit-exact.
+        let exact: Float = zoom == .identity && layout.isOneToOne(in: size) ? 1 : 0
         for p in strips {
             let state = p.chroma == nil ? bgraPipeline : pipeline
             if current !== state { enc.setRenderPipelineState(state); current = state }
             let r = zoom.toScreen(layout.viewRect(of: p.strip, in: size), viewSize: size)
             var u = p.uniforms
+            u.opts.x = exact
             u.dstRect = SIMD4(Float(r.minX / size.width * 2 - 1), Float(1 - r.minY / size.height * 2),
                               Float(r.maxX / size.width * 2 - 1), Float(1 - r.maxY / size.height * 2))
             enc.setVertexBytes(&u, length: MemoryLayout<StripUniforms>.stride, index: 0)
@@ -668,7 +772,7 @@ final class MetalRenderer: NSObject, MTKViewDelegate {
         guard let cursor, let img = cursor.image, let pos = cursor.position, img.width > 0, img.height > 0
         else { return }
         let host = cursor.hostSize.width > 0 && cursor.hostSize.height > 0 ? cursor.hostSize : canvas
-        let fit = CompositeLayout.aspectFit(host, in: size)
+        let fit = CompositeLayout.pixelAlignedFit(host, in: size)     // as the strips
         guard fit.width > 0, let tex = cursorTexture(for: img) else { return }
         let scl = fit.width / host.width * viewport.scale      // view px per canvas px (zoomed)
         let d = scl * cursor.pointScale
@@ -782,6 +886,14 @@ private final class ImageBox: @unchecked Sendable {
     let image: CGImage?
     init(_ image: CGImage?) { self.image = image }
 }
+
+#if DEBUG
+private final class DumpBox: @unchecked Sendable {   // read only after the GPU is done
+    let buffer: MTLBuffer
+    let space: CGColorSpace?
+    init(buffer: MTLBuffer, space: CGColorSpace?) { self.buffer = buffer; self.space = space }
+}
+#endif
 
 /// Keeps CVMetalTextures alive until a command buffer completes (read-only).
 private final class TextureHold: @unchecked Sendable {

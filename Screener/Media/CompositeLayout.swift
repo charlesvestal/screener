@@ -71,9 +71,31 @@ struct CompositeLayout: Equatable, Sendable {
                       width: size.width, height: size.height)
     }
 
-    /// Where `strip` lands in a view of `bounds` (top-left origin).
+    /// `aspectFit` for a target measured in PIXELS (the drawable), with the
+    /// letterbox origin rounded to whole pixels: a half-pixel offset would make
+    /// the bilinear sampler blend every pair of neighbouring pixels (a visible
+    /// softening at 1:1). The input mapping keeps the unrounded fit (points);
+    /// the two differ by at most half a drawable pixel.
+    static func pixelAlignedFit(_ content: CGSize, in pixels: CGSize) -> CGRect {
+        var fit = aspectFit(content, in: pixels)
+        fit.origin = CGPoint(x: fit.minX.rounded(), y: fit.minY.rounded())
+        return fit
+    }
+
+    /// The canvas lands on the `pixels` target exactly 1:1 (one canvas pixel
+    /// per target pixel, whole-pixel origin): it can be sampled
+    /// nearest-neighbour, bit-exact. (Fit Retina: canvas = drawable.)
+    func isOneToOne(in pixels: CGSize) -> Bool {
+        guard canvas.width > 0, canvas.height > 0 else { return false }
+        let fit = Self.pixelAlignedFit(canvas, in: pixels)
+        return fit.width == canvas.width && fit.height == canvas.height
+            && fit.minX == fit.minX.rounded() && fit.minY == fit.minY.rounded()
+    }
+
+    /// Where `strip` lands in a target of `bounds` PIXELS (top-left origin;
+    /// whole-pixel letterbox origin, `pixelAlignedFit`).
     func viewRect(of strip: Strip, in bounds: CGSize) -> CGRect {
-        let fit = Self.aspectFit(canvas, in: bounds)
+        let fit = Self.pixelAlignedFit(canvas, in: bounds)
         guard canvas.width > 0, canvas.height > 0 else { return .zero }
         let sx = fit.width / canvas.width, sy = fit.height / canvas.height
         return CGRect(x: fit.minX + strip.canvasRect.minX * sx, y: fit.minY + strip.canvasRect.minY * sy,

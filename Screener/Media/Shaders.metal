@@ -16,7 +16,7 @@ using namespace metal;
 struct StripUniforms {
     float4 dstRect;     // NDC: left, top, right, bottom
     float2 texExtent;   // fraction of the image sampled (cut at the canvas edge)
-    float2 pad;
+    float2 opts;        // x: 1 = nearest-neighbour (exact 1:1 mapping), 0 = bilinear
     float4 range;       // luma offset, luma scale, chroma offset, chroma scale
     float4 coeffs;      // R = Y + x·Cr; G = Y − y·Cb − z·Cr; B = Y + w·Cb
 };
@@ -39,9 +39,16 @@ fragment float4 stripFragment(VOut in [[stage_in]],
                               texture2d<float> lumaTex [[texture(0)]],
                               texture2d<float> chromaTex [[texture(1)]],
                               constant StripUniforms &u [[buffer(0)]]) {
-    constexpr sampler s(filter::linear, address::clamp_to_edge);
-    float y = (lumaTex.sample(s, in.uv).r - u.range.x) * u.range.y;
-    float2 c = (chromaTex.sample(s, in.uv).rg - u.range.z) * u.range.w;   // (Cb, Cr)
+    // 1:1 (CompositeLayout.isOneToOne): nearest-neighbour, so every drawable
+    // pixel is exactly one decoded pixel whatever the interpolated uv's
+    // rounding. Otherwise bilinear (scaled / zoomed).
+    constexpr sampler lin(filter::linear, address::clamp_to_edge);
+    constexpr sampler near(filter::nearest, address::clamp_to_edge);
+    bool exact = u.opts.x > 0.5;
+    float yv = exact ? lumaTex.sample(near, in.uv).r : lumaTex.sample(lin, in.uv).r;
+    float2 cv = exact ? chromaTex.sample(near, in.uv).rg : chromaTex.sample(lin, in.uv).rg;
+    float y = (yv - u.range.x) * u.range.y;
+    float2 c = (cv - u.range.z) * u.range.w;   // (Cb, Cr)
     float3 rgb = float3(y + u.coeffs.x * c.y,
                         y - u.coeffs.y * c.x - u.coeffs.z * c.y,
                         y + u.coeffs.w * c.x);
@@ -51,9 +58,11 @@ fragment float4 stripFragment(VOut in [[stage_in]],
 // TCP-only fallback (Task 19): the framebuffer path's BGRA8 picture
 // (FramebufferPipeline) is sampled as-is; same vertex stage as the strips.
 fragment float4 bgraFragment(VOut in [[stage_in]],
-                             texture2d<float> tex [[texture(0)]]) {
-    constexpr sampler s(filter::linear, address::clamp_to_edge);
-    return float4(tex.sample(s, in.uv).rgb, 1.0);
+                             texture2d<float> tex [[texture(0)]],
+                             constant StripUniforms &u [[buffer(0)]]) {
+    constexpr sampler lin(filter::linear, address::clamp_to_edge);
+    constexpr sampler near(filter::nearest, address::clamp_to_edge);
+    return float4((u.opts.x > 0.5 ? tex.sample(near, in.uv) : tex.sample(lin, in.uv)).rgb, 1.0);
 }
 
 // Cursor overlay (gpu.py WGSL_CURSOR): one textured quad over the video.

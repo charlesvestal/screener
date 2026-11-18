@@ -155,7 +155,7 @@ final class CompositeLayoutTests: XCTestCase {
         let l = CompositeLayout.make(canvas: CGSize(width: 1280, height: 1708), tileCount: 4,
                                      decoded: CGSize(width: 1280, height: 432))
         let bounds = CGSize(width: 2064, height: 2752)          // iPad Pro 13" portrait, pixels
-        let fit = CompositeLayout.aspectFit(l.canvas, in: bounds)
+        let fit = CompositeLayout.pixelAlignedFit(l.canvas, in: bounds)
         let rects = l.strips.map { l.viewRect(of: $0, in: bounds) }
         XCTAssertEqual(rects.first!.minY, fit.minY, accuracy: 1e-9)
         XCTAssertEqual(rects.last!.maxY, fit.maxY, accuracy: 1e-9)
