@@ -294,6 +294,18 @@
       ]
     }
   ],
-  "lastUpdated": "2026-11-14T17:30:30.612143",
-  "pausedAt": "2026-11-14T17:30:30.612143"
+  "lastUpdated": "2026-11-18T22:24:52.251943",
+  "pausedAt": "2026-11-14T17:30:30.612143",
+  "queued": [
+    {
+      "what": "iPhone support",
+      "detail": "TARGETED_DEVICE_FAMILY 1,2; compact host list; session fit for small screens (default Sharper/Match Mac); floating menu as bottom sheet; narrower keyboard accessory row; PiP on iPhone; test on paired iPhone 15 Pro (00000000-0000000000000000)",
+      "after": "current agents: keyboard/pointer, colour fidelity, fallback reconnect, PiP"
+    },
+    {
+      "what": "Designed for iPad on Mac",
+      "detail": "SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD=YES; smoke-test on the user's Apple-silicon laptop; note pointer-lock/keyboard differences",
+      "after": "with iPhone work"
+    }
+  ]
 }

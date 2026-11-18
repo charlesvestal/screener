@@ -77,3 +77,4 @@ build-fb2-dev/
 build-pip/
 build-pip-dev/
 .claude/worktrees/
+build-color/
