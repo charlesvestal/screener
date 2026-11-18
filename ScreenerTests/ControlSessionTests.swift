@@ -129,7 +129,8 @@ final class ControlSessionTests: XCTestCase {
             XCTAssertEqual(prelude, ClientMessage.viewerInfo() + ClientMessage.setEncryption(command: .start))
             try await fake.sendRekeyWithEncryptedTail()   // right after SetEncryption(1)
             let sdc = try await fake.readPlainSetDisplayConfiguration()
-            XCTAssertEqual(sdc, ClientMessage.setDisplayConfiguration(logicalWidth: 1376, logicalHeight: 1032, hidpiScale: 2))
+            XCTAssertEqual(sdc, ClientMessage.setDisplayConfiguration(logicalWidth: 1376, logicalHeight: 1032, hidpiScale: 2,
+                                                                  maxWidth: 3840, maxHeight: 3840))
             let enc = try await fake.readPlainSetEncodings()
             XCTAssertEqual(enc, ClientMessage.setEncodings())
             let stop = try await server.read(exactly: 8)
@@ -188,7 +189,8 @@ final class ControlSessionTests: XCTestCase {
         let params = try await session.start()
         let records = try await serverTask.value
 
-        XCTAssertEqual(records[0], ClientMessage.setDisplayConfiguration(logicalWidth: 1376, logicalHeight: 1032, hidpiScale: 2))
+        XCTAssertEqual(records[0], ClientMessage.setDisplayConfiguration(logicalWidth: 1376, logicalHeight: 1032, hidpiScale: 2,
+                                                                  maxWidth: 3840, maxHeight: 3840))
         XCTAssertEqual(records[1], ClientMessage.setEncodings())
         XCTAssertEqual(records[2], ClientMessage.framebufferUpdateRequest(incremental: false))
         XCTAssertEqual(records[3].first, 0x1c)
@@ -232,6 +234,104 @@ final class ControlSessionTests: XCTestCase {
         let next = try await fake.readRecord()
         XCTAssertEqual(next, ClientMessage.framebufferUpdateRequest(incremental: false))
         await session.close()
+    }
+
+    private func layoutRecord(scaled: (Int, Int), backing: (Int, Int)) -> Data {
+        var w = ByteWriter()
+        w.u8(0); w.u8(0); w.u16(1)
+        w.zeros(8); w.u32(0x451)
+        w.u16(12); w.u16(0); w.u16(UInt16(scaled.0)); w.u16(UInt16(scaled.1))
+        w.u16(UInt16(backing.0)); w.u16(UInt16(backing.1)); w.u16(0)
+        return w.data
+    }
+
+    /// RFC §10.9: dynamic 0x1d → 0x451 → 0x1c re-offer with the same keys.
+    /// The first 0x451 only confirms; an unchanged one gets no re-offer.
+    func testResizeRequestThenLayoutChangeReOffersTheSameMediaSession() async throws {
+        let (client, server) = MemoryPipe.pair()
+        let fake = FakeServer(server)
+        let bplist = try Self.answerBplist()
+        var tuning = ControlSession.Tuning.fast
+        tuning.cursorPollInterval = .seconds(60)
+        let session = makeSession(client, order: .reference, tuning: tuning)
+        let serverTask = Task { () -> Data in
+            try await fake.handshakeAndServerInit()
+            _ = try await server.read(exactly: 78)
+            try await fake.sendRekeyWithEncryptedTail()
+            _ = try await fake.readPlainSetDisplayConfiguration()
+            _ = try await fake.readPlainSetEncodings()
+            _ = try await server.read(exactly: 8)
+            var offer = Data()
+            for _ in 0..<3 { let r = try await fake.readRecord(); if r.first == 0x1c { offer = r } }
+            try await fake.sendAnswer(bplist)
+            return offer
+        }
+        let params = try await session.start()
+        let offer = try await serverTask.value
+        XCTAssertEqual(offer.first, 0x1c)
+
+        // Initial layout: confirmation only.
+        try await fake.sendRecord(layoutRecord(scaled: (1376, 1032), backing: (2752, 2064)))
+        let rec1 = try await fake.readRecord()
+        XCTAssertEqual(rec1, ClientMessage.framebufferUpdateRequest(incremental: false))
+
+        // The resize request: dynamic 0x1d, then a non-incremental 0x03.
+        let g = DisplayGeometry(logicalWidth: 1032, logicalHeight: 1376, hidpiScale: 2)
+        try await session.requestDisplay(g)
+        let sdc = try await fake.readRecord()
+        XCTAssertEqual(sdc, ClientMessage.setDisplayConfiguration(logicalWidth: 1032, logicalHeight: 1376, hidpiScale: 2,
+                                                                 dynamic: true, maxWidth: 3840, maxHeight: 3840))
+        let rec2 = try await fake.readRecord()
+        XCTAssertEqual(rec2, ClientMessage.framebufferUpdateRequest(incremental: false))
+
+        // The server confirms a different geometry (its cap): re-arm + re-offer.
+        try await fake.sendRecord(layoutRecord(scaled: (1032, 1376), backing: (2064, 2752)))
+        let rec3 = try await fake.readRecord()
+        XCTAssertEqual(rec3, ClientMessage.framebufferUpdateRequest(incremental: false))
+        let reoffer = try await fake.readRecord()
+        XCTAssertEqual(reoffer, offer, "the same 0x1c, same keys")
+        XCTAssertNotNil(reoffer.range(of: params.keys.videoKeyS))
+        let reoffers = await session.reoffersSent
+        XCTAssertEqual(reoffers, 1)
+
+        // Same geometry again (e.g. a login/lock transition): re-arm only.
+        try await fake.sendRecord(layoutRecord(scaled: (1032, 1376), backing: (2064, 2752)))
+        let rec4 = try await fake.readRecord()
+        XCTAssertEqual(rec4, ClientMessage.framebufferUpdateRequest(incremental: false))
+        try await session.send(ClientMessage.setMode(1))   // marker: nothing else was queued before it
+        let rec5 = try await fake.readRecord()
+        XCTAssertEqual(rec5, ClientMessage.setMode(1))
+        let after = await session.reoffersSent
+        XCTAssertEqual(after, 1)
+        await session.close()
+    }
+
+    /// DisplayMode.matchMac: the connect-time 0x1d is the bare descriptor at
+    /// ServerInit's size (1920×1080 in the fake) at 2×.
+    func testStaticDisplaySendsTheBareDescriptorAtTheServerSize() async throws {
+        let (client, server) = MemoryPipe.pair()
+        let fake = FakeServer(server)
+        var config = ControlSession.Config(host: "fake", port: 5900, username: "u", password: "p",
+                                           logicalSize: CGSize(width: 1376, height: 1032),
+                                           backingSize: CGSize(width: 2752, height: 2064), startupOrder: .reference)
+        config.dynamicDisplay = false
+        var seams = ControlSession.Seams.live
+        seams.connect = { _, _ in client }
+        seams.authenticate = { _, _, connect in
+            let s = try await connect()
+            return (s, AuthResult(wrapKey: ControlSessionTests.wrapKey, method: .srp, serverRSAPublicKeyDER: nil))
+        }
+        let session = ControlSession(config: config, tuning: .fast, seams: seams)
+        let startTask = Task { try await session.start() }
+        try await fake.handshakeAndServerInit()
+        _ = try await server.read(exactly: 78)
+        try await fake.sendRekeyWithEncryptedTail()
+        let sdc = try await fake.readPlainSetDisplayConfiguration()
+        XCTAssertEqual(sdc, ClientMessage.setDisplayConfiguration(logicalWidth: 1920, logicalHeight: 1080, hidpiScale: 2,
+                                                                 dynamic: false, maxWidth: 3840, maxHeight: 3840))
+        startTask.cancel()
+        await session.close()
+        _ = await startTask.result
     }
 
     /// session._maybe_poll_cursor: a 1×1 incremental 0x03 every tx tick.

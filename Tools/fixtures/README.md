@@ -91,7 +91,10 @@ the JSON is self-describing; this file summarizes the same information.
   `parse_apple_display_layout` is exercised against a synthesized 0x451
   body (1 display, 1920×1080 scaled / 3840×2160 backing, per RFC §8.4) and
   the fixture records both the synthesized input and the real parsed
-  output.
+  output. `build_virtual_display_dynamic_resize` is the same builder as
+  `session.send_dynamic_resolution` calls it for a mid-session resize
+  (RFC §7.3 / §10.9), over three `args.cases` (portrait, a ×0.8 landscape
+  size, a half-width window at scale 1.25); `result` is the list of outputs.
 
 - **`media_offer.json`** — `offers.py`, `negotiation.py`. `video_offer`/
   `audio_offer` come from `offers.create_offers(audio_enabled=True)` with

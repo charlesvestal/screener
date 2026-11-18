@@ -13,6 +13,7 @@ struct SessionView: View {
     @State private var menu = ControlMenuModel()
     @State private var menuExpanded = false
     @AppStorage(TouchInputMode.defaultsKey) private var touchModeRaw = TouchInputMode.default.rawValue
+    @AppStorage(DisplayMode.defaultsKey) private var displayModeRaw = DisplayMode.default.rawValue
 
     var body: some View {
         ZStack {
@@ -41,6 +42,9 @@ struct SessionView: View {
             // a user disconnect); never copied or logged.
             let coordinator = model
             menu.password = { [weak coordinator] in coordinator?.lastRequest?.password }
+        }
+        .onChange(of: displayModeRaw, initial: true) { _, raw in
+            model.setDisplayMode(DisplayMode(rawValue: raw) ?? .default)
         }
         .statusBarHidden(true)
         .persistentSystemOverlays(.hidden)
@@ -81,6 +85,22 @@ struct RemoteScreenView: UIViewRepresentable {
         let remoteInput = RemoteInputView(frame: .zero)
         /// Zoom/pan: changed by the input view, drawn by the renderer.
         let viewport = ViewportModel()
+        /// The video's size changed (rotation, Stage Manager): points, screen scale.
+        var onSizeChange: ((CGSize, CGFloat) -> Void)?
+        private var reportedSize: CGSize?
+
+        override func layoutSubviews() {
+            super.layoutSubviews()
+            guard bounds.size != reportedSize, bounds.width > 0, bounds.height > 0, let window else { return }
+            reportedSize = bounds.size
+            onSizeChange?(bounds.size, window.screen.nativeScale)
+        }
+
+        override func didMoveToWindow() {
+            super.didMoveToWindow()
+            reportedSize = nil
+            setNeedsLayout()
+        }
 
         override init(frame: CGRect) {
             super.init(frame: frame)
@@ -107,6 +127,8 @@ struct RemoteScreenView: UIViewRepresentable {
             context.coordinator.renderer = renderer
         }
         view.remoteInput.cursor = cursor
+        // Rotation / Stage Manager resize → in-band dynamic resolution (DisplayResizer).
+        view.onSizeChange = { [weak model] size, scale in model?.viewSizeChanged(points: size, scale: scale) }
         // Before any teardown (disconnect, background, failure) the
         // coordinator must release every held key/button on the Mac; this is
         // the one seam between the UI's RemoteInputView and the coordinator,
@@ -141,6 +163,7 @@ struct RemoteScreenView: UIViewRepresentable {
         view.remoteInput.modifiers = nil
         view.remoteInput.controlMenu = nil
         view.remoteInput.onPointerMoved = nil
+        view.onSizeChange = nil
         coordinator.renderer?.detach()
         coordinator.renderer = nil
     }

@@ -64,12 +64,44 @@ final class MessagesTests: XCTestCase {
         XCTAssertEqual(msg.count, 308, "RFC §7.1: 1 display, 5 modes = 308 bytes")
     }
 
+    /// RFC §7.3 / §10.9 step 1: the mid-session resize request is the full
+    /// dynamic descriptor, byte-identical to what session.send_dynamic_resolution
+    /// sends (rfb.build_virtual_display) for the same size, scale and the
+    /// reference's 3840×2160 max (ours defaults to 3840×3840, see below).
+    func testDynamicResizeDescriptorMatchesTheReference() throws {
+        let entry = f["build_virtual_display_dynamic_resize"] as! [String: Any]
+        let cases = (entry["args"] as! [String: Any])["cases"] as! [[String: Any]]
+        let results = entry["result"] as! [String]
+        XCTAssertEqual(cases.count, results.count)
+        for (c, expected) in zip(cases, results) {
+            let w = c["width"] as! Int, h = c["height"] as! Int, scale = c["hidpi_scale"] as! Double
+            let msg = ClientMessage.setDisplayConfiguration(logicalWidth: w, logicalHeight: h, hidpiScale: scale,
+                                                            dynamic: true, displayName: "iShareScreen Virtual Display",
+                                                            maxWidth: 3840, maxHeight: 2160)
+            XCTAssertEqual(msg.hex, expected, "\(w)x\(h)@\(scale)")
+            let d = 0x0c
+            XCTAssertEqual(Data(msg[d + 0x7a..<d + 0x82]).hex, "0000000100000004", "display_flags bit 0, display_type 4")
+            XCTAssertEqual(Data(msg[d + 0x92..<d + 0x9a]).hex, "0000000000000007", "mode indices 0, rotations 7")
+        }
+        // What requestDisplay sends: the same bytes but for the max size field.
+        let g = DisplayGeometry(logicalWidth: 1032, logicalHeight: 1376, hidpiScale: 2)
+        let ours = ClientMessage.setDisplayConfiguration(logicalWidth: 1032, logicalHeight: 1376, hidpiScale: 2,
+                                                         dynamic: true, displayName: "iShareScreen Virtual Display",
+                                                         maxWidth: g.maxBacking.width, maxHeight: g.maxBacking.height)
+        let reference = Data(hex: results[0])
+        XCTAssertEqual(Data(ours[0x0c + 0x8a..<0x0c + 0x92]).hex, "00000f0000000f00", "max 3840x3840")
+        var patched = ours
+        patched.replaceSubrange(0x0c + 0x8e..<0x0c + 0x92, with: [0, 0, 0x08, 0x70])   // 2160
+        XCTAssertEqual(patched, reference)
+    }
+
     func testFixtureKeysAllCovered() {
         // Guard: if the fixture grows a key, this test forces a matching assertion.
         let covered: Set<String> = ["_build_apple_viewer_command_mask", "_build_msg10_pointer",
                                     "build_auto_framebuffer_update", "build_fbu_request", "build_key_event",
                                     "build_pointer_event", "build_post_encryption_toggle", "build_set_encodings",
                                     "build_viewer_info", "build_virtual_display",
+                                    "build_virtual_display_dynamic_resize",
                                     "parse_apple_display_layout" /* ServerMessagesTests */]
         XCTAssertEqual(Set(f.keys), covered)
     }

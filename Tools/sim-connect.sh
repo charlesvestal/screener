@@ -6,6 +6,8 @@
 #     seconds        -autoDisconnectAfter (default 20)
 #     startup-order  reference (default) | native — ControlSession.StartupOrder
 #
+# SCREENER_EXTRA_ARGS (env): more launch arguments, split on spaces (see
+# DebugLaunch.swift, e.g. "-displayMode sharper -testResize 12:1032x1376").
 # SCREENER_LOCAL_ADDR=<ipv4> (env) pins the app's TCP + UDP source address
 # (-localAddress). HP media goes to the TCP peer address on the server's own
 # port numbers, so testing against THIS Mac needs two local IPs: connect to
@@ -29,6 +31,8 @@ HOST=${1:-127.0.0.1}
 AFTER=${2:-20}
 ORDER=${3:-}
 ENV_FILE=${SCREENER_TEST_ENV:-$HOME/.screener-test.env}
+# SCREENER_DERIVED (env): the build directory (default build-sim).
+DERIVED=${SCREENER_DERIVED:-build-sim}
 
 [[ $AFTER =~ ^[0-9]+$ ]] || { echo "seconds must be a whole number" >&2; exit 2; }
 if [[ -n $ORDER && $ORDER != reference && $ORDER != native ]]; then
@@ -72,14 +76,18 @@ cd "$(dirname "$0")/.."
 xcrun simctl bootstatus "$UDID" -b >/dev/null
 xcodegen generate >/dev/null
 xcodebuild -project Screener.xcodeproj -scheme Screener -configuration Debug \
-  -destination "platform=iOS Simulator,id=$UDID" -derivedDataPath build-sim build -quiet
-APP=build-sim/Build/Products/Debug-iphonesimulator/Screener.app
+  -destination "platform=iOS Simulator,id=$UDID" -derivedDataPath "$DERIVED" build -quiet
+APP=$DERIVED/Build/Products/Debug-iphonesimulator/Screener.app
 xcrun simctl install "$UDID" "$APP"
 
 # --- launch (credentials go only into the child's environment) ---
 args=(-autoConnect "$HOST" -autoDisconnectAfter "$AFTER")
 [[ -n $ORDER ]] && args+=(-startupOrder "$ORDER")
 [[ -n ${SCREENER_LOCAL_ADDR:-} ]] && args+=(-localAddress "$SCREENER_LOCAL_ADDR")
+if [[ -n ${SCREENER_EXTRA_ARGS:-} ]]; then
+  read -r -a extra <<< "$SCREENER_EXTRA_ARGS"
+  args+=("${extra[@]}")
+fi
 echo "Launching $BUNDLE: ${args[*]}"
 SIMCTL_CHILD_SCREENER_USER=$SCREENER_USER_VALUE SIMCTL_CHILD_SCREENER_PASS=$SCREENER_PASS_VALUE \
   xcrun simctl launch --terminate-running-process "$UDID" "$BUNDLE" "${args[@]}" >/dev/null

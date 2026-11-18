@@ -11,6 +11,9 @@
 //     static screen sends nothing, and held AUs must still be released);
 //   * .needKeyframe → MediaTransport.requestKeyframe (rate-limited there);
 //   * .parameterSets → decoder (re)configure; .notHEVC → onNotHEVC;
+//   * a new SSRC group or new parameter sets mid-session (a dynamic resize,
+//     RFC §10.9) → VideoFrameStore.beginGroup: the last picture stays up
+//     until the new stream's first one is complete;
 //   * decoded pictures go straight from VideoToolbox's thread to the frame
 //     store, and MediaTransport.notePublished() is called (throttled) so the
 //     SSRC-adoption stall timer follows real decoded output;
@@ -172,13 +175,17 @@ actor VideoPipeline {
             guard !stopped, group.contains(p.ssrc) else { return }   // not (yet) an adopted tile
             if let a = assembler {
                 if group != a.tileSSRCs {
+                    // A resize (RFC §10.9) or a server restart: re-harvest the
+                    // parameter sets, re-root on the new IDR, and keep the
+                    // last picture up until the new stream's first one.
                     Log.video.info("video: SSRC group changed → \(group.map { String(format: "%08x", $0) })")
                     a.resetForNewGroup(tileSSRCs: group)
+                    store.beginGroup(tileCount: group.count, afterSeq: VideoDecoder.lastSequence)
                 }
             } else {
                 assembler = HEVCAssembler(tileSSRCs: group, config: Self.assemblerConfig)
+                store.configure(tileCount: group.count)
             }
-            store.configure(tileCount: group.count)
         }
         await handle(assembler!.ingest(p))
     }
@@ -208,7 +215,14 @@ actor VideoPipeline {
                     + (info.map { "profile=\($0.profileIdc) chroma=\($0.chromaFormatIdc) "
                                   + "\($0.width)x\($0.height) \($0.bitDepthLuma)-bit" } ?? ""))
                 do {
-                    if try decoder.configure(vps: vps, sps: sps, pps: pps) { recovery.noteModeChanged() }
+                    let wasConfigured = decoder.formatDescription != nil
+                    if try decoder.configure(vps: vps, sps: sps, pps: pps) {
+                        recovery.noteModeChanged()
+                        // New parameter sets mid-session (a resize keeps or
+                        // changes the group): pictures from here on are the
+                        // new stream's.
+                        if wasConfigured { store.beginGroup(tileCount: nil, afterSeq: VideoDecoder.lastSequence) }
+                    }
                 } catch {
                     Log.video.error("video: decoder configure failed: \(error)")
                 }

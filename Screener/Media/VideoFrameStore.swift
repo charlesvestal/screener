@@ -59,6 +59,18 @@
 // video stream is 24 kHz (measured 24.03–24.05 kHz over 35–50 s); the
 // rolling floor absorbs the drift.
 //
+// Resize hold (Task 21, RFC §10.9): a dynamic resize restarts the encoder on
+// a new SSRC group with new parameter sets, a new canvas and maybe a new tile
+// count. `holdForResize(canvas:)` (the 0x451) and `beginGroup` (the pipeline:
+// new group / new parameter sets) keep the last picture, its canvas and tile
+// count on screen — the renderer keeps scaling it into the view — until the
+// new stream's first picture has every tile (or `incomingTimeout` after its
+// first strip); then frames, canvas and tile count switch together, so there
+// is no black flash and old strips are never laid out on the new canvas.
+// Pictures are told apart by their decoder sequence number (submitted after
+// `beginGroup` = new stream). A held canvas with no new stream after
+// `resizeHoldLimit` is applied anyway.
+//
 // `onChange` (the renderer's redraw trigger) is called, outside the lock,
 // after every change that bumps `version`.
 import CoreGraphics
@@ -155,6 +167,12 @@ final class VideoFrameStore: @unchecked Sendable {   // all state behind `lock`
     /// / 11.2 ms (the previous store: 23 ms, and 53 pictures never shown).
     static let recentPictures = 30
 
+    /// Resize hold: a partial first picture of the new stream is shown this
+    /// long after its first strip; a held canvas without a new stream is
+    /// applied after `resizeHoldLimit`.
+    static let incomingTimeout: Duration = .milliseconds(500)
+    static let resizeHoldLimit: Duration = .seconds(3)
+
     private let lock = NSLock()
     private var frames: [Int: (buffer: CVPixelBuffer, seq: Int)] = [:]
     private struct StagedPicture {
@@ -172,6 +190,16 @@ final class VideoFrameStore: @unchecked Sendable {   // all state behind `lock`
     /// Tile sets of the last `recentPictures` pictures shown, oldest first.
     private var recentSets: [Set<Int>] = []
     private var partialCommits = 0
+    /// Resize hold (see the header).
+    private struct NextGroup {
+        var afterSeq: Int
+        var tileCount: Int?
+        var incoming: [Int: (buffer: CVPixelBuffer, seq: Int)] = [:]
+        var firstAt: ContinuousClock.Instant?
+        var since: ContinuousClock.Instant
+    }
+    private var nextGroup: NextGroup?
+    private var heldCanvas: (size: CGSize, since: ContinuousClock.Instant)?
     private var present = PresentStats()
     private var changedAt: ContinuousClock.Instant?
     /// Newest RTP timestamp staged this session (out-of-order detection).
@@ -233,6 +261,7 @@ final class VideoFrameStore: @unchecked Sendable {   // all state behind `lock`
     func reset() -> Int {
         let (e, cb) = lock.withLock {
             frames = [:]; version += 1; canvas = nil; tileCount = 4
+            nextGroup = nil; heldCanvas = nil
             pending = []; shownTimestamp = nil; shownMissing = []; newestStaged = nil; recentSets = []
             resetPacingLocked()
             counters = Counters(); firstFrameSeen = false
@@ -255,7 +284,10 @@ final class VideoFrameStore: @unchecked Sendable {   // all state behind `lock`
                 pending = []; shownTimestamp = nil; shownMissing = []; recentSets = []
                 version += 1
             }
-            if let canvas, canvas != self.canvas { self.canvas = canvas; version += 1 }
+            if let canvas {
+                heldCanvas = nil
+                if canvas != self.canvas { self.canvas = canvas; version += 1 }
+            }
             guard version != before else { return nil }
             scheduleLocked(ts: nil, now: .now)
             return _onChange
@@ -280,7 +312,14 @@ final class VideoFrameStore: @unchecked Sendable {   // all state behind `lock`
             counters.decodeNanos += f.decodeTime.components.seconds * 1_000_000_000
                 + f.decodeTime.components.attoseconds / 1_000_000_000
             let committed: Bool
-            if let ts = f.rtpTimestamp, tileCount > 1 {
+            if var next = nextGroup, f.seq > next.afterSeq {
+                // The new stream (resize hold): collect its first picture.
+                next.incoming[f.tile] = (f.pixelBuffer, f.seq)
+                next.firstAt = next.firstAt ?? now
+                nextGroup = next
+                committed = next.incoming.count >= (next.tileCount ?? tileCount)
+                if committed { switchToNextGroupLocked(now: now, reason: "complete") }
+            } else if let ts = f.rtpTimestamp, tileCount > 1 {
                 committed = stageLocked(f, ts: ts, now: now)
             } else {
                 frames[f.tile] = (f.pixelBuffer, f.seq)
@@ -341,6 +380,76 @@ final class VideoFrameStore: @unchecked Sendable {   // all state behind `lock`
         return true
     }
 
+    // MARK: resize hold
+
+    /// The server confirmed a new display geometry (0x451, RFC §7.5): with a
+    /// picture on screen, `canvas` applies together with the new stream's
+    /// first picture (see the header); with none, at once.
+    func holdForResize(canvas size: CGSize, now: ContinuousClock.Instant = .now) {
+        let cb: (@Sendable () -> Void)? = lock.withLock {
+            guard size != canvas || nextGroup != nil else { heldCanvas = nil; return nil }
+            if frames.isEmpty, pending.isEmpty, nextGroup == nil {
+                heldCanvas = nil
+                canvas = size; version += 1
+                scheduleLocked(ts: nil, now: now)
+                return _onChange
+            }
+            heldCanvas = (size, now)
+            return nil
+        }
+        cb?()
+    }
+
+    /// The video pipeline switched to a new stream (SSRC group or parameter
+    /// sets) of `tileCount` tiles (nil: unchanged): pictures submitted after
+    /// decoder sequence `afterSeq` belong to it. Until its first picture is
+    /// in, the current one stays up. With nothing on screen it applies at once.
+    func beginGroup(tileCount: Int?, afterSeq: Int, now: ContinuousClock.Instant = .now) {
+        let cb: (@Sendable () -> Void)? = lock.withLock {
+            if frames.isEmpty, pending.isEmpty, nextGroup == nil {
+                var changed = false
+                if let t = tileCount, t > 0, t != self.tileCount { self.tileCount = t; changed = true }
+                if let held = heldCanvas { heldCanvas = nil; if held.size != canvas { canvas = held.size; changed = true } }
+                guard changed else { return nil }
+                version += 1
+                scheduleLocked(ts: nil, now: now)
+                return _onChange
+            }
+            var next = nextGroup ?? NextGroup(afterSeq: afterSeq, since: now)
+            next.afterSeq = max(next.afterSeq, afterSeq)
+            if let t = tileCount, t > 0 { next.tileCount = t }
+            // Strips of the new stream decoded before this call stay in.
+            next.incoming = next.incoming.filter { $0.value.seq > next.afterSeq }
+            if next.incoming.isEmpty { next.firstAt = nil }
+            nextGroup = next
+            return nil
+        }
+        cb?()
+    }
+
+    /// Holding the last picture for a resize / stream switch.
+    var isHoldingForNewStream: Bool { lock.withLock { nextGroup != nil || heldCanvas != nil } }
+
+    /// Frames, tile count and canvas switch to the new stream together.
+    private func switchToNextGroupLocked(now: ContinuousClock.Instant, reason: String) {
+        guard let next = nextGroup else { return }
+        nextGroup = nil
+        let newTiles = next.tileCount.flatMap { $0 > 0 ? $0 : nil } ?? tileCount
+        let geometryChanged = heldCanvas != nil || newTiles != tileCount
+        // Same geometry (a plain stream restart): a tile the new picture
+        // lacks keeps its last strip; otherwise old strips cannot be mixed in.
+        frames = geometryChanged ? next.incoming : frames.merging(next.incoming) { _, new in new }
+        tileCount = newTiles
+        if let held = heldCanvas { canvas = held.size }
+        heldCanvas = nil
+        pending = []; shownTimestamp = nil; shownMissing = []; recentSets = []; newestStaged = nil
+        version += 1
+        changedAt = now
+        scheduleLocked(ts: nil, now: now)
+        Log.video.info("video: new stream shown (\(reason): \(next.incoming.count)/\(newTiles) tiles, canvas "
+                       + "\(canvas.map { "\(Int($0.width))x\(Int($0.height))" } ?? "-"), held \((now - next.since).ms) ms)")
+    }
+
     /// Commits a staged picture older than `timeout` (the pipeline ticker).
     func flushStaged(now: ContinuousClock.Instant = .now, timeout: Duration = VideoFrameStore.stagingTimeout) {
         let cb: (@Sendable () -> Void)? = lock.withLock {
@@ -348,6 +457,15 @@ final class VideoFrameStore: @unchecked Sendable {   // all state behind `lock`
             while let oldest = pending.first, now - oldest.lastStrip >= timeout {
                 commitLocked(through: 0, now: now, reason: "timeout")
                 changed = true
+            }
+            if let first = nextGroup?.firstAt, now - first >= Self.incomingTimeout {
+                switchToNextGroupLocked(now: now, reason: "timeout")
+                changed = true
+            } else if nextGroup == nil, let held = heldCanvas, now - held.since >= Self.resizeHoldLimit {
+                Log.video.error("video: resize hold: no new stream \(Self.resizeHoldLimit.ms) ms after the layout; "
+                                + "applying canvas \(Int(held.size.width))x\(Int(held.size.height))")
+                heldCanvas = nil
+                if held.size != canvas { canvas = held.size; version += 1; changed = true }
             }
             return changed ? _onChange : nil
         }

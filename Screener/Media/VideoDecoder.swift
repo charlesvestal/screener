@@ -114,6 +114,9 @@ final class VideoDecoder {
     /// out of order in a shared store.
     private static let sequence = Atomic<Int>(0)
     static func nextSequence() -> Int { sequence.wrappingAdd(1, ordering: .relaxed).newValue }
+    /// The newest sequence handed out: every frame submitted later has a larger one
+    /// (VideoFrameStore.beginGroup splits old- from new-geometry pictures on it).
+    static var lastSequence: Int { sequence.load(ordering: .relaxed) }
 
     init(onEvent: @escaping @Sendable (Event) -> Void) {
         self.onEvent = onEvent

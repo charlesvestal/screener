@@ -52,6 +52,14 @@
 //     login → desktop transitions, not getting connected at all (loopback
 //     included). `_handshake_with_reconnect` (burst-starvation reconnect)
 //     lives in SessionCoordinator, which owns the UDP side.
+//   * Dynamic resolution (RFC §10.9, session.send_dynamic_resolution /
+//     _schedule_post_layout_arm): `requestDisplay` sends a dynamic 0x1d +
+//     non-incremental 0x03; a 0x451 whose backing size differs from the
+//     previous one gets the 0x1c re-offer with the negotiated keys. The
+//     descriptor's max size is 3840×3840, not the reference's 3840×2160: the
+//     server keeps the connect-time bound per axis for the whole session, so
+//     3840×2160 turns every portrait request taller than 2160 into a small
+//     fallback canvas (live, 2026-11-18).
 //   * Session-select cmd 0/2 (share console / alt session) is not implemented
 //     in v1: the prompt is reported as `.sessionSelectUnsupported`.
 import CoreGraphics
@@ -117,6 +125,10 @@ actor ControlSession {
         var backingSize: CGSize
         var audioEnabled: Bool = true
         var startupOrder: StartupOrder = .reference
+        /// The connect-time 0x1d is a full dynamic descriptor (RFC §7.3), so
+        /// later `requestDisplay` resizes work; false (DisplayMode.matchMac):
+        /// the bare descriptor, sized to ServerInit's framebuffer at 2×.
+        var dynamicDisplay = true
     }
 
     /// Timing knobs; defaults are the reference's values.
@@ -224,6 +236,14 @@ actor ControlSession {
     private var answerTimer: Task<Void, Never>?
     private var answerGeneration = 0
 
+    // Dynamic resolution (RFC §10.9; session._schedule_post_layout_arm).
+    /// The 0x1c the session was negotiated with (same keys): re-sent after a
+    /// 0x451 that changes the backing geometry. nil until the answer.
+    private var offerMessage: Data?
+    /// The backing size of the last 0x451 (the first one only confirms).
+    private var lastLayoutBacking: (width: Int, height: Int)?
+    private(set) var reoffersSent = 0
+
     init(config: Config, tuning: Tuning = Tuning(), seams: Seams = .live) {
         self.config = config
         self.tuning = tuning
@@ -307,10 +327,20 @@ actor ControlSession {
 
         // 3) Cleartext prelude.
         beginStep("cleartext prelude")
-        let scale = cfg.logicalSize.width > 0 ? Double(cfg.backingSize.width / cfg.logicalSize.width) : 2.0
-        let sdc = ClientMessage.setDisplayConfiguration(logicalWidth: Int(cfg.logicalSize.width.rounded()),
-                                                        logicalHeight: Int(cfg.logicalSize.height.rounded()),
-                                                        hidpiScale: scale)
+        let requested = DisplayGeometry(logicalWidth: Int(cfg.logicalSize.width.rounded()),
+                                        logicalHeight: Int(cfg.logicalSize.height.rounded()),
+                                        hidpiScale: cfg.logicalSize.width > 0
+                                            ? Double(cfg.backingSize.width / cfg.logicalSize.width) : 2.0)
+        let display = cfg.dynamicDisplay ? requested
+            : DisplayGeometry.matching(serverWidth: serverInit.width, serverHeight: serverInit.height) ?? requested
+        let scale = display.hidpiScale
+        let sdc = ClientMessage.setDisplayConfiguration(logicalWidth: display.logicalWidth,
+                                                        logicalHeight: display.logicalHeight,
+                                                        hidpiScale: scale, dynamic: cfg.dynamicDisplay,
+                                                        maxWidth: display.maxBacking.width,
+                                                        maxHeight: display.maxBacking.height)
+        Log.control.info("display: connect-time 0x1d \(display) dynamic=\(cfg.dynamicDisplay) "
+                         + "max=\(display.maxBacking.width)x\(display.maxBacking.height)")
         try await writePlain(ClientMessage.viewerInfo() + ClientMessage.setEncryption(command: .start))
         try await Task.sleep(for: tuning.postViewerInfoSettle)
         switch cfg.startupOrder {
@@ -386,6 +416,7 @@ actor ControlSession {
         guard case .answer(let answer) = outcome, let record else { throw ControlSessionError.closed }
         Log.control.info("M2 media answer canvas=\(answer.canvasWidth)x\(answer.canvasHeight) tiles=\(answer.tiles)")
 
+        offerMessage = msg1c
         startCursorPoll()
         return MediaParams(keys: keys, canvas: (answer.canvasWidth, answer.canvasHeight), tiles: answer.tiles,
                            contentKey: record.contentKey, audioOffer: offers.audio, videoOffer: offers.video,
@@ -565,12 +596,14 @@ actor ControlSession {
         var sawCursor = false
         for event in events {
             switch event {
-            case .displayLayout:
+            case .displayLayout(let l):
                 // session._handle_fbu 0x451 → _send_cursor_rearm: one
                 // non-incremental 0x03 on EVERY layout, never 0x09.
-                // TODO(Task 21): on a geometry change also re-offer 0x1c
-                // (session._schedule_post_layout_arm).
                 try await send(ClientMessage.framebufferUpdateRequest(incremental: false))
+                // ...and on a backing-geometry CHANGE, the 0x1c re-offer with
+                // the same keys (_schedule_post_layout_arm, RFC §10.9 step
+                // 3): without it the server stops emitting media.
+                try await layoutReceived(l)
             case .cursorStore, .cursorSelect:
                 sawCursor = true
             case .mediaStreamAnswer(let data):
@@ -580,6 +613,8 @@ actor ControlSession {
                     } else {
                         resolveAnswer(.success(.degenerate))
                     }
+                } else if reoffersSent > 0, let a = try? MediaStreamOptions.parseAnswer(data) {
+                    Log.control.info("display: re-offer answer canvas=\(a.canvasWidth)x\(a.canvasHeight) tiles=\(a.tiles)")
                 }
             case .rekey:
                 // TODO: wrap-key rotation (RFC §6.2.1) is unobserved in captures and unported.
@@ -592,6 +627,38 @@ actor ControlSession {
         // session._handle_fbu tail: after an FBU with a cursor rect, re-request a
         // 1×1 incremental update so shape changes keep flowing.
         if sawCursor { try await send(Self.cursorPoll) }
+    }
+
+    // MARK: dynamic resolution (RFC §7.3, §10.9)
+
+    /// session.send_dynamic_resolution: a steady-state dynamic 0x1d for the
+    /// new size, then a non-incremental 0x03. The server answers with a 0x451
+    /// (handled in `layoutReceived`), which may carry a smaller geometry than
+    /// asked (backing cap): that answer, not this request, is authoritative.
+    func requestDisplay(_ g: DisplayGeometry) async throws {
+        Log.control.info("display: dynamic resolution requesting \(g)")
+        try await send(ClientMessage.setDisplayConfiguration(logicalWidth: g.logicalWidth,
+                                                             logicalHeight: g.logicalHeight,
+                                                             hidpiScale: g.hidpiScale, dynamic: true,
+                                                             maxWidth: g.maxBacking.width,
+                                                             maxHeight: g.maxBacking.height))
+        try await send(ClientMessage.framebufferUpdateRequest(incremental: false))
+    }
+
+    /// The 0x451 handler's geometry check (session._handle_fbu): the first
+    /// layout only confirms; a later one with a different backing size gets
+    /// the 0x1c re-offer so the encoder restarts at the new canvas.
+    private func layoutReceived(_ l: DisplayLayout) async throws {
+        guard l.backingWidth > 0, l.backingHeight > 0 else { return }
+        let previous = lastLayoutBacking
+        lastLayoutBacking = (l.backingWidth, l.backingHeight)
+        guard let previous, previous != (l.backingWidth, l.backingHeight) else { return }
+        Log.control.info("display: layout changed \(previous.width)x\(previous.height) → "
+                         + "\(l.backingWidth)x\(l.backingHeight) (scaled \(l.scaledWidth)x\(l.scaledHeight))")
+        guard let offerMessage else { return }   // still negotiating: the answer wait covers it
+        try await send(offerMessage)
+        reoffersSent += 1
+        Log.control.info("display: post-layout 0x1c re-offer sent (\(offerMessage.count)B, same keys)")
     }
 
     // MARK: cursor poll (session._maybe_poll_cursor, every _TX_INTERVAL_S)

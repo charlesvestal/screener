@@ -153,6 +153,9 @@ struct SSRCGroupTracker: Sendable {
     private(set) var active: [UInt32] = []
     private(set) var blacklist: Set<UInt32> = []
     private(set) var lastPublish: ContinuousClock.Instant?
+    /// A new group is expected until then (a dynamic resize's 0x1c re-offer,
+    /// RFC §10.9 step 4): adopt it without waiting for the stall.
+    private(set) var expectingUntil: ContinuousClock.Instant?
 
     init(groupSize: Int = 4, threshold: Int = 5, stall: Duration = .seconds(2)) {
         self.groupSize = groupSize
@@ -166,12 +169,17 @@ struct SSRCGroupTracker: Sendable {
 
     mutating func notePublish(at now: ContinuousClock.Instant) { lastPublish = now }
 
+    mutating func expectNewGroup(until deadline: ContinuousClock.Instant) { expectingUntil = deadline }
+
+    func isExpecting(at now: ContinuousClock.Instant) -> Bool { expectingUntil.map { now < $0 } ?? false }
+
     /// Returns the newly adopted group (sorted) when `ssrc`'s arrival tips a
     /// fresh consecutive group into adoption, else nil.
     mutating func noteUnknown(_ ssrc: UInt32, counts: [UInt32: Int], now: ContinuousClock.Instant) -> [UInt32]? {
         if active.contains(ssrc) { return nil }
-        // Only switch when there is no working group or it has gone quiet.
-        if !active.isEmpty, let last = lastPublish, now - last < stall { return nil }
+        // Only switch when there is no working group or it has gone quiet
+        // (or a resize announced the new one).
+        if !isExpecting(at: now), !active.isEmpty, let last = lastPublish, now - last < stall { return nil }
         let activeSet = Set(active)
         let candidates = counts.filter { !activeSet.contains($0.key) && !blacklist.contains($0.key) && $0.value >= threshold }
             .keys.sorted()
@@ -197,6 +205,7 @@ struct SSRCGroupTracker: Sendable {
         blacklist.formUnion(active)
         active = newGroup
         lastPublish = now   // grace window before another adoption
+        expectingUntil = nil
         return newGroup
     }
 }
@@ -323,6 +332,8 @@ actor MediaTransport {
         var srSSRCs: Set<UInt32> = []
         var activeVideoSSRCs: [UInt32] = []
         var ssrcCounts: [UInt32: Int] = [:]
+        /// SSRC groups adopted after the burst (resizes, server restarts).
+        var groupAdoptions = 0
     }
 
     enum BurstOutcome: Sendable, Equatable {
@@ -398,6 +409,10 @@ actor MediaTransport {
     private var burstVideo: [MediaPacket] = []
     private var burstResult: BurstOutcome?
     private var burstWaiters: [CheckedContinuation<BurstOutcome, Never>] = []
+    /// While a new group is expected: packets from SSRCs outside the active
+    /// group, replayed for the group that gets adopted (its VPS/SPS/PPS + IDR
+    /// burst is in the first packets, before adoption's threshold is met).
+    private var expectedGroupBuffer: [MediaPacket] = []
 
     private var counters = Stats()
     /// Rate window for the stats line: (when, payload bytes, packets) at the last line.
@@ -566,6 +581,7 @@ actor MediaTransport {
         tracker = SSRCGroupTracker(threshold: tuning.adoptThreshold, stall: tuning.adoptStall)
         groupLocked = false; burstLockScheduled = false
         burstVideo = []; burstResult = nil
+        expectedGroupBuffer = []
         pending = []
         counters = Stats()
         Log.media.info("media transport reset for a fresh handshake (sockets kept)")
@@ -745,11 +761,38 @@ actor MediaTransport {
             return
         }
         let counts = videoDecryptor?.ssrcCounts ?? [:]
-        if let adopted = tracker.noteUnknown(pkt.ssrc, counts: counts, now: clock.now) {
-            Log.media.info("adopting fresh SSRC group: \(adopted.map(hex))")
-            for s in adopted { requestKeyframe(ssrc: s, congestionSignal: false) }
-            emitVideo(pkt)
+        let now = clock.now
+        let expecting = tracker.isExpecting(at: now)
+        if expecting {
+            if expectedGroupBuffer.count < tuning.rawBufferLimit { expectedGroupBuffer.append(pkt) }
+        } else if !expectedGroupBuffer.isEmpty {
+            expectedGroupBuffer = []
         }
+        if let adopted = tracker.noteUnknown(pkt.ssrc, counts: counts, now: now) {
+            Log.media.info("adopting fresh SSRC group: \(adopted.map(hex))\(expecting ? " (expected: resize)" : "")")
+            counters.groupAdoptions += 1
+            for s in adopted { requestKeyframe(ssrc: s, congestionSignal: false) }
+            if expecting {
+                let members = Set(adopted)
+                let replay = expectedGroupBuffer.filter { members.contains($0.ssrc) }
+                expectedGroupBuffer = []
+                Log.media.info("replaying \(replay.count) buffered packets of the new group")
+                for p in replay { emitVideo(p) }
+            } else {
+                emitVideo(pkt)
+            }
+        }
+    }
+
+    /// A dynamic resize's 0x451 arrived and the 0x1c re-offer went out: the
+    /// server is about to restart the encoder on a new four-SSRC group (RFC
+    /// §10.9 step 4). Adopt it as soon as it is complete — without the 2 s
+    /// stall — and replay its first packets (the new parameter sets and IDR).
+    func expectNewGroup(within window: Duration = .seconds(5)) {
+        guard groupLocked else { return }
+        tracker.expectNewGroup(until: clock.now + window)
+        expectedGroupBuffer = []
+        Log.media.info("expecting a new SSRC group (resize) for \(window.ms) ms")
     }
 
     private var burstLockScheduled = false

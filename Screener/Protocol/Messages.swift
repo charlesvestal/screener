@@ -189,10 +189,13 @@ enum ClientMessage {
     /// resize (RFC §7.3). `dynamic: false` emits the bare descriptor RFC §7.3
     /// describes for fixed-resolution sessions (those three fields zero).
     /// The fixture uses the reference's default display name; ours differs.
+    /// `maxWidth`/`maxHeight`: the descriptor's backing bound (the reference
+    /// and native send 3840×2160; a portrait request swaps them, see
+    /// DisplayGeometry.maxBacking).
     static func setDisplayConfiguration(logicalWidth: Int, logicalHeight: Int, hidpiScale: Double = 2.0,
                                         refreshHz: Double = 60.0, hdr: Bool = false, dynamic: Bool = true,
                                         displayName: String = "Screener Virtual Display",
-                                        modeCount: Int = 5) -> Data {
+                                        modeCount: Int = 5, maxWidth: Int = 3840, maxHeight: Int = 2160) -> Data {
         let diSize = 0x9C + 28 * modeCount
         var di = [UInt8](repeating: 0, count: diSize)
         func put16(_ off: Int, _ v: UInt16) { di[off] = UInt8(v >> 8); di[off + 1] = UInt8(v & 0xff) }
@@ -207,7 +210,7 @@ enum ClientMessage {
         put32(0x7E, dynamic ? 4 : 0)            // display_type: 4 = virtual display
         put32(0x82, Float(369.4545593261719).bitPattern)   // physical mm (native capture)
         put32(0x86, Float(207.81817626953125).bitPattern)
-        put32(0x8A, 3840); put32(0x8E, 2160)    // max backing size (server cap)
+        put32(0x8A, UInt32(maxWidth)); put32(0x8E, UInt32(maxHeight))   // max backing size (server cap)
         put16(0x92, 0); put16(0x94, 0)          // current / preferred mode index
         put32(0x96, dynamic ? 7 : 0)            // reserved/rotations — native sends 7
         put16(0x9A, UInt16(modeCount))

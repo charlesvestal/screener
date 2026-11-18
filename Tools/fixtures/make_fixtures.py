@@ -415,6 +415,21 @@ def build_messages_fixture():
         ),
         "result": h(rfb.build_virtual_display(width=1376, height=1032)),
     }
+    # The same builder is what session.send_dynamic_resolution sends for a
+    # mid-session resize (RFC §7.3 / §10.9 step 1: display_flags bit 0,
+    # display_type 4, rotations 7, valid mode indices, max size, populated
+    # mode table). Cases: iPad Pro 13" portrait, a "sharper" (×0.8) landscape
+    # request, and a half-width Stage Manager window at a 1.25 scale ratio.
+    resize_cases = [
+        {"width": 1032, "height": 1376, "hidpi_scale": 2.0},
+        {"width": 1100, "height": 826, "hidpi_scale": 2.0},
+        {"width": 688, "height": 1032, "hidpi_scale": 1.25},
+    ]
+    out["build_virtual_display_dynamic_resize"] = {
+        "args": {"cases": resize_cases},
+        "source": "rfb.build_virtual_display as called by session.send_dynamic_resolution",
+        "result": [h(rfb.build_virtual_display(**c, hdr=False)) for c in resize_cases],
+    }
     out["build_fbu_request"] = {
         "args": {"incremental": False},
         "result": h(negotiation.build_fbu_request(incremental=False)),

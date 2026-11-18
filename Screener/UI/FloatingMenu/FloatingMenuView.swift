@@ -234,6 +234,8 @@ private struct ControlPanel: View {
     @AppStorage(TouchInputMode.defaultsKey) private var touchModeRaw = TouchInputMode.default.rawValue
     private var touchMode: TouchInputMode { TouchInputMode(rawValue: touchModeRaw) ?? .default }
     @AppStorage(AudioPlayer.mutedDefaultsKey) private var audioMuted = false
+    @AppStorage(DisplayMode.defaultsKey) private var displayModeRaw = DisplayMode.default.rawValue
+    private var displayMode: DisplayMode { DisplayMode(rawValue: displayModeRaw) ?? .default }
     @AppStorage(ClipboardSyncMode.defaultsKey) private var clipboardModeRaw = ClipboardSyncMode.default.rawValue
     private var clipboardAuto: Bool { (ClipboardSyncMode(rawValue: clipboardModeRaw) ?? .default) == .automatic }
     /// Brief confirmation on a clipboard tile ("Sent", "No Text", …).
@@ -352,7 +354,7 @@ private struct ControlPanel: View {
                  hint: "Silences the Mac's sound on this iPad.") { audioMuted.toggle() }
                 .accessibilityValue(audioMuted ? "On" : "Off")
                 .accessibilityAddTraits(.isToggle)
-            tile("Display", "display", hint: "Coming soon") {}.disabled(true)
+            displayMenu
             tile(touchMode.title, touchMode == .trackpad ? "rectangle.and.hand.point.up.left" : "hand.point.up.left",
                  hint: "Input mode for your fingers. Trackpad: drag to move the pointer, tap to click. "
                     + "Touch: the pointer goes where you touch. Tap to switch.") {
@@ -382,6 +384,25 @@ private struct ControlPanel: View {
             guard !Task.isCancelled else { return }
             clipboardFlash = nil
         }
+    }
+
+    /// Display mode picker (DisplayMode; SessionView applies the change).
+    private var displayMenu: some View {
+        Menu {
+            Picker("Display", selection: $displayModeRaw) {
+                ForEach(DisplayMode.allCases) { mode in
+                    Text(mode.title).tag(mode.rawValue)
+                }
+            }
+            Section { Text(displayMode.detail) }
+        } label: {
+            tileLabel(displayMode.title, "display", selected: false, destructive: false)
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("Display")
+        .accessibilityValue(displayMode.title)
+        .accessibilityHint("How large the Mac's desktop is. Fit matches this window; More Space shows more; "
+                           + "Sharper uses fewer, crisper pixels; Match Mac uses the Mac's own resolution.")
     }
 
     private func typePasswordTapped() {

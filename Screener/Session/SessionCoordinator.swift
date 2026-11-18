@@ -37,6 +37,15 @@
 // re-checks the iPad pasteboard when the scene becomes active, and is
 // detached at teardown. Its sync bookkeeping outlives sessions.
 //
+// Display (Task 21): the connect-time 0x1d is sized by DisplayMode from the
+// session view's size (the window scene's before it exists); afterwards
+// `display` (DisplayResizer) follows view / mode changes with debounced
+// dynamic 0x1d requests. A 0x451 that changes the backing size (ControlSession
+// re-offers 0x1c on it) makes the media transport expect the new SSRC group
+// and the frame store hold the last picture until the new stream's first;
+// input and the cursor follow the 0x451 at once (the server's geometry is
+// authoritative).
+//
 // Concurrency: every connect runs in `connectTask` under a generation number.
 // `disconnect()` and any session failure bump the generation, cancel the task
 // and tear down; the connect task re-checks its generation after every await
@@ -144,6 +153,10 @@ final class SessionCoordinator {
     /// Latest 0x451 backing size (pointer clamp) and backing/scaled factor.
     private var hostBacking: (width: Int, height: Int)?
     private var hostPointScale: CGFloat = 2
+    /// Display sizing and in-band resizes (DisplayMode.swift).
+    @ObservationIgnored private(set) var display: DisplayResizer!
+    /// The session view's size in points and its screen scale (last reported).
+    private var viewGeometry: (points: CGSize, scale: CGFloat)?
     /// The current session decoded its first picture.
     private(set) var hasFirstFrame = false
     /// A suspended session is being resumed: from the background close until
@@ -191,6 +204,7 @@ final class SessionCoordinator {
     init(policy: Policy = Policy(), seams: Seams = .live) {
         self.policy = policy
         self.seams = seams
+        display = DisplayResizer(hooks: .init(send: { [weak self] g in await self?.requestDisplay(g) }))
         let videoGeneration = videoGeneration
         frames.onFirstFrame = { [weak self] pb in
             let gen = videoGeneration.value
@@ -393,12 +407,22 @@ final class SessionCoordinator {
         guard isCurrent(gen) else { return }
         startStatsPolling(media)
 
-        let (logical, backing) = Self.screenSizes()
+        let view = viewGeometry ?? Self.sceneGeometry()
+        display.setMode(.stored())
+        let mode = display.mode
+        // matchMac: ControlSession sends a bare descriptor at the Mac's ServerInit size instead.
+        let geometry = mode.geometry(viewPoints: view.points, scale: view.scale)
+            ?? DisplayMode.fitRetina.geometry(viewPoints: view.points, scale: view.scale)
+            ?? DisplayGeometry(logicalWidth: 1376, logicalHeight: 1032, hidpiScale: 2)
+        let (logical, backing) = (geometry.logicalSize, geometry.backingSize)
         hostBacking = nil
         hostPointScale = logical.width > 0 ? backing.width / logical.width : 2
         cursor.setPointScale(hostPointScale)
-        let config = ControlSession.Config(host: ip, port: port, username: username, password: password,
+        Log.app.info("display: mode \(mode.rawValue), view \(Int(view.points.width))x\(Int(view.points.height))pt "
+                     + "@\(view.scale)x → \(geometry)")
+        var config = ControlSession.Config(host: ip, port: port, username: username, password: password,
                                            logicalSize: logical, backingSize: backing, startupOrder: order)
+        config.dynamicDisplay = mode.isDynamic
         let attempts = max(1, policy.burstRetryAttempts)
         for attempt in 1...attempts {
             let session = ControlSession(config: config, tuning: seams.controlTuning,
@@ -435,6 +459,9 @@ final class SessionCoordinator {
             case .started:
                 frames.configure(canvas: CGSize(width: params.canvas.width, height: params.canvas.height))
                 startInput(session, params)
+                let mac = DisplayGeometry.matching(serverWidth: params.serverInit.width,
+                                                   serverHeight: params.serverInit.height)
+                display.start(initial: mode.isDynamic ? geometry : mac, mac: mac)
                 clipboard.start(send: { try await session.send($0) })
                 state = .connected(canvasWidth: params.canvas.width, canvasHeight: params.canvas.height)
                 startFirstFrameDeadline(gen, media)
@@ -498,6 +525,7 @@ final class SessionCoordinator {
         // one atomic transition.
         releaseInput?()
         clipboard.stop()
+        display.stop()
         let input = input
         self.input = nil
         cursor.reset()
@@ -574,12 +602,23 @@ final class SessionCoordinator {
         switch event {
         case .displayLayout(let l):
             if l.backingWidth > 0, l.backingHeight > 0 {
+                let previous = hostBacking
                 hostBacking = (l.backingWidth, l.backingHeight)
                 input?.setServerDims(width: l.backingWidth, height: l.backingHeight)
                 // One canvas source of truth: the frame store (video layout
                 // and drawCursor's CompositeLayout) and the input mapping
-                // must agree on the same backing size.
-                frames.configure(canvas: CGSize(width: l.backingWidth, height: l.backingHeight))
+                // must agree on the same backing size. On a resize (RFC
+                // §10.9) the store switches to it with the new stream's first
+                // picture, holding the last one until then.
+                let canvas = CGSize(width: l.backingWidth, height: l.backingHeight)
+                if let previous, previous != (l.backingWidth, l.backingHeight) {
+                    Log.app.info("display: Mac resized to \(l.scaledWidth)x\(l.scaledHeight)pt "
+                                 + "(\(l.backingWidth)x\(l.backingHeight)px), was \(previous.width)x\(previous.height)px")
+                    frames.holdForResize(canvas: canvas)
+                    if let media { Task { await media.expectNewGroup() } }
+                } else {
+                    frames.configure(canvas: canvas)
+                }
                 if l.scaledWidth > 0 {
                     hostPointScale = CGFloat(l.backingWidth) / CGFloat(l.scaledWidth)
                     input?.pointScale = hostPointScale
@@ -675,17 +714,43 @@ final class SessionCoordinator {
         }
     }
 
+    // MARK: display (Task 21)
+
+    /// The session view's size changed (rotation, Stage Manager): the resizer
+    /// debounces it into a dynamic 0x1d when the session is up.
+    func viewSizeChanged(points: CGSize, scale: CGFloat) {
+        guard points.width > 0, points.height > 0 else { return }
+        Log.app.info("display: view \(Int(points.width))x\(Int(points.height))pt @\(scale)x")
+        viewGeometry = (points, scale)
+        display.viewChanged(points: points, scale: scale)
+    }
+
+    /// The user picked a display mode (stored by the menu; applies now when dynamic).
+    func setDisplayMode(_ mode: DisplayMode) {
+        display.setMode(mode)
+    }
+
+    private func requestDisplay(_ g: DisplayGeometry) async {
+        guard let control, case .connected = state else { return }
+        do {
+            try await control.requestDisplay(g)
+        } catch {
+            Log.app.error("display: resize request failed: \(ControlSession.describe(error))")
+        }
+    }
+
     /// The UI text for `error` (UserFacingError: no raw errno text).
     static func describe(_ error: Error) -> String { UserFacingError.message(for: error) }
 
-    /// Advertised display: the window scene's screen in points (logical) and
-    /// `points × nativeScale` (backing). Using bounds × scale rather than
-    /// `nativeBounds` keeps the backing size in the current orientation.
-    static func screenSizes() -> (logical: CGSize, backing: CGSize) {
-        let screen = UIApplication.shared.connectedScenes.compactMap { ($0 as? UIWindowScene)?.screen }.first
-        let logical = screen?.bounds.size ?? CGSize(width: 1376, height: 1032)
-        let scale = screen?.nativeScale ?? 2
-        return (logical, CGSize(width: logical.width * scale, height: logical.height * scale))
+    /// Before the session view reports its size: the window scene's size in
+    /// points (the window in Stage Manager, the screen in full screen, in the
+    /// current orientation) and its screen's native scale.
+    static func sceneGeometry() -> (points: CGSize, scale: CGFloat) {
+        let scene = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
+            .first { $0.activationState == .foregroundActive }
+            ?? UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first
+        let points = scene?.coordinateSpace.bounds.size ?? CGSize(width: 1376, height: 1032)
+        return (points, scene?.screen.nativeScale ?? 2)
     }
 }
 
