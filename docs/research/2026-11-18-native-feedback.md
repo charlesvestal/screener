@@ -60,10 +60,17 @@ Host→Screener video rate from a host-side packet capture (UDP to .33:5901, IP+
 | **New default (RCTL on, nothing else)** | **60–61 Mbps flat** | **55–60 Mbps / ~60 fps** |
 
 ### Decision
-- RCTL ON by default (`SCREENER_FB_RCTL=0` turns it off, `SCREENER_RCTL_BWE=<kbps>` sets the estimate, `0` = measured receive rate).
+- RCTL ON by default (`SCREENER_FB_RCTL=0` turns it off, `SCREENER_RCTL_BWE=<kbps>` pins the estimate, `0` = measured receive rate; adaptive otherwise, see below).
 - Per-port RRs (`SCREENER_FB_RR=1`) and per-tile acks (`SCREENER_FB_ACKALL=1`) stay opt-in: neither raised the bitrate on its own, and the per-tile acks coincided with decode stalls.
 
 ### Open
-- BWE is a fixed 60 Mbps, not an estimate. On a slower link (iPad on Wi-Fi) the host will try to send 60 Mbps; the RR still reports zero loss. Next step: a loss- and receive-rate-driven BWE (keep the last good value while the screen is idle).
+- ~~BWE is a fixed 60 Mbps~~ → adaptive since the next commit (below).
+
+## Adaptive BWE + real RR loss (same day, unit-tested only)
+- `BandwidthEstimator` (Screener/Transport/BandwidthEstimator.swift), ticked by every RCTL (50 ms): starts at 30 Mbps (the native captures show no start ramp: the RCTL body is encrypted and the sessions were static), +6 %/s toward 65 Mbps (u16 wire limit) while windowed loss (1 s) < 2 %, the host fills ≥ 60 % of the estimate and no recovery event in 2 s; ×0.85 (or 0.85 × receive rate, at most halving) when loss > 10 % (1 s hold-off) or on an assembler keyframe request / video-consumer backlog (3 s hold-off); 2–10 % holds; idle screen (receive rate < 60 % of the estimate, or too few packets) holds; 1 %/s within ±10 % of the last cut point; floor 4 Mbps; 1 s startup grace.
+- Loss = expected − received per tile SSRC (RFC 3550 A.1 `RTPReceptionStats`), summed over the window so late/reordered packets cancel.
+- RCTL loss fields: top nibble = the longest run of consecutive missing packets this tick (cap 15; AVConference names it burstyLoss and AFRC ramps down on it); low 12 bits = windowed loss in whole percent. **Unknown:** the 12-bit field's unit (it comes from VCRateControlGetStatistics type 7, offset 0x24; percent is the conservative reading). owrd stays 0: the video RTP extension carries no send timestamp.
+- RRs now carry RFC 3550 A.3 fraction lost / cumulative lost (jitter still 0).
+- Env: `SCREENER_RCTL_BWE=<kbps>` pins (0 = measured), `SCREENER_RCTL_INIT/MIN/MAX`, `SCREENER_RCTL_LOSS=0`, `SCREENER_FB_RR_LOSS=0`, `SCREENER_FB_RCTL=0`. Log every 2 s: `rctl bwe=… (adaptive; est=…) loss%=… rx_kbps=… state=increase|decrease|hold|hold-app|hold-off|hold-idle decreases=… sent_loss=…%/burst…`.
 - The simulator drops packets at these rates: the host capture has ~15–40% more video datagrams than the app reads (worst with per-tile acks). The kernel socket buffer is the likely place; worth checking on the iPad.
 - The echo field's exact source (RTP timestamp, low vs high precision) is unverified; the host accepted it either way.

@@ -25,6 +25,13 @@ enum RTCP {
         var roc: UInt32
     }
 
+    /// RFC 3550 §6.4.1 loss fields of one report block (A.3).
+    struct LossReport: Sendable, Equatable {
+        var fractionLost: UInt8
+        /// Clamped to the 24-bit signed field.
+        var cumulativeLost: Int32
+    }
+
     /// Last Sender Report seen from a source: the middle 32 bits of its NTP
     /// timestamp (LSR) and when it arrived (for DLSR).
     struct SRInfo: Sendable, Equatable {
@@ -151,10 +158,13 @@ enum RTCP {
     }
 
     /// build_rr: Receiver Report with up to 31 report blocks. No sources → the
-    /// 1-word empty RR. Loss and jitter are always reported as zero.
+    /// 1-word empty RR. Loss comes from `loss` (RTPReceptionStats.makeReport;
+    /// a source without an entry reports zero, as the reference always does).
+    /// Jitter is always zero.
     static func receiverReport(senderSSRC: UInt32, sources: [UInt32] = [],
                                stats: [UInt32: SourceStats] = [:],
-                               srData: [UInt32: SRInfo] = [:], now: Date = Date()) -> Data {
+                               srData: [UInt32: SRInfo] = [:], loss: [UInt32: LossReport] = [:],
+                               now: Date = Date()) -> Data {
         var w = ByteWriter()
         guard !sources.isEmpty else {
             w.u8(0x80); w.u8(201); w.u16(1); w.u32(senderSSRC)
@@ -171,7 +181,9 @@ enum RTCP {
                 // int() truncates toward zero, then & 0xFFFFFFFF.
                 dlsr = UInt32(truncatingIfNeeded: Int64(now.timeIntervalSince(sr.arrival) * 65536))
             }
-            w.u32(ssrc); w.u32(0); w.u32(extSeq); w.u32(0); w.u32(lsr); w.u32(dlsr)
+            let l = loss[ssrc] ?? LossReport(fractionLost: 0, cumulativeLost: 0)
+            let lostWord = UInt32(l.fractionLost) << 24 | UInt32(bitPattern: l.cumulativeLost) & 0x00FF_FFFF
+            w.u32(ssrc); w.u32(lostWord); w.u32(extSeq); w.u32(0); w.u32(lsr); w.u32(dlsr)
         }
         return w.data
     }

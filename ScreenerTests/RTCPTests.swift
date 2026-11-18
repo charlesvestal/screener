@@ -100,6 +100,22 @@ final class RTCPTests: XCTestCase {
         XCTAssertEqual(RTCP.packetTypes(pkt), [204])
     }
 
+    /// What MediaTransport sends for a tick with a 3-packet loss burst, 7 %
+    /// windowed loss and the 30 Mbps start estimate.
+    func testAppRCTLWithAdaptiveLossFields() {
+        let pkt = RTCP.appRCTL(senderSSRC: 0x4014_2F36, echo: 0x4536, echoDelayMs: 3, now1024: 0x0400,
+                               burstyLoss: 3, lossField: 7, bwe: 30_000)
+        XCTAssertEqual(Data(pkt.suffix(4)).hex, "3007" + "7530")
+    }
+
+    func testReceiverReportLossWord() {
+        let pkt = RTCP.receiverReport(senderSSRC: 1, sources: [7, 8],
+                                      loss: [7: .init(fractionLost: 25, cumulativeLost: 10)],
+                                      now: Date(timeIntervalSince1970: 0))
+        XCTAssertEqual(pkt.subdata(in: 12..<16).hex, "1900000a")
+        XCTAssertEqual(pkt.subdata(in: 36..<40).hex, "00000000", "a source without stats reports zero")
+    }
+
     func testEmptySenderReportLayout() {
         let now = Date(timeIntervalSince1970: 1_700_000_000.25)
         let pkt = RTCP.emptySR(senderSSRC: 0xDEAD_BEEF, now: now)

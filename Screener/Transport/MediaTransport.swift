@@ -44,10 +44,18 @@
 //   * on P+1 every 50 ms: APP "RCTL" rate-control feedback (videoKeyV, our
 //     video SSRC), as the native viewer sends. ON by default: the host's
 //     encoder target follows its bandwidth estimate (BWE, kbps) — without it
-//     the encoder holds a flat ~20 Mbps while a window is dragged;
+//     the encoder holds a flat ~20 Mbps while a window is dragged. The BWE
+//     is adaptive (BandwidthEstimator: loss-based AIMD, holds while the
+//     screen is idle) unless SCREENER_RCTL_BWE pins it; RCTL's loss nibble
+//     carries the largest burst of consecutive lost packets and its 12-bit
+//     loss field the windowed loss in whole percent (Feedback.rctlLoss);
+//   * RR report blocks carry the real fraction lost / cumulative lost
+//     (RFC 3550 A.3, RTPReceptionStats; SCREENER_FB_RR_LOSS=0 → zeros as
+//     the reference);
 //   * opt-in (SCREENER_FB_RR=1): native-style RRs per port at 1 s.
 // Every 2 s the stats line adds the video payload kbps/pps, the server's
-// RTCP packet types, the SR source SSRCs and the last RR we sent.
+// RTCP packet types, the SR source SSRCs and the last RR we sent, and an
+// `rctl bwe=… loss%=… rx_kbps=… state=…` line follows it.
 //
 // Deviations (deliberate):
 //   * The reference's ctrl process loop tests `200 <= pkt[1] & 0x7F <= 207`,
@@ -259,9 +267,19 @@ actor MediaTransport {
         /// flat ~20 Mbps while a window is dragged; with it, 40–60 Mbps (live
         /// A/B 2026-11-18, docs/research/2026-11-18-native-feedback.md).
         var rateControl = true
-        /// SCREENER_RCTL_BWE: the bandwidth estimate RCTL carries, in kbps
-        /// (assumed unit; u16 on the wire). 0 = the measured receive rate.
-        var rctlBWE: UInt16 = 60_000
+        /// SCREENER_RCTL_BWE: pins the bandwidth estimate RCTL carries, in
+        /// kbps (u16 on the wire; 60000 → the host sends 60–61 Mbps). 0 = the
+        /// measured receive rate. nil (default): adaptive (BandwidthEstimator).
+        var rctlBWE: UInt16? = nil
+        /// SCREENER_RCTL_INIT / _MIN / _MAX (kbps): the adaptive estimate's
+        /// start, floor and ceiling.
+        var estimator = BandwidthEstimator.Config()
+        /// SCREENER_RCTL_LOSS (default ON; =0 sends zeros as before): RCTL's
+        /// burstyLoss nibble and 12-bit loss field.
+        var rctlLoss = true
+        /// SCREENER_FB_RR_LOSS (default ON; =0 reports zero loss as the
+        /// reference): RR fraction lost / cumulative lost from RFC 3550 A.3.
+        var rrLoss = true
         /// SCREENER_RCTL_ECHO=low: echo the RTP timestamp >> 8 (AVConference's
         /// useLowPrecisionEchoTimeStamp) instead of its low 16 bits.
         var rctlLowPrecisionEcho = false
@@ -271,6 +289,11 @@ actor MediaTransport {
             if let v = env["SCREENER_FB_RR"] { f.splitReports = v == "1" }
             if let v = env["SCREENER_FB_RCTL"] { f.rateControl = v == "1" }
             if let v = env["SCREENER_RCTL_BWE"], let n = UInt16(v) { f.rctlBWE = n }
+            if let v = env["SCREENER_RCTL_INIT"], let n = UInt16(v) { f.estimator.initialKbps = Double(n) }
+            if let v = env["SCREENER_RCTL_MIN"], let n = UInt16(v) { f.estimator.floorKbps = Double(n) }
+            if let v = env["SCREENER_RCTL_MAX"], let n = UInt16(v) { f.estimator.ceilingKbps = Double(n) }
+            if let v = env["SCREENER_RCTL_LOSS"] { f.rctlLoss = v != "0" }
+            if let v = env["SCREENER_FB_RR_LOSS"] { f.rrLoss = v != "0" }
             if let v = env["SCREENER_RCTL_ECHO"] { f.rctlLowPrecisionEcho = v == "low" }
             return f
         }
@@ -349,6 +372,16 @@ actor MediaTransport {
     private var serverAudioSSRC: UInt32?
     private var rateWindow: (start: ContinuousClock.Instant, bytes: Int)?
     private var measuredKbps = 0
+    /// RFC 3550 reception stats per server SSRC (video tiles and audio).
+    private var reception: [UInt32: RTPReceptionStats] = [:]
+    /// Adaptive RCTL estimate and its per-tick inputs.
+    private var estimator: BandwidthEstimator
+    private var estimatorEpoch: ContinuousClock.Instant?
+    private var bweRxBytes = 0
+    private var pendingRecoveryEvents = 0
+    private var lastStreamDropsSeen = 0
+    /// The last RCTL we sent: BWE, loss field (%), bursty-loss nibble.
+    private var lastRCTL = (bwe: UInt16(0), lossPct: UInt16(0), bursty: UInt8(0))
     private var serverSR: [UInt32: RTCP.SRInfo] = [:]
     private var tick = 0
     private var lastKeyframeRequest: [UInt32: ContinuousClock.Instant] = [:]
@@ -375,6 +408,7 @@ actor MediaTransport {
         self.tuning = tuning
         self.makeChannel = channelFactory ?? { flow, cfg in SocketDatagramChannel.make(flow: flow, config: cfg) }
         self.tracker = SSRCGroupTracker(threshold: tuning.adoptThreshold, stall: tuning.adoptStall)
+        self.estimator = BandwidthEstimator(config: tuning.feedback.estimator)
         (video, videoOut) = AsyncStream.makeStream(of: MediaPacket.self,
                                                    bufferingPolicy: .bufferingNewest(max(1, tuning.videoBufferLimit)))
         (audio, audioOut) = AsyncStream.makeStream(of: MediaPacket.self,
@@ -515,6 +549,9 @@ actor MediaTransport {
         rtcpDecryptors = [:]; rtcpKeyLogged = []
         keepaliveEncryptor = nil; rtcpEncryptor = nil; audioRTCPEncryptor = nil
         lastVideoRTP = nil; serverAudioSSRC = nil; rateWindow = nil; measuredKbps = 0
+        reception = [:]; estimator = BandwidthEstimator(config: tuning.feedback.estimator); estimatorEpoch = nil
+        bweRxBytes = 0; pendingRecoveryEvents = 0; lastStreamDropsSeen = streamDrops.video
+        lastRCTL = (0, 0, 0)
         serverSR = [:]; tick = 0
         lastKeyframeRequest = [:]; lastLTRAcked = nil
         decoderDrivesPublish = false
@@ -588,8 +625,12 @@ actor MediaTransport {
 
     /// Keyframe request for one tile SSRC, the reference's default variant:
     /// compound RR + AVPF FIR (PT 206) + PLI + legacy FIR (PT 192), sent to P.
+    /// `congestionSignal`: the request comes from the assembler (loss or a
+    /// decode error) and counts as a recovery event for the BWE; an SSRC
+    /// group adoption does not.
     @discardableResult
-    func requestKeyframe(ssrc: UInt32) -> Bool {
+    func requestKeyframe(ssrc: UInt32, congestionSignal: Bool = true) -> Bool {
+        if congestionSignal { pendingRecoveryEvents += 1 }
         guard let a = activation, let sender = a.ourVideoSSRC, let enc = rtcpEncryptor,
               let channel = channels[.audio] else { return false }
         let now = clock.now
@@ -645,6 +686,11 @@ actor MediaTransport {
         let pkt = MediaPacket(ssrc: out.ssrc, seq: out.seq,
                               timestamp: UInt32(h[4]) << 24 | UInt32(h[5]) << 16 | UInt32(h[6]) << 8 | UInt32(h[7]),
                               marker: h[1] & 0x80 != 0, payloadType: h[1] & 0x7F, payload: out.payload, arrival: at)
+        if reception[pkt.ssrc] == nil {
+            reception[pkt.ssrc] = RTPReceptionStats(firstSeq: pkt.seq)
+        } else {
+            reception[pkt.ssrc]!.update(pkt.seq)
+        }
         switch flow {
         case .audio:
             counters.audioPackets += 1
@@ -672,7 +718,7 @@ actor MediaTransport {
         let counts = videoDecryptor?.ssrcCounts ?? [:]
         if let adopted = tracker.noteUnknown(pkt.ssrc, counts: counts, now: clock.now) {
             Log.media.info("adopting fresh SSRC group: \(adopted.map(hex))")
-            for s in adopted { requestKeyframe(ssrc: s) }
+            for s in adopted { requestKeyframe(ssrc: s, congestionSignal: false) }
             emitVideo(pkt)
         }
     }
@@ -793,7 +839,10 @@ actor MediaTransport {
         } else {
             sendReport()
         }
-        if tick % tuning.statsEveryNTicks == 0 { Log.media.info(statsLine()) }
+        if tick % tuning.statsEveryNTicks == 0 {
+            Log.media.info(statsLine())
+            if tuning.feedback.rateControl && counters.rateControlSent > 0 { Log.media.info(rctlLine()) }
+        }
     }
 
     private func sendHeartbeat() {
@@ -813,7 +862,8 @@ actor MediaTransport {
             stats[s] = RTCP.SourceStats(maxSeq: st?.maxSeq ?? 0, roc: st?.roc ?? 0)
         }
         let now = Date()
-        var rr = RTCP.receiverReport(senderSSRC: sender, sources: sources, stats: stats, srData: serverSR, now: now)
+        var rr = RTCP.receiverReport(senderSSRC: sender, sources: sources, stats: stats, srData: serverSR,
+                                     loss: lossReports(sources), now: now)
         let withSR = sources.compactMap { serverSR[$0] }
         lastReport = (sources.count, withSR.count,
                       withSR.map { Int(now.timeIntervalSince($0.arrival) * 1000) }.max() ?? 0,
@@ -833,7 +883,8 @@ actor MediaTransport {
             let states = videoDecryptor?.stateSnapshot() ?? [:]
             var stats: [UInt32: RTCP.SourceStats] = [:]
             for s in sources { stats[s] = RTCP.SourceStats(maxSeq: states[s]?.maxSeq ?? 0, roc: states[s]?.roc ?? 0) }
-            var rr = RTCP.receiverReport(senderSSRC: sender, sources: sources, stats: stats, srData: serverSR, now: now)
+            var rr = RTCP.receiverReport(senderSSRC: sender, sources: sources, stats: stats, srData: serverSR,
+                                         loss: lossReports(sources), now: now)
             let withSR = sources.compactMap { serverSR[$0] }
             lastReport = (sources.count, withSR.count,
                           withSR.map { Int(now.timeIntervalSince($0.arrival) * 1000) }.max() ?? 0,
@@ -850,7 +901,8 @@ actor MediaTransport {
             let states = audioDecryptor?.stateSnapshot() ?? [:]
             var stats: [UInt32: RTCP.SourceStats] = [:]
             for s in sources { stats[s] = RTCP.SourceStats(maxSeq: states[s]?.maxSeq ?? 0, roc: states[s]?.roc ?? 0) }
-            let rr = RTCP.receiverReport(senderSSRC: sender, sources: sources, stats: stats, srData: serverSR, now: now)
+            let rr = RTCP.receiverReport(senderSSRC: sender, sources: sources, stats: stats, srData: serverSR,
+                                         loss: lossReports(sources), now: now)
             if let wire = try? enc.protect(rr) {
                 channel.send(wire)
                 counters.audioReportsSent += 1
@@ -858,8 +910,18 @@ actor MediaTransport {
         }
     }
 
+    /// RFC 3550 A.3 loss fields for the RR blocks (advances each source's
+    /// report interval). Empty when Feedback.rrLoss is off.
+    private func lossReports(_ sources: [UInt32]) -> [UInt32: RTCP.LossReport] {
+        guard tuning.feedback.rrLoss else { return [:] }
+        var out: [UInt32: RTCP.LossReport] = [:]
+        for s in sources where reception[s] != nil { out[s] = reception[s]!.makeReport() }
+        return out
+    }
+
     private func noteVideoArrival(_ p: MediaPacket, bytes: Int) {
         lastVideoRTP = (p.timestamp, p.arrival)
+        bweRxBytes += bytes
         guard var w = rateWindow else { rateWindow = (p.arrival, bytes); return }
         w.bytes += bytes
         let span = p.arrival - w.start
@@ -880,14 +942,76 @@ actor MediaTransport {
         let delayMs = Double(delay.components.seconds) * 1000 + Double(delay.components.attoseconds) / 1e15
         let uptime = ProcessInfo.processInfo.systemUptime
         let fb = tuning.feedback
-        let bwe = fb.rctlBWE != 0 ? fb.rctlBWE : UInt16(clamping: measuredKbps)
+        let sample = takeEstimatorSample()
+        let epoch = estimatorEpoch ?? now
+        estimatorEpoch = epoch
+        let adaptive = estimator.update(sample.sample, now: seconds(now - epoch))
+        let bwe: UInt16
+        switch fb.rctlBWE {
+        case nil: bwe = adaptive
+        case 0?: bwe = UInt16(clamping: measuredKbps)
+        case let pinned?: bwe = pinned
+        }
+        // Loss fields. Apple's semantics, as far as known (AVConference RE,
+        // docs/research/2026-11-18-native-feedback.md): the top nibble is
+        // "burstyLoss" (AFRC ramps down on bursty loss; the stats carry a
+        // maxVideoBurstyLoss), so we send the longest run of consecutive
+        // missing packets this tick, capped at 15. The low 12 bits come from
+        // a VCRateControl statistic whose unit is unverified; whole percent
+        // is the conservative reading (a host expecting a finer unit sees
+        // less loss than real — the old behaviour — never more).
+        var lossPct: UInt16 = 0, bursty: UInt8 = 0
+        if fb.rctlLoss {
+            lossPct = UInt16(min(100, ((estimator.lossFraction ?? 0) * 100).rounded()))
+            bursty = UInt8(min(15, sample.maxGap))
+        }
+        lastRCTL = (bwe, lossPct, bursty)
         let echo = fb.rctlLowPrecisionEcho ? UInt16(truncatingIfNeeded: last.ts >> 8) : UInt16(truncatingIfNeeded: last.ts)
         let pkt = RTCP.appRCTL(senderSSRC: sender, echo: echo,
                                echoDelayMs: UInt16(clamping: Int(delayMs)),
-                               now1024: UInt16(truncatingIfNeeded: Int(uptime * 1024)), bwe: bwe)
+                               now1024: UInt16(truncatingIfNeeded: Int(uptime * 1024)),
+                               burstyLoss: bursty, lossField: lossPct, bwe: bwe)
         guard let wire = try? enc.protect(pkt) else { return }
         channel.send(wire)
         counters.rateControlSent += 1
+    }
+
+    /// One estimator tick's inputs, drained from the receive path: bytes,
+    /// expected/received over the active tiles, the largest loss burst,
+    /// recovery events, and whether the video consumer dropped packets.
+    private func takeEstimatorSample() -> (sample: BandwidthEstimator.Sample, maxGap: Int) {
+        var s = BandwidthEstimator.Sample()
+        s.rxBytes = bweRxBytes
+        bweRxBytes = 0
+        let active = Set(tracker.active)
+        var maxGap = 0
+        for ssrc in Array(reception.keys) {
+            let c = reception[ssrc]!.takeCounts()
+            let g = reception[ssrc]!.takeMaxGap()
+            guard active.contains(ssrc) else { continue }
+            s.expected += c.expected
+            s.received += c.received
+            maxGap = max(maxGap, g)
+        }
+        s.recoveryEvents = pendingRecoveryEvents
+        pendingRecoveryEvents = 0
+        s.decodeBacklog = streamDrops.video > lastStreamDropsSeen
+        lastStreamDropsSeen = streamDrops.video
+        return (s, maxGap)
+    }
+
+    private func seconds(_ d: Duration) -> Double {
+        Double(d.components.seconds) + Double(d.components.attoseconds) / 1e18
+    }
+
+    private func rctlLine() -> String {
+        let fb = tuning.feedback
+        let mode = fb.rctlBWE.map { $0 == 0 ? "measured" : "pinned" } ?? "adaptive"
+        let loss = estimator.lossFraction.map { String(format: "%.1f", $0 * 100) } ?? "-"
+        let rx = estimator.receiveKbps.map { String(format: "%.0f", $0) } ?? "-"
+        return "rctl bwe=\(lastRCTL.bwe) (\(mode); est=\(estimator.bweKbps)) loss%=\(loss) rx_kbps=\(rx)"
+            + " state=\(estimator.state.rawValue) decreases=\(estimator.decreases)"
+            + " sent_loss=\(lastRCTL.lossPct)%/burst\(lastRCTL.bursty)"
     }
 
     private func statsLine() -> String {

@@ -290,14 +290,26 @@ final class MediaTransportTests: XCTestCase {
         let d = MediaTransport.Feedback.fromEnvironment([:])
         XCTAssertTrue(d.rateControl)
         XCTAssertFalse(d.splitReports)
-        XCTAssertEqual(d.rctlBWE, 60_000)
+        XCTAssertNil(d.rctlBWE, "adaptive by default")
         XCTAssertFalse(d.rctlLowPrecisionEcho)
+        XCTAssertTrue(d.rctlLoss)
+        XCTAssertTrue(d.rrLoss)
+        XCTAssertEqual(d.estimator, BandwidthEstimator.Config())
         let f = MediaTransport.Feedback.fromEnvironment(["SCREENER_FB_RCTL": "0", "SCREENER_FB_RR": "1",
-                                                         "SCREENER_RCTL_BWE": "0", "SCREENER_RCTL_ECHO": "low"])
+                                                         "SCREENER_RCTL_BWE": "0", "SCREENER_RCTL_ECHO": "low",
+                                                         "SCREENER_RCTL_LOSS": "0", "SCREENER_FB_RR_LOSS": "0",
+                                                         "SCREENER_RCTL_INIT": "20000", "SCREENER_RCTL_MIN": "3000",
+                                                         "SCREENER_RCTL_MAX": "50000"])
         XCTAssertFalse(f.rateControl)
         XCTAssertTrue(f.splitReports)
         XCTAssertEqual(f.rctlBWE, 0)
         XCTAssertTrue(f.rctlLowPrecisionEcho)
+        XCTAssertFalse(f.rctlLoss)
+        XCTAssertFalse(f.rrLoss)
+        XCTAssertEqual(f.estimator.initialKbps, 20_000)
+        XCTAssertEqual(f.estimator.floorKbps, 3_000)
+        XCTAssertEqual(f.estimator.ceilingKbps, 50_000)
+        XCTAssertEqual(MediaTransport.Feedback.fromEnvironment(["SCREENER_RCTL_BWE": "45000"]).rctlBWE, 45_000)
         XCTAssertEqual(VideoPipeline.LTRAckMode.fromEnvironment([:]), .off)
         XCTAssertEqual(VideoPipeline.LTRAckMode.fromEnvironment(["SCREENER_LTR_ACK": "1"]), .tile0)
         XCTAssertEqual(VideoPipeline.LTRAckMode.fromEnvironment(["SCREENER_FB_ACKALL": "1"]), .allTiles)
@@ -337,6 +349,72 @@ final class MediaTransportTests: XCTestCase {
         XCTAssertEqual(Data(p[16..<18]).hex, "4536", "echoes the low 16 bits of the newest RTP timestamp")
         XCTAssertEqual(Data(p[30..<32]).hex, "afc8", "BWE 45000")
         XCTAssertFalse(ch.audio.sent.contains { RTCP.isRTCP($0) && rtcpDec.unprotect($0)?[1] == 204 })
+    }
+
+    /// Default (adaptive) RCTL: the estimator's start value goes out during
+    /// its startup grace, and a sequence gap shows up in the loss fields.
+    func testAdaptiveRateControlSendsTheInitialEstimateAndLossFields() async throws {
+        let ch = FakeChannels()
+        var tuning = fastTuning
+        tuning.txInterval = .seconds(60)
+        tuning.rateControlInterval = .milliseconds(10)
+        tuning.feedback = .init(rateControl: true)
+        tuning.feedback.estimator.startupGrace = 60
+        let t = make(ch, tuning: tuning)
+        try await t.open()
+        try await t.activate(activation)
+        let group: [UInt32] = [0x1000, 0x1001, 0x1002, 0x1003]
+        let encs = try group.map { try SRTPEncryptor(blob: keys.videoKeyS, ssrc: $0, seq: 1) }
+        for i in 0..<10 { for j in 0..<4 { ch.video.deliver(try encs[j].encrypt(Data("a\(j)-\(i)".utf8), pt: 100)) } }
+        try await waitUntil("burst lock") { await t.activeVideoSSRCs == group }
+        // Tile 2 loses 5 packets in a row, then 40 more arrive on each tile.
+        for _ in 0..<5 { _ = try encs[2].encrypt(Data("gone".utf8), pt: 100) }
+        for i in 0..<40 { for j in 0..<4 { ch.video.deliver(try encs[j].encrypt(Data("b\(j)-\(i)".utf8), pt: 100)) } }
+        let rtcpDec = try SRTCPDecryptor(blob: keys.videoKeyV)
+        var sawBurst = false
+        try await waitUntil("rctl with loss") {
+            for d in ch.video.sent where RTCP.isRTCP(d) {
+                guard let p = rtcpDec.unprotect(d).map({ [UInt8]($0) }), p.count == 32 else { continue }
+                XCTAssertEqual(Data(p[30..<32]).hex, "7530", "BWE = the 30000 kbps start value")
+                if p[28] >> 4 == 5 { sawBurst = true }
+            }
+            return sawBurst
+        }
+        await t.close()
+    }
+
+    /// RR report blocks carry the RFC 3550 A.3 loss of each tile.
+    func testReceiverReportsCarryRealLoss() async throws {
+        let ch = FakeChannels()
+        var tuning = fastTuning
+        tuning.feedback = .init(rateControl: false)
+        let t = make(ch, tuning: tuning)
+        try await t.open()
+        try await t.activate(activation)
+        let group: [UInt32] = [0x1000, 0x1001, 0x1002, 0x1003]
+        let encs = try group.map { try SRTPEncryptor(blob: keys.videoKeyS, ssrc: $0, seq: 1) }
+        for i in 0..<10 { for j in 0..<4 { ch.video.deliver(try encs[j].encrypt(Data("a\(j)-\(i)".utf8), pt: 100)) } }
+        try await waitUntil("burst lock") { await t.activeVideoSSRCs == group }
+        for _ in 0..<3 { _ = try encs[1].encrypt(Data("gone".utf8), pt: 100) }
+        for i in 0..<10 { for j in 0..<4 { ch.video.deliver(try encs[j].encrypt(Data("b\(j)-\(i)".utf8), pt: 100)) } }
+        let rtcpDec = try SRTCPDecryptor(blob: keys.videoKeyV)
+        var cumulative: [UInt32: UInt32] = [:]
+        try await waitUntil("RR with loss") {
+            for d in ch.audio.sent where RTCP.isRTCP(d) {
+                guard var p = rtcpDec.unprotect(d).map({ [UInt8]($0) }) else { continue }
+                if p[1] == 200 { p = Array(p[28...]) }
+                guard p[1] == 201, p[0] & 0x1F == 4 else { continue }
+                for b in 0..<4 {
+                    let o = 8 + b * 24
+                    let ssrc = UInt32(p[o]) << 24 | UInt32(p[o + 1]) << 16 | UInt32(p[o + 2]) << 8 | UInt32(p[o + 3])
+                    cumulative[ssrc] = UInt32(p[o + 5]) << 16 | UInt32(p[o + 6]) << 8 | UInt32(p[o + 7])
+                }
+            }
+            return cumulative[0x1001] == 3
+        }
+        await t.close()
+        XCTAssertEqual(cumulative[0x1000], 0)
+        XCTAssertEqual(cumulative[0x1002], 0)
     }
 
     /// Split reports: the video RR from our video SSRC on P+1 (videoKeyV),
