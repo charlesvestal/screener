@@ -72,6 +72,8 @@ final class SessionCoordinatorConnectedTests: XCTestCase {
         private var _streams: [ScriptedStream] = []
         private var _fakes: [ControlSessionTests.FakeServer] = []
         private var _auth = 0
+        private var _connectionIndex = 0
+        private var _framebufferOnlyFromIndex = Int.max
         private var servers: [Task<Void, Error>] = []
         let answer: Data
 
@@ -81,6 +83,14 @@ final class SessionCoordinatorConnectedTests: XCTestCase {
         }
 
         var authCalls: Int { lock.lock(); defer { lock.unlock() }; return _auth }
+        /// Connections at/after this 1-based index script a framebufferOnly
+        /// connect (no 0x1c offer) instead of the usual HP offer/answer:
+        /// fallback tests use this to script the "reconnect without a media
+        /// offer" leg. Default: never (every connection is a normal HP offer).
+        var framebufferOnlyFromIndex: Int {
+            get { lock.lock(); defer { lock.unlock() }; return _framebufferOnlyFromIndex }
+            set { lock.lock(); _framebufferOnlyFromIndex = newValue; lock.unlock() }
+        }
         var streams: [ScriptedStream] { lock.lock(); defer { lock.unlock() }; return _streams }
         var lastStream: ScriptedStream? { streams.last }
         var channels: [FakeDatagramChannel] { lock.lock(); defer { lock.unlock() }; return _channels.map(\.1) }
@@ -126,6 +136,8 @@ final class SessionCoordinatorConnectedTests: XCTestCase {
         }
 
         private func newConnection() -> ByteStream {
+            lock.lock(); _connectionIndex += 1; let idx = _connectionIndex; lock.unlock()
+            let framebufferOnly = idx >= framebufferOnlyFromIndex
             let (client, server) = MemoryPipe.pair()
             let fake = ControlSessionTests.FakeServer(server)
             let answer = answer
@@ -136,9 +148,16 @@ final class SessionCoordinatorConnectedTests: XCTestCase {
                 _ = try await fake.readPlainSetDisplayConfiguration()
                 _ = try await fake.readPlainSetEncodings()
                 _ = try await server.read(exactly: 8)
-                for _ in 0..<3 { _ = try await fake.readRecord() }
-                try await fake.sendAnswer(answer)
-                while true { _ = try await fake.readRecord() }   // drain until closed
+                if framebufferOnly {
+                    // No 0x1c: session.start() returns at once; the client's
+                    // SetPixelFormat / framebuffer SetEncodings / first FBUR
+                    // only arrive once the coordinator calls enterFramebufferMode.
+                    while true { _ = try await fake.readRecord() }   // drain until closed
+                } else {
+                    for _ in 0..<3 { _ = try await fake.readRecord() }
+                    try await fake.sendAnswer(answer)
+                    while true { _ = try await fake.readRecord() }   // drain until closed
+                }
             }
             let stream = ScriptedStream(client)
             lock.lock(); servers.append(task); _streams.append(stream); _fakes.append(fake); lock.unlock()

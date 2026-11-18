@@ -72,5 +72,7 @@ build-ux1/
 build-ux1-dev/
 build-ux4/
 build-ux4-dev/
-build-ux1/
-build-ux1-dev/
+build-fb2/
+build-fb2-dev/
+build-pip/
+build-pip-dev/

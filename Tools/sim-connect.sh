@@ -96,5 +96,5 @@ unset SCREENER_USER_VALUE SCREENER_PASS_VALUE
 sleep $((AFTER + 5))
 
 DATA=$(xcrun simctl get_app_container "$UDID" "$BUNDLE" data)
-echo "----- $DATA/Documents/screener.log -----"
-cat "$DATA/Documents/screener.log"
+echo "----- $DATA/Library/Caches/Logs/screener.log -----"
+cat "$DATA/Library/Caches/Logs/screener.log"

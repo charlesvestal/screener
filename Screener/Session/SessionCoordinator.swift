@@ -67,15 +67,22 @@
 // the close before iOS suspends us, or it keeps sharing (display privacy on).
 //
 // TCP-only fallback (Task 19; MediaFallbackPolicy.swift): no authenticated
-// video at the start burst, a failed 0x1c negotiation (ControlSession's
-// `fallbackOnMediaFailure`), or 3 hard decoder failures within 10 s switch the
-// SAME control connection to the framebuffer path (`enterFallback`): the HP
-// video consumer stops, the frame store is reset, a FramebufferPipeline
-// decodes ControlSession's zlib / raw rects into a BGRA picture, and
-// `fallbackReason` drives the "Reduced performance" badge + toast. If that
-// path shows no picture within `Policy.firstFrameDeadline`, the session is
-// re-established without any media offer (`ConnectRequest.framebufferOnly`,
-// also kept for this session's reconnects after a negotiation failure).
+// video at the start burst, or 3 hard decoder failures within 10 s, tear this
+// connection down and reconnect the SAME host without a media offer
+// (`reconnectWithoutMediaOffer` → `ConnectRequest.framebufferOnly`, kept for
+// this session's later reconnects too). A failed 0x1c negotiation
+// (ControlSession's `fallbackOnMediaFailure`) never activated media either,
+// so it goes straight to the framebuffer path on the SAME connection
+// (`enterFallback`). Either way a FramebufferPipeline decodes ControlSession's
+// zlib / raw rects into a BGRA picture and `fallbackReason` drives the
+// "Reduced performance" badge + toast. We never switch HP → framebuffer
+// in place on a connection that already activated media: a live capture
+// (2026-11-18) showed macOS answers the SetEncodings that mid-session switch
+// sends with exactly one framebuffer update and then nothing, while it keeps
+// streaming the old HP UDP video — so a fresh connection without the offer is
+// the only path that reliably recovers. If the framebuffer path still shows
+// no picture within `Policy.firstFrameDeadline`, the session reconnects
+// without a media offer once more, then gives up.
 //
 // First picture: once `.connected`, a picture must decode within
 // `Policy.firstFrameDeadline` (a keyframe is requested at
@@ -550,8 +557,7 @@ final class SessionCoordinator {
             if case .starved(let packets) = outcome,
                case .fallBack(let reason) = fallbackPolicy.burstStarved(packets: packets, attempt: attempt,
                                                                        attempts: attempts) {
-                guard await enterFallback(gen, session, params, reason: reason, closeMedia: false) else { return }
-                startFallbackStream(session, params, initial: mode.isDynamic ? geometry : mac, mac: mac)
+                await reconnectWithoutMediaOffer(gen, reason: reason)
                 return
             }
             switch outcome {
@@ -864,8 +870,10 @@ final class SessionCoordinator {
     static let framebufferBrokenMessage = "The picture stream from the Mac broke. Reconnect to continue."
 
     /// DEBUG live testing (ExperimentEnv; Release ignores it):
-    /// SCREENER_FORCE_TCP=connect connects without a media offer;
-    /// =inplace falls back on the same connection once HP video started.
+    /// SCREENER_FORCE_TCP=connect connects without a media offer (the good
+    /// path). =inplace deliberately exercises the broken mid-session switch
+    /// (SetEncodings after HP media started) so it can be compared against
+    /// `reconnectWithoutMediaOffer`; do not use it as a real fallback path.
     static let forceTCP: String? = {
         let v = ExperimentEnv.current["SCREENER_FORCE_TCP"]
         if let v { Log.app.info("TCP fallback forced: SCREENER_FORCE_TCP=\(v)") }
@@ -915,6 +923,24 @@ final class SessionCoordinator {
         return true
     }
 
+    /// Media already activated on this connection (burst starved, or hard
+    /// decoder failures): tears the session down cleanly and reconnects the
+    /// same host without a media offer, instead of switching this connection
+    /// to the framebuffer path in place (macOS ignores that mid-session
+    /// SetEncodings; see the header). `fallbackReason` is set first so the
+    /// "Reduced performance" badge/toast is already up while the teardown
+    /// and reconnect run. `lastRequest.framebufferOnly` sticks for the rest
+    /// of this session (its later reconnects skip HP too); a fresh
+    /// `connect()` or the next session starts clean and retries HP.
+    private func reconnectWithoutMediaOffer(_ gen: Int, reason: MediaFallbackPolicy.Reason) async {
+        guard isCurrent(gen), lastRequest != nil else { return }
+        Log.app.error("TCP fallback: \(reason); reconnecting \(private: lastRequest?.host ?? "?") without a media offer (reduced performance)")
+        fallbackReason = reason
+        lastRequest?.framebufferOnly = reason
+        await suspend()
+        Task { [weak self] in await self?.reconnect() }
+    }
+
     /// The `.started` set-up for a session that went straight to the framebuffer path.
     private func startFallbackStream(_ session: ControlSession, _ params: ControlSession.MediaParams,
                                      initial: DisplayGeometry?, mac: DisplayGeometry?) {
@@ -928,9 +954,9 @@ final class SessionCoordinator {
 
     /// A hard decoder failure in session `gen` (VideoPipeline hook).
     private func decoderHardFailure(_ gen: Int) async {
-        guard gen == generation, let control, let params = mediaParams, case .connected = state else { return }
+        guard gen == generation, control != nil, mediaParams != nil, case .connected = state else { return }
         guard case .fallBack(let reason) = fallbackPolicy.decoderFailed(at: .now) else { return }
-        _ = await enterFallback(gen, control, params, reason: reason, closeMedia: false)
+        await reconnectWithoutMediaOffer(gen, reason: reason)
     }
 
     /// The framebuffer path must show a picture within `firstFrameDeadline`
@@ -943,11 +969,8 @@ final class SessionCoordinator {
             try? await Task.sleep(for: deadline)
             guard let self, !Task.isCancelled, self.isCurrent(gen) else { return }
             if self.lastRequest != nil, self.lastRequest?.framebufferOnly == nil {
-                Log.app.error("TCP fallback: no picture \(deadline.ms) ms after switching; "
-                              + "reconnecting without a media offer")
-                self.lastRequest?.framebufferOnly = self.fallbackReason ?? .noVideo(packets: 0)
-                await self.suspend()
-                Task { [weak self] in await self?.reconnect() }
+                Log.app.error("TCP fallback: no picture \(deadline.ms) ms after switching")
+                await self.reconnectWithoutMediaOffer(gen, reason: self.fallbackReason ?? .noVideo(packets: 0))
             } else {
                 Log.app.error("TCP fallback: no picture \(deadline.ms) ms after switching; giving up")
                 await self.end(gen, .failed(Self.noPictureMessage))
