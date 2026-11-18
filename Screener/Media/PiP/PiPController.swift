@@ -30,8 +30,10 @@ final class PiPController: NSObject {
     private(set) var isActive = false
     /// The system can start PiP now (a layer in a window with a picture).
     private(set) var isPossible = false
-    /// PiP exists on this device at all.
-    let isSupported = AVPictureInPictureController.isPictureInPictureSupported()
+    /// PiP exists on this device at all (not offered to the iPad app on a
+    /// Mac, where the window itself can be kept small: AdaptiveLayout).
+    let isSupported = AdaptiveLayout.supportsPictureInPicture(
+        platform: .current, systemSupported: AVPictureInPictureController.isPictureInPictureSupported())
 
     /// PiP is about to show (the session must survive the background).
     @ObservationIgnored var onWillStart: (() -> Void)?

@@ -285,7 +285,7 @@ struct PasswordPromptView: View {
                 }
             }
         }
-        .presentationDetents([.medium])
+        .presentationDetents([.medium, .large])
     }
 
     private func go() {

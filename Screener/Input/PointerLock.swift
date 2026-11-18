@@ -25,6 +25,10 @@ enum PointerLock {
 
     private struct WeakInputView { weak var view: RemoteInputView? }
 
+    /// Pointer lock is offered on this platform (not on a Mac: there the
+    /// Mac's own pointer drives the session through hover and clicks).
+    static let isAvailable = AdaptiveLayout.supportsPointerLock(platform: .current)
+
     /// Is a mouse or trackpad connected (GameController's view)?
     static var mouseConnected: Bool { !GCMouse.mice().isEmpty }
 

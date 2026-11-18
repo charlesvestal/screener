@@ -10,6 +10,10 @@
 // modifiers held; the fn layer applies: fn+← = Home, …). Like the menu
 // (ModifierGlow), a latched modifier is tinted with a soft glow and a locked
 // one is filled, underlined, with a tighter glow.
+//
+// Narrow widths (iPhone portrait, a slim window): the keys keep a 44 pt
+// minimum and the row scrolls sideways (`rowLayout`); wide ones center it at
+// up to 720 pt with the keys sharing the width equally.
 import Observation
 import UIKit
 
@@ -27,6 +31,22 @@ final class KeyboardAccessoryBar: UIInputView {
     ]
 
     static let height: CGFloat = 52
+    static let minimumKeyWidth: CGFloat = 44
+    static let spacing: CGFloat = 6
+    static let maximumRowWidth: CGFloat = 720
+    static let sideMargin: CGFloat = 8
+
+    /// The row's width for a bar `width` wide, its leading inset (centred
+    /// when it fits), and whether it has to scroll.
+    static func rowLayout(width: CGFloat, itemCount: Int = items.count)
+        -> (rowWidth: CGFloat, inset: CGFloat, scrolls: Bool) {
+        let available = max(0, width - 2 * sideMargin)
+        let n = CGFloat(itemCount)
+        let minimum = n * minimumKeyWidth + max(0, n - 1) * spacing
+        let row = max(minimum, min(available, maximumRowWidth))
+        let scrolls = row > available
+        return (row, scrolls ? sideMargin : (width - row) / 2, scrolls)
+    }
 
     weak var menu: ControlMenuModel? {
         didSet {
@@ -36,6 +56,11 @@ final class KeyboardAccessoryBar: UIInputView {
     }
 
     private var buttons: [Item: UIButton] = [:]
+    private let scroll = UIScrollView()
+    private let stack = UIStackView()
+    private var rowWidth: NSLayoutConstraint?
+    /// Test hook: the row scrolls at the current width.
+    private(set) var rowScrolls = false
     /// The key whose button is down (its up is sent on release or cancel).
     private var pressedKey: SpecialKey?
 
@@ -55,10 +80,9 @@ final class KeyboardAccessoryBar: UIInputView {
     func button(for item: Item) -> UIButton? { buttons[item] }
 
     private func setUp() {
-        let stack = UIStackView()
         stack.axis = .horizontal
         stack.distribution = .fillEqually
-        stack.spacing = 6
+        stack.spacing = Self.spacing
         stack.translatesAutoresizingMaskIntoConstraints = false
         for item in Self.items {
             let b = UIButton(configuration: .gray())
@@ -79,17 +103,45 @@ final class KeyboardAccessoryBar: UIInputView {
             buttons[item] = b
             stack.addArrangedSubview(b)
         }
-        addSubview(stack)
-        let wide = stack.widthAnchor.constraint(equalTo: widthAnchor, constant: -16)
-        wide.priority = .defaultHigh
+        scroll.translatesAutoresizingMaskIntoConstraints = false
+        scroll.showsHorizontalScrollIndicator = false
+        scroll.showsVerticalScrollIndicator = false
+        scroll.alwaysBounceVertical = false
+        scroll.contentInsetAdjustmentBehavior = .never
+        scroll.delaysContentTouches = false
+        scroll.canCancelContentTouches = true
+        addSubview(scroll)
+        scroll.addSubview(stack)
+        let width = stack.widthAnchor.constraint(equalToConstant: Self.maximumRowWidth)
+        rowWidth = width
         NSLayoutConstraint.activate([
-            stack.centerXAnchor.constraint(equalTo: centerXAnchor),
-            stack.widthAnchor.constraint(lessThanOrEqualToConstant: 720),
-            stack.widthAnchor.constraint(lessThanOrEqualTo: widthAnchor, constant: -16),
-            wide,
-            stack.topAnchor.constraint(equalTo: topAnchor, constant: 6),
-            stack.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -6),
+            scroll.leadingAnchor.constraint(equalTo: leadingAnchor),
+            scroll.trailingAnchor.constraint(equalTo: trailingAnchor),
+            scroll.topAnchor.constraint(equalTo: topAnchor),
+            scroll.bottomAnchor.constraint(equalTo: bottomAnchor),
+            stack.leadingAnchor.constraint(equalTo: scroll.contentLayoutGuide.leadingAnchor),
+            stack.trailingAnchor.constraint(equalTo: scroll.contentLayoutGuide.trailingAnchor),
+            stack.topAnchor.constraint(equalTo: scroll.contentLayoutGuide.topAnchor, constant: 6),
+            stack.bottomAnchor.constraint(equalTo: scroll.contentLayoutGuide.bottomAnchor, constant: -6),
+            stack.heightAnchor.constraint(equalTo: scroll.frameLayoutGuide.heightAnchor, constant: -12),
+            width,
         ])
+    }
+
+    override func layoutSubviews() {
+        // Landscape iPhone: keep clear of the sensor housing / corners.
+        let safe = safeAreaInsets
+        let layout = Self.rowLayout(width: bounds.width - safe.left - safe.right)
+        if rowWidth?.constant != layout.rowWidth { rowWidth?.constant = layout.rowWidth }
+        let insets = UIEdgeInsets(top: 0, left: safe.left + layout.inset, bottom: 0,
+                                  right: safe.right + (layout.scrolls ? Self.sideMargin : 0))
+        if scroll.contentInset != insets {
+            scroll.contentInset = insets
+            scroll.contentOffset = CGPoint(x: -insets.left, y: 0)
+        }
+        scroll.isScrollEnabled = layout.scrolls
+        rowScrolls = layout.scrolls
+        super.layoutSubviews()
     }
 
     private func keyDown(_ key: SpecialKey) {

@@ -44,6 +44,8 @@ struct HostListView: View {
     @Query private var savedHosts: [SavedHost]
     @Environment(\.modelContext) private var context
     @Environment(\.scenePhase) private var scenePhase
+    /// iPhone / narrow window: one full-width column of cards (AdaptiveLayout).
+    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
 
     init() {
         let model = SessionCoordinator()
@@ -62,6 +64,7 @@ struct HostListView: View {
         NavigationStack {
             content
                 .navigationTitle("Hosts")
+                .navigationBarTitleDisplayMode(.large)
                 .searchable(text: $search, prompt: "Search Macs")
                 .toolbar {
                     ToolbarItem(placement: .primaryAction) {
@@ -220,13 +223,17 @@ struct HostListView: View {
         try? await Task.sleep(for: .seconds(1.5))
     }
 
-    private static let columns = [GridItem(.adaptive(minimum: 220, maximum: 360), spacing: 16)]
+    private var columns: [GridItem] {
+        let minimum = AdaptiveLayout.hostCardMinimumWidth(horizontal: horizontalSizeClass)
+        let maximum: CGFloat = horizontalSizeClass == .compact ? 520 : 360
+        return [GridItem(.adaptive(minimum: minimum, maximum: maximum), spacing: horizontalSizeClass == .compact ? 10 : 16)]
+    }
 
     private func section<Cards: View, Empty: View>(_ title: String, @ViewBuilder cards: () -> Cards,
                                                    @ViewBuilder empty: () -> Empty = { EmptyView() }) -> some View {
         VStack(alignment: .leading, spacing: 12) {
             Text(title).font(.title3.bold())
-            LazyVGrid(columns: Self.columns, alignment: .leading, spacing: 16) { cards() }
+            LazyVGrid(columns: columns, alignment: .leading, spacing: horizontalSizeClass == .compact ? 10 : 16) { cards() }
             empty()
         }
     }

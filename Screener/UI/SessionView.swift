@@ -32,6 +32,10 @@ struct SessionView: View {
     /// Picture in Picture (Media/PiP): its layer sits behind the video.
     @State private var pip: PiPController?
     @AppStorage(ScreenerSettings.pipAutoStartKey) private var pipAutoStart = ScreenerSettings.pipAutoStartDefault
+    /// iPhone in portrait: "turn sideways" once per session (AdaptiveLayout).
+    @State private var sessionSize: CGSize = .zero
+    @State private var landscapeHint = false
+    @State private var landscapeHintShown = false
 
     var body: some View {
         ZStack {
@@ -55,6 +59,13 @@ struct SessionView: View {
                                                            ? { pip?.toggle() } : nil,
                                                        pictureInPicturePossible: pip?.isPossible ?? false,
                                                        pictureInPictureActive: pip?.isActive ?? false))
+            if landscapeHint && !showCoach {
+                LandscapeHint()
+                    .onTapGesture { landscapeHint = false }
+                    .frame(maxHeight: .infinity, alignment: .bottom)
+                    .padding(.bottom, 32)
+                    .transition(.opacity.combined(with: .move(edge: .bottom)))
+            }
             if showCoach {
                 GestureCoachOverlay { showCoach = false }
             }
@@ -69,6 +80,9 @@ struct SessionView: View {
                 PrivacyCover().transition(.identity)
             }
         }
+        .onGeometryChange(for: CGSize.self) { $0.size } action: { sessionSize = $0 }
+        .onChange(of: wantsLandscapeHint, initial: true) { _, wants in updateLandscapeHint(wants) }
+        .animation(.easeInOut(duration: 0.3), value: landscapeHint)
         .onChange(of: scenePhase, initial: true) { _, phase in
             privacyCover.phaseChanged(to: PrivacyCoverPolicy.Phase(phase))
         }
@@ -115,6 +129,23 @@ extension SessionView {
         return true
     }
 
+    /// Portrait iPhone with a picture up, coach out of the way.
+    private var wantsLandscapeHint: Bool {
+        model.hasFirstFrame && !showCoach
+            && AdaptiveLayout.suggestsLandscape(platform: .current, size: sessionSize)
+    }
+
+    private func updateLandscapeHint(_ wants: Bool) {
+        guard wants else { landscapeHint = false; return }
+        guard !landscapeHintShown else { return }
+        landscapeHintShown = true
+        landscapeHint = true
+        Task { @MainActor in
+            try? await Task.sleep(for: .seconds(5))
+            landscapeHint = false
+        }
+    }
+
     private func setUpPictureInPicture() {
         guard pip == nil else { return }
         let controller = PiPController(store: model.frames)
@@ -143,6 +174,19 @@ private extension PrivacyCoverPolicy.Phase {
         case .background: self = .background
         @unknown default: self = .inactive
         }
+    }
+}
+
+/// iPhone in portrait: a Mac desktop is wide; turning sideways gives it more room.
+private struct LandscapeHint: View {
+    var body: some View {
+        Label("Turn iPhone sideways for a larger Mac desktop", systemImage: "rotate.right")
+            .font(.subheadline.weight(.semibold))
+            .padding(.horizontal, 16)
+            .padding(.vertical, 10)
+            .menuGlass(Capsule())
+            .padding(.horizontal, 24)
+            .accessibilityAddTraits(.isStaticText)
     }
 }
 

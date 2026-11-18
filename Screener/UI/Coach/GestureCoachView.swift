@@ -10,6 +10,10 @@ struct GestureCoachOverlay: View {
     @AppStorage(TouchInputMode.defaultsKey) private var touchModeRaw = TouchInputMode.default.rawValue
     @State private var page = 0
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    /// iPhone landscape: shorter cards and margins so everything fits.
+    @Environment(\.verticalSizeClass) private var verticalSizeClass
+
+    private var compactHeight: Bool { verticalSizeClass == .compact }
 
     private var touchMode: TouchInputMode { TouchInputMode(rawValue: touchModeRaw) ?? .default }
     private var cards: [CoachCard] { GestureCoach.cards(for: touchMode) }
@@ -18,24 +22,24 @@ struct GestureCoachOverlay: View {
         ZStack {
             Color.black.opacity(0.55).ignoresSafeArea()
                 .onTapGesture(perform: onDismiss)
-            VStack(spacing: 20) {
+            VStack(spacing: compactHeight ? 8 : 20) {
                 Text("Gestures — \(touchMode.title) Mode")
                     .font(.headline)
                     .foregroundStyle(.white)
-                    .padding(.top, 28)
+                    .padding(.top, compactHeight ? 8 : 28)
                 TabView(selection: $page) {
                     ForEach(Array(cards.enumerated()), id: \.element.id) { index, card in
-                        CoachCardView(card: card, reduceMotion: reduceMotion)
+                        CoachCardView(card: card, reduceMotion: reduceMotion, compact: compactHeight)
                             .tag(index)
-                            .padding(.horizontal, 36)
+                            .padding(.horizontal, compactHeight ? 24 : 36)
                     }
                 }
                 .tabViewStyle(.page(indexDisplayMode: .always))
                 .indexViewStyle(.page(backgroundDisplayMode: .always))
-                .frame(height: 320)
+                .frame(height: AdaptiveLayout.coachCardHeight(vertical: verticalSizeClass))
                 Button("Got it") { onDismiss() }
                     .buttonStyle(.glassProminent)
-                    .padding(.bottom, 28)
+                    .padding(.bottom, compactHeight ? 8 : 28)
             }
             .frame(maxWidth: 520)
         }
@@ -49,11 +53,13 @@ struct GestureCoachOverlay: View {
 private struct CoachCardView: View {
     let card: CoachCard
     let reduceMotion: Bool
+    var compact = false
 
     var body: some View {
-        VStack(spacing: 18) {
+        VStack(spacing: compact ? 8 : 18) {
             CoachIconView(kind: card.kind, systemImage: card.systemImage, reduceMotion: reduceMotion)
-                .frame(height: 96)
+                .frame(height: compact ? 64 : 96)
+                .scaleEffect(compact ? 0.75 : 1)
             Text(card.title).font(.title3.bold())
             Text(card.subtitle)
                 .font(.callout)
@@ -61,7 +67,7 @@ private struct CoachCardView: View {
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
         }
-        .padding(24)
+        .padding(compact ? 14 : 24)
         .frame(maxWidth: .infinity)
         .menuGlass(RoundedRectangle(cornerRadius: 24, style: .continuous))
         .accessibilityElement(children: .combine)

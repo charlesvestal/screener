@@ -9,7 +9,9 @@ settings:
     SWIFT_VERSION: "6.0"
     DEVELOPMENT_TEAM: YOURTEAMID
     CODE_SIGN_STYLE: Automatic
-    TARGETED_DEVICE_FAMILY: "2"
+    # iPhone + iPad; the iPad app also runs on Apple-silicon Macs
+    # ("Designed for iPad", README › Mac).
+    TARGETED_DEVICE_FAMILY: "1,2"
 targets:
   # attaswift/BigInt, vendored (Vendor/BigInt/README.md) so it is optimized
   # even in Debug: the SRP modexps are ~17x slower at -Onone.
@@ -40,7 +42,11 @@ targets:
         CFBundleDisplayName: Screener
         UILaunchScreen:
           UIColorName: LaunchBackground
-        UIRequiresFullScreen: false
+        # iPhone: every orientation but upside-down (landscape suits a Mac
+        # desktop best; SessionView hints at it in portrait).
+        UISupportedInterfaceOrientations~iphone:
+          [UIInterfaceOrientationPortrait,
+           UIInterfaceOrientationLandscapeLeft, UIInterfaceOrientationLandscapeRight]
         UISupportedInterfaceOrientations~ipad:
           [UIInterfaceOrientationPortrait, UIInterfaceOrientationPortraitUpsideDown,
            UIInterfaceOrientationLandscapeLeft, UIInterfaceOrientationLandscapeRight]
@@ -53,6 +59,9 @@ targets:
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.vestal.screener
+        # The iPad app is offered on Apple-silicon Macs ("Designed for iPad").
+        SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD: YES
+        SUPPORTS_MACCATALYST: NO
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
   ScreenerTests:
     type: bundle.unit-test

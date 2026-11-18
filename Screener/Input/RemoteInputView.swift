@@ -1076,9 +1076,11 @@ final class RemoteInputView: UIView, UIPointerInteractionDelegate, UIGestureReco
     // MARK: pointer lock (hardware mouse / trackpad)
 
     /// Asks for (or gives up) the pointer lock: wanted while connected, in
-    /// a window, a mouse/trackpad attached and the menu closed.
+    /// a window, a mouse/trackpad attached and the menu closed — never for
+    /// the iPad app on a Mac (AdaptiveLayout.supportsPointerLock).
     func updatePointerLock() {
-        let want = window != nil && input != nil && !menuOpen && PointerLock.mouseConnected
+        let want = PointerLock.isAvailable && window != nil && input != nil && !menuOpen
+            && PointerLock.mouseConnected
         PointerLock.setWanted(want, by: self)
         if !want { setPointerLocked(false) }
     }

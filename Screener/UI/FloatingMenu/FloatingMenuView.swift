@@ -6,7 +6,12 @@
 // (@AppStorage). It fades to 30% after 3 s without interaction, steps aside
 // while the remote pointer is over it, and shows latched/locked modifier
 // badges. ⌘⌥M on a hardware keyboard toggles the panel (RemoteInputView).
+//
+// On a compact width or height (iPhone, a narrow window) the panel is a
+// bottom sheet (.medium / .large detents) with the same sections, opened
+// from the same pill (AdaptiveLayout.menuPresentation).
 import SwiftUI
+import UIKit
 
 /// Where the collapsed pill rests: an edge and a 0…1 position along it.
 struct PillPlacement: Equatable {
@@ -109,6 +114,17 @@ struct FloatingMenuView: View {
     @State private var idle = false
     @State private var idleTask: Task<Void, Never>?
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
+    @Environment(\.verticalSizeClass) private var verticalSizeClass
+
+    private var presentation: AdaptiveLayout.MenuPresentation {
+        AdaptiveLayout.menuPresentation(horizontal: horizontalSizeClass, vertical: verticalSizeClass)
+    }
+
+    /// The panel shown as a bottom sheet (compact sizes).
+    private var sheetShown: Binding<Bool> {
+        Binding(get: { expanded && presentation == .bottomSheet }, set: { if !$0 { expanded = false } })
+    }
 
     var body: some View {
         GeometryReader { geo in
@@ -118,7 +134,7 @@ struct FloatingMenuView: View {
             let rest = placement.center(pill: pillSize, in: size)
             let aside = menu.pointerOverPill && !dragging ? placement.asideOffset(pill: pillSize, in: size) : .zero
             ZStack(alignment: .topLeading) {
-                if expanded {
+                if expanded && presentation == .floatingPanel {
                     ControlPanel(menu: menu, expanded: $expanded, keyboardVisible: $keyboardVisible,
                                  controls: controls)
                         .onGeometryChange(for: CGSize.self) { $0.size } action: { panelSize = $0 }
@@ -140,6 +156,14 @@ struct FloatingMenuView: View {
             .animation(reduceMotion ? nil : .spring(response: 0.35, dampingFraction: 0.8), value: aside)
         }
         .animation(reduceMotion ? nil : .spring(response: 0.3, dampingFraction: 0.85), value: expanded)
+        .sheet(isPresented: sheetShown) {
+            ControlPanel(menu: menu, expanded: $expanded, keyboardVisible: $keyboardVisible,
+                         controls: controls, style: .sheet)
+                .presentationDetents([.medium, .large])
+                .presentationDragIndicator(.visible)
+                .presentationBackground(.thinMaterial)
+                .presentationContentInteraction(.scrolls)
+        }
         .onChange(of: expanded) { _, isExpanded in
             if !isExpanded { menu.menuDidCollapse() }
             poke()
@@ -230,12 +254,15 @@ struct FloatingMenuView: View {
     }
 }
 
-/// The expanded panel.
+/// The expanded panel: floating glass beside the pill, or a bottom sheet.
 private struct ControlPanel: View {
+    enum Style { case floating, sheet }
+
     let menu: ControlMenuModel
     @Binding var expanded: Bool
     @Binding var keyboardVisible: Bool
     let controls: SessionControls
+    var style: Style = .floating
     @State private var passwordArmed = false
     @State private var disarmTask: Task<Void, Never>?
     @AppStorage(PacingConfig.defaultsKey) private var smoothPlayback = false
@@ -254,12 +281,25 @@ private struct ControlPanel: View {
     @Environment(LiveStatsModel.self) private var liveStats: LiveStatsModel?
 
     var body: some View {
-        ViewThatFits(in: .vertical) {
-            content
-            ScrollView { content }.scrollBounceBehavior(.basedOnSize)
+        Group {
+            switch style {
+            case .floating:
+                ViewThatFits(in: .vertical) {
+                    content
+                    ScrollView { content }.scrollBounceBehavior(.basedOnSize)
+                }
+                .frame(width: 372)
+                .menuGlass(RoundedRectangle(cornerRadius: 26, style: .continuous))
+            case .sheet:
+                ScrollView {
+                    content
+                        .padding(.top, 8)
+                        .frame(maxWidth: 520)
+                        .frame(maxWidth: .infinity)
+                }
+                .scrollBounceBehavior(.basedOnSize)
+            }
         }
-        .frame(width: 372)
-        .menuGlass(RoundedRectangle(cornerRadius: 26, style: .continuous))
         .onDisappear { disarmTask?.cancel(); clipboardFlashTask?.cancel() }
     }
 
@@ -333,7 +373,7 @@ private struct ControlPanel: View {
         LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 6), count: 4), spacing: 6) {
             tile(keyboardVisible ? "Hide Keyboard" : "Keyboard",
                  keyboardVisible ? "keyboard.chevron.compact.down" : "keyboard",
-                 selected: keyboardVisible) { keyboardVisible.toggle() }
+                 selected: keyboardVisible) { keyboardTapped() }
                 .disabled(!controls.inputAvailable)
             tile(passwordArmed ? "Tap to Type" : "Type Password",
                  passwordArmed ? "key.fill" : "key", selected: passwordArmed,
@@ -412,6 +452,18 @@ private struct ControlPanel: View {
                 SwitchMacTile(switcher: switcher) { expanded = false }
             }
             tile("Disconnect", "xmark.circle.fill", destructive: true) { controls.disconnect() }
+        }
+    }
+
+    /// The sheet covers the session (and its keyboard proxy): it closes
+    /// first, and the keyboard comes up once it's gone.
+    private func keyboardTapped() {
+        guard style == .sheet else { return keyboardVisible.toggle() }
+        let show = !keyboardVisible
+        expanded = false
+        Task { @MainActor in
+            if show { try? await Task.sleep(for: .milliseconds(450)) }
+            keyboardVisible = show
         }
     }
 
@@ -519,7 +571,8 @@ private struct MenuGlass<S: Shape>: ViewModifier {
 /// `-previewControlMenu YES`, optionally `-previewMenuExpanded YES`).
 ///
 /// `-previewSettings YES` shows Settings instead; `-previewStats YES` adds
-/// synthetic live stats (badge + overlay) and a toast.
+/// synthetic live stats (badge + overlay) and a toast; `-previewKeyboard YES`
+/// brings up the on-screen keyboard with its accessory row.
 struct FloatingMenuPreview: View {
     @State private var menu = ControlMenuModel()
     @State private var expanded = UserDefaults.standard.bool(forKey: "previewMenuExpanded")
@@ -528,6 +581,7 @@ struct FloatingMenuPreview: View {
     /// Never auto-dismissed (screenshots).
     @State private var toasts = ToastCenter(schedule: { _, _ in {} })
     private let withStats = UserDefaults.standard.bool(forKey: "previewStats")
+    @Environment(\.horizontalSizeClass) private var sizeClass
 
     var body: some View {
         if UserDefaults.standard.bool(forKey: "previewSettings") {
@@ -539,10 +593,14 @@ struct FloatingMenuPreview: View {
                 if withStats {
                     StatsOverlay(stats: stats)
                         .padding(16)
+                        .padding(.top, AdaptiveLayout.statsTopInset(horizontal: sizeClass) - 16)
                         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
                 }
                 FloatingMenuView(menu: menu, expanded: $expanded, keyboardVisible: $keyboard,
                                  controls: SessionControls(inputAvailable: true, disconnect: {}))
+                if UserDefaults.standard.bool(forKey: "previewKeyboard") {
+                    AccessoryBarPreviewField(menu: menu).frame(width: 1, height: 1).opacity(0.01)
+                }
             }
             .overlay(alignment: .top) { ToastOverlay(center: toasts) }
             .environment(withStats ? stats : nil)
@@ -558,5 +616,22 @@ struct FloatingMenuPreview: View {
             }
         }
     }
+}
+/// DEBUG preview: a hidden text field that brings up the keyboard with the
+/// session's accessory row (KeyboardAccessoryBar).
+private struct AccessoryBarPreviewField: UIViewRepresentable {
+    let menu: ControlMenuModel
+
+    func makeUIView(context: Context) -> UITextField {
+        let field = UITextField()
+        let bar = KeyboardAccessoryBar()
+        bar.menu = menu
+        field.inputAccessoryView = bar
+        field.autocorrectionType = .no
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { field.becomeFirstResponder() }
+        return field
+    }
+
+    func updateUIView(_ view: UITextField, context: Context) {}
 }
 #endif

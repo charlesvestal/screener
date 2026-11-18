@@ -30,6 +30,7 @@ private struct SessionPolish: ViewModifier {
     @AppStorage(ScreenerSettings.statsOverlayKey) private var showStats = ScreenerSettings.statsOverlayDefault
     @AppStorage(ScreenerSettings.keepAwakeKey) private var keepAwake = ScreenerSettings.keepAwakeDefault
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
 
     private var keepsAwake: Bool {
         IdleTimerPolicy.disablesIdleTimer(keepAwake: keepAwake, sessionActive: model.isSessionActive)
@@ -40,7 +41,8 @@ private struct SessionPolish: ViewModifier {
             .overlay(alignment: .topLeading) {
                 if showStats {
                     StatsOverlay(stats: model.liveStats)
-                        .padding(.leading, 16).padding(.top, 16)
+                        .padding(.leading, 16)
+                        .padding(.top, AdaptiveLayout.statsTopInset(horizontal: horizontalSizeClass))
                         .transition(reduceMotion ? .opacity : .opacity.combined(with: .scale(scale: 0.92, anchor: .topLeading)))
                 }
             }

@@ -3,7 +3,9 @@ import UIKit
 
 /// One Mac in the host grid: the last picture of its screen (or a
 /// placeholder), its model icon, name and address, a reachability dot, and
-/// the connection stages while connecting to it.
+/// the connection stages while connecting to it. On a compact width
+/// (iPhone) it is a row: a small thumbnail beside the text, so several Macs
+/// fit on screen.
 struct HostCard: View {
     let name: String
     let address: String
@@ -16,8 +18,56 @@ struct HostCard: View {
     var stage: ConnectionStage?
 
     static let cornerRadius: CGFloat = 20
+    /// The thumbnail's width in the compact (row) layout.
+    static let rowThumbnailWidth: CGFloat = 128
+
+    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
 
     var body: some View {
+        if horizontalSizeClass == .compact { row } else { card }
+    }
+
+    private var row: some View {
+        HStack(spacing: 12) {
+            preview
+                .frame(width: Self.rowThumbnailWidth)
+                .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+                .overlay(alignment: .topTrailing) { OnlineDot(reachability: reachability).padding(4) }
+            VStack(alignment: .leading, spacing: 2) {
+                HStack(spacing: 6) {
+                    Image(systemName: symbol)
+                        .font(.system(size: 15, weight: .regular))
+                        .foregroundStyle(.tint)
+                        .accessibilityLabel(family ?? "Mac")
+                    Text(name).font(.headline).lineLimit(1)
+                }
+                Text(address).font(.subheadline).foregroundStyle(.secondary).lineLimit(1)
+                if let stage {
+                    Text(stage.title).font(.caption.weight(.medium)).foregroundStyle(.tint).lineLimit(1)
+                        .contentTransition(.opacity)
+                } else {
+                    Text(detail).font(.caption).foregroundStyle(.tertiary).lineLimit(1)
+                }
+            }
+            Spacer(minLength: 0)
+            if stage != nil {
+                ProgressView()
+            } else {
+                Image(systemName: "chevron.right").font(.footnote.weight(.semibold)).foregroundStyle(.tertiary)
+                    .accessibilityHidden(true)
+            }
+        }
+        .padding(10)
+        .animation(.smooth(duration: 0.3), value: stage)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(.background.secondary)
+        .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+        .contentShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+        .accessibilityElement(children: .combine)
+        .accessibilityValue(stage?.title ?? reachability.accessibilityLabel)
+    }
+
+    private var card: some View {
         VStack(alignment: .leading, spacing: 0) {
             preview
                 .overlay(alignment: .topTrailing) { OnlineDot(reachability: reachability).padding(10) }

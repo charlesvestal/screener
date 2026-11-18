@@ -128,6 +128,7 @@ struct ToastOverlay: View {
             }
         }
         .padding(.top, 14)
+        .padding(.horizontal, 16)
         .animation(reduceMotion ? .easeInOut(duration: 0.2) : .spring(response: 0.38, dampingFraction: 0.82),
                    value: center.current?.key)
     }
@@ -153,7 +154,8 @@ private struct ToastCapsule: View {
         .padding(.horizontal, 16)
         .padding(.vertical, 10)
         .menuGlass(Capsule())
-        .fixedSize()
+        // Its natural width, wrapping only when narrower than that (iPhone).
+        .fixedSize(horizontal: false, vertical: true)
         .animation(.easeInOut(duration: 0.15), value: toast.text)
         // Announced by ToastCenter; the capsule itself stays out of the way.
         .accessibilityHidden(true)

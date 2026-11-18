@@ -19,7 +19,8 @@ import Foundation
 
 /// What the Mac's virtual display is sized to.
 enum DisplayMode: String, CaseIterable, Identifiable, Sendable {
-    /// The view's size in points, at 2× (Retina): what the iPad shows 1:1.
+    /// The view's size in points, at 2× (Retina): what the iPad shows 1:1
+    /// (on a 3× iPhone: its pixels at 2×, i.e. points × 1.5).
     case fitRetina
     /// 1.25× the view's points at 2×: more room, smaller text.
     case moreSpace
@@ -72,16 +73,25 @@ enum DisplayMode: String, CaseIterable, Identifiable, Sendable {
     /// the view (`.matchMac`: bare descriptor, fixed at the Mac's size).
     var isDynamic: Bool { pointFactor != nil }
 
+    /// The Mac's HiDPI scale is at most 2× (macOS has no 3× displays).
+    static let maxHiDPIScale = 2.0
+
     /// The virtual display to ask for in a view of `viewPoints` on a screen of
-    /// `scale` (backing pixels per point; 2 on every iPad), or nil for
-    /// `.matchMac`. Logical sizes of the scaled modes are rounded to even
-    /// numbers; every mode keeps the backing inside `maxBacking` (either
-    /// orientation) by shrinking uniformly.
+    /// `scale` (backing pixels per point: 2 on every iPad, 3 on most
+    /// iPhones, 1 or 2 for the iPad app on a Mac), or nil for `.matchMac`.
+    /// The Mac's display is HiDPI at `min(scale, 2)`, sized so its backing
+    /// matches the view's pixels: on a 3× iPhone its logical size is the
+    /// view's points × 1.5 (× the mode's factor) — pixel for pixel, and a Mac
+    /// desktop large enough to work in (AdaptiveLayout). Logical sizes of
+    /// the scaled modes are rounded to even numbers; every mode keeps the
+    /// backing inside `maxBacking` (either orientation) by shrinking uniformly.
     func geometry(viewPoints: CGSize, scale: CGFloat,
                   maxBacking: DisplayGeometry.Cap = .serverDefault) -> DisplayGeometry? {
         guard let factor = pointFactor else { return nil }
-        let hidpi = max(1, Double(scale))
-        var w = Double(viewPoints.width) * factor, h = Double(viewPoints.height) * factor
+        let screen = max(1, Double(scale))
+        let hidpi = min(screen, Self.maxHiDPIScale)
+        let pixelMatch = screen / hidpi
+        var w = Double(viewPoints.width) * factor * pixelMatch, h = Double(viewPoints.height) * factor * pixelMatch
         guard w > 0, h > 0 else { return nil }
         // Fit the backing inside the cap (orientation-agnostic: long × short).
         let long = max(w, h) * hidpi, short = min(w, h) * hidpi
