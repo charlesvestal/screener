@@ -26,3 +26,5 @@ build-menu/
 build-menu-dev/
 build-tear/
 build-fb/
+build-rel/
+.serena/
