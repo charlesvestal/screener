@@ -132,6 +132,9 @@ final class SessionCoordinator {
     private(set) var state: State = .idle
     /// Refreshed once a second while media flows.
     private(set) var mediaStats: MediaTransport.Stats?
+    /// fps / Mbps / decode / loss / BWE for the menu's quality badge and the
+    /// stats overlay (LiveStats.swift), sampled by the same 1 Hz poll.
+    let liveStats = LiveStatsModel()
     private(set) var control: ControlSession?
     private(set) var media: MediaTransport?
     private(set) var mediaParams: ControlSession.MediaParams?
@@ -644,6 +647,11 @@ final class SessionCoordinator {
                                     send: { try await session.send($0) })
         if let b = hostBacking { input.setServerDims(width: b.width, height: b.height) }
         input.pointScale = hostPointScale
+        // TODO(coordinator, Input owner): apply the Settings scroll speed
+        // (ScreenerSettings.scrollSpeed(), "input.scrollSpeed", 0.5–2.0,
+        // default 1.0) at session start: scale the scroll deltas
+        // RemoteInputView / ScrollInertia hand to InputController.scroll.
+        // Not wired here because Input/* is owned by another change.
         self.input?.close()
         self.input = input
         Log.input.info("M5 input ready: canvas \(input.serverWidth)x\(input.serverHeight), pointer via 0x10")
@@ -704,11 +712,16 @@ final class SessionCoordinator {
 
     private func startStatsPolling(_ media: MediaTransport) {
         statsTask?.cancel()
+        liveStats.reset()
+        let epoch = ContinuousClock.now
         statsTask = Task { [weak self] in
             while !Task.isCancelled {
                 let s = await media.stats
                 guard let self, self.media === media else { return }
                 self.mediaStats = s
+                let t = ContinuousClock.now - epoch
+                self.liveStats.ingest(media: s, video: self.frames.liveTotals,
+                                      now: Double(t.components.seconds) + Double(t.components.attoseconds) / 1e18)
                 try? await Task.sleep(for: .seconds(1))
             }
         }

@@ -334,6 +334,10 @@ actor MediaTransport {
         var ssrcCounts: [UInt32: Int] = [:]
         /// SSRC groups adopted after the burst (resizes, server restarts).
         var groupAdoptions = 0
+        /// The last RCTL bandwidth estimate sent (kbps; 0 before the first).
+        var bweKbps = 0
+        /// The estimator's windowed video loss (0…1); nil with too few packets.
+        var lossFraction: Double?
     }
 
     enum BurstOutcome: Sendable, Equatable {
@@ -638,6 +642,8 @@ actor MediaTransport {
         s.audioStreamDrops = streamDrops.audio
         s.activeVideoSSRCs = tracker.active
         s.ssrcCounts = videoDecryptor?.ssrcCounts ?? [:]
+        s.bweKbps = Int(lastRCTL.bwe)
+        s.lossFraction = estimator.lossFraction
         return s
     }
 

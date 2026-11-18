@@ -7,7 +7,9 @@
 // sticky modifiers (tap = latch, double-tap = lock, tap again = off; the
 // menu and the pill badges show the same state), and the keys are the
 // special keys (down on touch-down, up on release, hold to repeat with the
-// modifiers held; the fn layer applies: fn+← = Home, …).
+// modifiers held; the fn layer applies: fn+← = Home, …). Like the menu
+// (ModifierGlow), a latched modifier is tinted with a soft glow and a locked
+// one is filled, underlined, with a tighter glow.
 import Observation
 import UIKit
 
@@ -134,13 +136,12 @@ final class KeyboardAccessoryBar: UIInputView {
                 }
                 c.cornerStyle = .medium
                 c.contentInsets = NSDirectionalEdgeInsets(top: 4, leading: 2, bottom: 4, trailing: 2)
-                c.attributedTitle = AttributedString(m.symbol, attributes: Self.titleAttributes(size: 19))
+                var attributes = Self.titleAttributes(size: 19)
+                if level == .locked { attributes[AttributeScopes.UIKitAttributes.UnderlineStyleAttribute.self] = .single }
+                c.attributedTitle = AttributedString(m.symbol, attributes: attributes)
                 b.configuration = c
-                b.accessibilityValue = switch level {
-                case .off: "Off"
-                case .latched: "Latched for the next key"
-                case .locked: "Locked"
-                }
+                Self.applyGlow(to: b, level: level)
+                b.accessibilityValue = ModifierGlow.accessibilityValue(level)
                 b.accessibilityTraits = level == .off ? .button : [.button, .selected]
             case .key(let k):
                 let shown = state.fnActive ? k.withFn : k
@@ -149,6 +150,16 @@ final class KeyboardAccessoryBar: UIInputView {
                 b.accessibilityLabel = shown.accessibilityName
             }
         }
+    }
+
+    /// The glow is a layer shadow in the tint color (shadowPath-less, so it
+    /// follows the button's rounded background).
+    private static func applyGlow(to b: UIButton, level: StickyLevel) {
+        b.layer.shadowColor = b.tintColor.cgColor
+        b.layer.shadowOffset = .zero
+        b.layer.shadowRadius = ModifierGlow.radius(level)
+        b.layer.shadowOpacity = Float(ModifierGlow.opacity(level))
+        b.layer.masksToBounds = false
     }
 
     private static func titleAttributes(size: CGFloat) -> AttributeContainer {

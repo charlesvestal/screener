@@ -151,6 +151,14 @@ final class VideoFrameStore: @unchecked Sendable {   // all state behind `lock`
         var decodeNanos: Int64 = 0
     }
 
+    /// Cumulative (never reset) decode totals for the live stats overlay
+    /// (LiveStatsModel samples deltas); `takeCounters` stays the log's.
+    struct LiveTotals: Equatable, Sendable {
+        var frames: [Int: Int] = [:]
+        var decodeNanos: Int64 = 0
+        var pixelFormat: OSType?
+    }
+
     /// How long a staged picture waits after its newest strip when nothing
     /// newer decodes (see the header). On live captures consecutive strips of
     /// one picture arrive ≤ 13 ms apart (p99.9; one in ~19000 gaps above
@@ -208,6 +216,7 @@ final class VideoFrameStore: @unchecked Sendable {   // all state behind `lock`
     private var tileCount = 4
     private var canvas: CGSize?
     private var counters = Counters()
+    private var live = LiveTotals()
     private var firstFrameSeen = false
     private var epoch = 0
     private var published = 0
@@ -311,6 +320,10 @@ final class VideoFrameStore: @unchecked Sendable {   // all state behind `lock`
             counters.frames[f.tile, default: 0] += 1
             counters.decodeNanos += f.decodeTime.components.seconds * 1_000_000_000
                 + f.decodeTime.components.attoseconds / 1_000_000_000
+            live.frames[f.tile, default: 0] += 1
+            live.decodeNanos += f.decodeTime.components.seconds * 1_000_000_000
+                + f.decodeTime.components.attoseconds / 1_000_000_000
+            live.pixelFormat = CVPixelBufferGetPixelFormatType(f.pixelBuffer)
             let committed: Bool
             if var next = nextGroup, f.seq > next.afterSeq {
                 // The new stream (resize hold): collect its first picture.
@@ -615,6 +628,9 @@ final class VideoFrameStore: @unchecked Sendable {   // all state behind `lock`
     var staleFramesDropped: Int { lock.withLock { staleDropped } }
 
     func noteError() { lock.withLock { counters.errors += 1 } }
+
+    /// Cumulative decode totals (all sessions; see LiveTotals).
+    var liveTotals: LiveTotals { lock.withLock { live } }
 
     /// Counters since the last call (then zeroed).
     func takeCounters() -> Counters {

@@ -11,6 +11,7 @@ struct HostListView: View {
     @State private var browser = BonjourBrowser()
     @State private var sheet: HostSheet?
     @State private var pendingDelete: SavedHost?
+    @State private var showSettings = false
     @State private var search = ""
     @Query private var savedHosts: [SavedHost]
     @Environment(\.modelContext) private var context
@@ -42,8 +43,12 @@ struct HostListView: View {
                     ToolbarItem(placement: .topBarLeading) {
                         Button { sheet = .about } label: { Label("About", systemImage: "info.circle") }
                     }
+                    ToolbarItem(placement: .topBarLeading) {
+                        Button { showSettings = true } label: { Label("Settings", systemImage: "gearshape") }
+                    }
                 }
                 .sheet(item: $sheet) { sheet in sheetView(sheet) }
+                .sheet(isPresented: $showSettings) { SettingsView() }
                 .confirmationDialog("Delete \(pendingDelete?.name ?? "this Mac")?",
                                     isPresented: Binding(get: { pendingDelete != nil },
                                                          set: { if !$0 { pendingDelete = nil } }),

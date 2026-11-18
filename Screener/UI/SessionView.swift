@@ -46,6 +46,8 @@ struct SessionView: View {
         .onChange(of: displayModeRaw, initial: true) { _, raw in
             model.setDisplayMode(DisplayMode(rawValue: raw) ?? .default)
         }
+        // Toasts, the stats overlay, Keep Screen Awake (UI/Toast/SessionPolish.swift).
+        .sessionPolish(model)
         .statusBarHidden(true)
         .persistentSystemOverlays(.hidden)
     }

@@ -241,6 +241,9 @@ private struct ControlPanel: View {
     /// Brief confirmation on a clipboard tile ("Sent", "No Text", …).
     @State private var clipboardFlash: (tile: Int, text: String)?
     @State private var clipboardFlashTask: Task<Void, Never>?
+    @AppStorage(ScreenerSettings.statsOverlayKey) private var showStats = ScreenerSettings.statsOverlayDefault
+    /// The session's live stats (SessionView's environment); nil outside a session.
+    @Environment(LiveStatsModel.self) private var liveStats: LiveStatsModel?
 
     var body: some View {
         ViewThatFits(in: .vertical) {
@@ -270,6 +273,7 @@ private struct ControlPanel: View {
                 .buttonStyle(.plain)
                 .accessibilityLabel("Close Control Menu")
             }
+            if let liveStats { QualityBadge(stats: liveStats) }
             section("Modifiers") { ModifierBar(menu: menu) }
             section("Keys") { SpecialKeysPanel(menu: menu) }
             section("Mac Shortcuts") { shortcuts }
@@ -360,7 +364,10 @@ private struct ControlPanel: View {
                     + "Touch: the pointer goes where you touch. Tap to switch.") {
                 touchModeRaw = (touchMode == .trackpad ? TouchInputMode.direct : .trackpad).rawValue
             }
-            tile("Stats", "chart.bar", hint: "Coming soon") {}.disabled(true)
+            tile("Stats", showStats ? "chart.bar.fill" : "chart.bar", selected: showStats,
+                 hint: "Shows frame rate, bitrate, decode time and loss over the session.") { showStats.toggle() }
+                .accessibilityValue(showStats ? "On" : "Off")
+                .accessibilityAddTraits(.isToggle)
             tile("Smooth Playback", smoothPlayback ? "waveform.path" : "waveform.path.ecg",
                  selected: smoothPlayback,
                  hint: "Presents frames on the Mac's timeline: smoother motion, a little more delay. "
@@ -478,21 +485,45 @@ private struct MenuGlass<S: Shape>: ViewModifier {
 #if DEBUG
 /// DEBUG-only: the menu over a stand-in desktop, no Mac (launch with
 /// `-previewControlMenu YES`, optionally `-previewMenuExpanded YES`).
+///
+/// `-previewSettings YES` shows Settings instead; `-previewStats YES` adds
+/// synthetic live stats (badge + overlay) and a toast.
 struct FloatingMenuPreview: View {
     @State private var menu = ControlMenuModel()
     @State private var expanded = UserDefaults.standard.bool(forKey: "previewMenuExpanded")
     @State private var keyboard = false
+    @State private var stats = LiveStatsModel()
+    /// Never auto-dismissed (screenshots).
+    @State private var toasts = ToastCenter(schedule: { _, _ in {} })
+    private let withStats = UserDefaults.standard.bool(forKey: "previewStats")
 
     var body: some View {
-        ZStack {
-            LinearGradient(colors: [.indigo, .teal], startPoint: .topLeading, endPoint: .bottomTrailing)
-                .ignoresSafeArea()
-            FloatingMenuView(menu: menu, expanded: $expanded, keyboardVisible: $keyboard,
-                             controls: SessionControls(inputAvailable: true, disconnect: {}))
-        }
-        .onAppear {
-            menu.password = { "preview" }
-            menu.tapModifier(.command)
+        if UserDefaults.standard.bool(forKey: "previewSettings") {
+            SettingsView()
+        } else {
+            ZStack {
+                LinearGradient(colors: [.indigo, .teal], startPoint: .topLeading, endPoint: .bottomTrailing)
+                    .ignoresSafeArea()
+                if withStats {
+                    StatsOverlay(stats: stats)
+                        .padding(16)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+                }
+                FloatingMenuView(menu: menu, expanded: $expanded, keyboardVisible: $keyboard,
+                                 controls: SessionControls(inputAvailable: true, disconnect: {}))
+            }
+            .overlay(alignment: .top) { ToastOverlay(center: toasts) }
+            .environment(withStats ? stats : nil)
+            .onAppear {
+                menu.password = { "preview" }
+                menu.tapModifier(.command)
+                menu.tapModifier(.shift)
+                menu.tapModifier(.shift)
+                if withStats {
+                    stats.loadPreview()
+                    toasts.show(SessionToasts.sentToMac, systemImage: "doc.on.clipboard")
+                }
+            }
         }
     }
 }

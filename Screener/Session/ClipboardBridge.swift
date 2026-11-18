@@ -51,9 +51,20 @@ final class SystemPasteboard: PasteboardAccess {
     }
 }
 
+/// A completed clipboard transfer (for the session's toasts).
+enum ClipboardActivity: Equatable, Sendable {
+    /// iPad text went out to the Mac.
+    case sentToMac
+    /// The Mac's text was written to the iPad clipboard.
+    case receivedFromMac
+}
+
 @MainActor
 final class ClipboardBridge {
     typealias Send = @Sendable (Data) async throws -> Void
+
+    /// Called on the main actor after each completed transfer (never with contents).
+    var onActivity: ((ClipboardActivity) -> Void)?
 
     /// Read on every decision so the menu toggle applies at once.
     var mode: () -> ClipboardSyncMode = { ClipboardSyncMode.current }
@@ -228,14 +239,16 @@ final class ClipboardBridge {
         writing = false
         state.didWriteLocal(text, changeCount: pasteboard.changeCount)
         Log.app.info("clipboard recv: \(text.count) chars → iPad clipboard")
+        onActivity?(.receivedFromMac)
     }
 
     /// Builds the 0x1f (deflate off the main actor) and queues it.
     private func transmit(text: String) {
         let lf = text.replacingOccurrences(of: "\r\n", with: "\n")
         let chars = lf.count
-        enqueue { try await Task.detached(priority: .userInitiated) { try Clipboard.send(text: lf) }.value } done: {
+        enqueue { try await Task.detached(priority: .userInitiated) { try Clipboard.send(text: lf) }.value } done: { [weak self] in
             Log.app.info("clipboard send: \(chars) chars")
+            self?.onActivity?(.sentToMac)
         }
     }
 
