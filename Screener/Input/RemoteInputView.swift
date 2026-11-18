@@ -889,6 +889,8 @@ final class RemoteInputView: UIView, UIPointerInteractionDelegate, UIGestureReco
         case .dragBegan:
             guard let p = cursorBasePoint else { return }
             feedback.feedback(.dragBegan(at: p))
+        case .dragEnded:
+            feedback.feedback(.dragEnded)
         case .dragLock(let on):
             feedback.feedback(.dragLock(active: on, at: cursorBasePoint))
         case .longPressArmed(let p, let duration):

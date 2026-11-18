@@ -30,9 +30,9 @@
 // Four or more fingers are left to the system.
 //
 // Feedback cues (`onCue`, TouchCue): alongside its actions the interpreter
-// reports what a gesture MEANT — a click (and how many), a drag starting, the
-// drag lock engaging/releasing, a trackpad finger landing, a direct-mode long
-// press arming / firing / being abandoned — for the visual feedback
+// reports what a gesture MEANT — a click (and how many), a drag starting or
+// ending, the drag lock engaging/releasing, a trackpad finger landing, a
+// direct-mode long press arming / firing / being abandoned — for the visual feedback
 // (RemoteInputView → FeedbackSink). Cues never change the actions.
 //
 // Nothing stays pressed: every button-down has its button-up on lift, on a
@@ -119,8 +119,10 @@ enum TouchCue: Equatable {
     case fingerDown
     /// `count` clicks of `button` were sent (2: a double click).
     case click(button: Int, count: Int)
-    /// A gesture pressed the left button to drag.
+    /// A gesture pressed the left button to drag (tap-drag / long-press-drag).
     case dragBegan
+    /// That drag released the button.
+    case dragEnded
     /// The three-finger drag lock engaged (true) or released (false).
     case dragLock(Bool)
     /// Direct mode: a touch at `at` will be a long press after `duration`
@@ -547,6 +549,7 @@ final class TouchInterpreter {
         guard buttonDown else { return }
         buttonDown = false
         perform(.button(InputController.Button.left, down: false))
+        onCue?(.dragEnded)
     }
 
     private func click(_ button: Int, haptic: TouchHaptic?) {

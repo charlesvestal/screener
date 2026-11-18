@@ -28,9 +28,13 @@ enum FeedbackEvent: Equatable, Sendable {
     case doubleClick(at: CGPoint)
     /// A touch right click at the cursor (BASE).
     case rightClick(at: CGPoint)
-    /// A touch drag pressed the button at the cursor (BASE).
+    /// A touch drag (tap-drag / long-press-drag) pressed the button: starts
+    /// the slow pulse at the cursor (BASE).
     case dragBegan(at: CGPoint)
-    /// The trackpad drag lock engaged / released (cursor in BASE).
+    /// That drag released the button: stops the pulse.
+    case dragEnded
+    /// The trackpad three-finger drag lock engaged / released (cursor in
+    /// BASE): the same pulse as `dragBegan`/`dragEnded`.
     case dragLock(active: Bool, at: CGPoint?)
     /// Trackpad mode: a finger landed (the cursor's halo).
     case fingerDown

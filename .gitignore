@@ -54,5 +54,9 @@ build-host-fx-dev/
 build-fx/
 build-fx-dev/
 build-vid/
+build-sec1/
+build-sec1-dev/
 build-sec2/
 build-sec2-dev/
+build-ripple/
+build-ripple-dev/

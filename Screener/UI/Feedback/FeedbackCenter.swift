@@ -104,7 +104,14 @@ final class FeedbackCenter: FeedbackSink {
         case .click(let p): spawn(.click, p, t, visual, reduced)
         case .doubleClick(let p): spawn(.doubleClick, p, t, visual, reduced)
         case .rightClick(let p): spawn(.rightClick, p, t, visual, reduced)
-        case .dragBegan(let p): spawn(.grab, p, t, visual, reduced)
+        case .dragBegan(let p):
+            guard visual else { return }
+            ripples.setPulse(at: p, now: t, reduceMotion: reduced)
+            changed()
+        case .dragEnded:
+            guard ripples.pulse != nil else { return }
+            ripples.setPulse(at: nil, now: t, reduceMotion: reduced)
+            changed()
         case .dragLock(let active, let p):
             guard visual || !active else { return }
             ripples.setPulse(at: active ? p : nil, now: t, reduceMotion: reduced)

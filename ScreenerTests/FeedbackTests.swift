@@ -14,7 +14,8 @@ final class RippleFieldTests: XCTestCase {
         var f = RippleField()
         f.spawn(.click, at: p, now: 10, reduceMotion: false)
         XCTAssertEqual(f.ripples.count, 1)
-        let a = f.samples(at: 10.0), b = f.samples(at: 10.15), c = f.samples(at: 10.34)
+        let a = f.samples(at: 10.0), b = f.samples(at: 10 + RippleField.ringDuration * 0.43),
+            c = f.samples(at: 10 + RippleField.ringDuration * 0.97)
         XCTAssertEqual(a.count, 1)
         XCTAssertEqual(a[0].center, p)
         XCTAssertLessThan(a[0].radius, b[0].radius)
@@ -22,21 +23,23 @@ final class RippleFieldTests: XCTestCase {
         XCTAssertLessThanOrEqual(c[0].radius, RippleField.ringMaxRadius)
         XCTAssertGreaterThan(a[0].amplitude, b[0].amplitude)
         XCTAssertGreaterThan(b[0].amplitude, c[0].amplitude)
-        XCTAssertGreaterThan(c[0].radius, 100)                 // ~0 → 120 pt
-        XCTAssertTrue(f.isAnimating(at: 10.34))
+        XCTAssertGreaterThan(c[0].radius, RippleField.ringMaxRadius * 0.8)
+        XCTAssertTrue(f.isAnimating(at: 10 + RippleField.ringDuration * 0.97))
         XCTAssertFalse(f.isAnimating(at: 10 + RippleField.ringDuration))
-        XCTAssertEqual(f.samples(at: 10.36), [])
-        f.prune(at: 10.36)
+        XCTAssertEqual(f.samples(at: 10 + RippleField.ringDuration + 0.01), [])
+        f.prune(at: 10 + RippleField.ringDuration + 0.01)
         XCTAssertTrue(f.isEmpty)
     }
 
-    func testDoubleClickIsTwoQuickRings() {
+    func testDoubleClickIsTwoRingsAProportionalGapApart() {
         var f = RippleField()
         f.spawn(.doubleClick, at: p, now: 0, reduceMotion: false)
         XCTAssertEqual(f.ripples.count, 2)
         XCTAssertEqual(f.ripples[1].start, RippleField.doubleGap, accuracy: 1e-9)
-        XCTAssertEqual(f.samples(at: 0.05).count, 1)          // the second hasn't started
-        XCTAssertEqual(f.samples(at: 0.1).count, 2)
+        XCTAssertGreaterThanOrEqual(RippleField.doubleGap, 0.12)
+        XCTAssertLessThanOrEqual(RippleField.doubleGap, 0.15)
+        XCTAssertEqual(f.samples(at: RippleField.doubleGap * 0.5).count, 1)  // the second hasn't started
+        XCTAssertEqual(f.samples(at: RippleField.doubleGap * 1.2).count, 2)
         // Animating until the second ring ends.
         XCTAssertTrue(f.isAnimating(at: RippleField.ringDuration + 0.05))
         XCTAssertFalse(f.isAnimating(at: RippleField.doubleGap + RippleField.ringDuration))
@@ -55,21 +58,12 @@ final class RippleFieldTests: XCTestCase {
         XCTAssertLessThan(s[1].amplitude, plain.amplitude)
     }
 
-    func testGrabRingContracts() {
-        var f = RippleField()
-        f.spawn(.grab, at: p, now: 0, reduceMotion: false)
-        let r = [0.0, 0.1, 0.2, 0.29].map { f.samples(at: $0)[0].radius }
-        XCTAssertEqual(r, r.sorted(by: >))
-        XCTAssertEqual(r[0], RippleField.grabStartRadius, accuracy: 0.01)
-        XCTAssertFalse(f.isAnimating(at: RippleField.grabDuration))
-    }
-
     func testAtMostEightRipplesNewestKept() {
         var f = RippleField()
         for i in 0..<10 { f.spawn(.click, at: CGPoint(x: i, y: 0), now: Double(i) * 0.01, reduceMotion: false) }
         XCTAssertEqual(f.ripples.count, RippleField.maxCount)
         XCTAssertEqual(f.ripples.first?.center.x, 2)
-        // The drag-lock pulse takes one slot.
+        // The drag pulse takes one slot.
         f.setPulse(at: p, now: 0.1, reduceMotion: false)
         XCTAssertEqual(f.ripples.count, RippleField.maxCount - 1)
         XCTAssertLessThanOrEqual(f.samples(at: 0.12).count, RippleField.maxCount)
@@ -91,7 +85,7 @@ final class RippleFieldTests: XCTestCase {
     }
 
     func testReduceMotionGivesInPlaceFadesWithoutDistortion() {
-        for v in [RippleVariant.click, .doubleClick, .rightClick, .grab] {
+        for v in [RippleVariant.click, .doubleClick, .rightClick] {
             var f = RippleField()
             f.spawn(v, at: p, now: 0, reduceMotion: true)
             XCTAssertEqual(f.ripples.count, 1, "\(v)")
@@ -176,8 +170,22 @@ final class FeedbackCenterTests: XCTestCase {
         XCTAssertTrue(c.needsFrames(at: clock.now))
         XCTAssertEqual(c.gpuState(at: clock.now + 0.1).ripples.count, 1)
         XCTAssertGreaterThan(c.gpuState(at: clock.now + 0.1).ripples[0].amplitude, 0)
-        XCTAssertFalse(c.needsFrames(at: clock.now + 0.5))
-        XCTAssertTrue(c.gpuState(at: clock.now + 0.5).isEmpty)
+        XCTAssertFalse(c.needsFrames(at: clock.now + RippleField.ringDuration + 0.05))
+        XCTAssertTrue(c.gpuState(at: clock.now + RippleField.ringDuration + 0.05).isEmpty)
+    }
+
+    func testDragBeganStartsThePulseAndDragEndedStopsIt() {
+        let c = make()
+        var redraws = 0
+        c.onChange = { redraws += 1 }
+        c.feedback(.dragBegan(at: CGPoint(x: 1, y: 1)))
+        XCTAssertEqual(redraws, 1)
+        XCTAssertTrue(c.needsFrames(at: clock.now + 5))
+        c.feedback(.cursorMoved(to: CGPoint(x: 20, y: 30)))
+        XCTAssertEqual(c.gpuState(at: clock.now + 0.2).ripples.last?.center, CGPoint(x: 20, y: 30))
+        c.feedback(.dragEnded)
+        XCTAssertFalse(c.needsFrames(at: clock.now + 5))
+        XCTAssertTrue(c.gpuState(at: clock.now + 5).isEmpty)
     }
 
     func testVisualOffDisablesRipplesHaloTrailAndScrollPill() {
@@ -312,6 +320,16 @@ final class FeedbackCueTests: XCTestCase {
         XCTAssertEqual(cues, [.fingerDown, .fingerDown, .dragBegan])
     }
 
+    func testTrackpadTapDragEndsWithDragEndedOnLift() {
+        let t = make()
+        t.began(1, at: .zero, time: at(0))
+        t.ended(1, at: .zero, time: at(0.08))
+        t.began(2, at: .zero, time: at(0.1))
+        t.moved(2, to: CGPoint(x: 40, y: 0), time: at(0.05))
+        t.ended(2, at: CGPoint(x: 40, y: 0), time: at(0.1))
+        XCTAssertEqual(cues.last, .dragEnded)
+    }
+
     func testTwoFingerTapIsARightClick() {
         let t = make()
         t.began(1, at: CGPoint(x: 10, y: 10), time: at(0))
@@ -378,6 +396,15 @@ final class FeedbackCueTests: XCTestCase {
         t.moved(1, to: CGPoint(x: 30, y: 0), time: at(0.05))
         XCTAssertEqual(Array(cues.dropFirst()), [.longPressFired, .dragBegan])
     }
+
+    func testDirectLongPressDragEndsWithDragEndedOnLift() {
+        let t = make(.direct)
+        t.began(1, at: .zero, time: at(0))
+        _ = at(0.6)
+        t.moved(1, to: CGPoint(x: 30, y: 0), time: at(0.05))
+        t.ended(1, at: CGPoint(x: 30, y: 0), time: at(0.1))
+        XCTAssertEqual(cues.last, .dragEnded)
+    }
 }
 
 /// RemoteInputView: cues and its own work → FeedbackEvents at the cursor.
@@ -409,10 +436,11 @@ final class FeedbackEmissionTests: XCTestCase {
         view.handleCue(.click(button: InputController.Button.left, count: 2))
         view.handleCue(.click(button: InputController.Button.right, count: 1))
         view.handleCue(.dragBegan)
+        view.handleCue(.dragEnded)
         view.handleCue(.dragLock(true))
         view.handleCue(.fingerDown)
         XCTAssertEqual(r.events, [.click(at: p), .doubleClick(at: p), .rightClick(at: p), .dragBegan(at: p),
-                                  .dragLock(active: true, at: p), .fingerDown])
+                                  .dragEnded, .dragLock(active: true, at: p), .fingerDown])
     }
 
     func testZoomedClicksStillReportTheUnzoomedPoint() throws {
