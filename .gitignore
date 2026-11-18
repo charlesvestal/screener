@@ -41,3 +41,5 @@ build-audio/
 build-audio-dev/
 build-touch/
 build-touch-dev/
+build-clip/
+build-clip-dev/

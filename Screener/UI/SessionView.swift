@@ -32,7 +32,9 @@ struct SessionView: View {
             }
             FloatingMenuView(menu: menu, expanded: $menuExpanded, keyboardVisible: $keyboardVisible,
                              controls: SessionControls(inputAvailable: model.input != nil,
-                                                       disconnect: { Task { await model.disconnect() } }))
+                                                       disconnect: { Task { await model.disconnect() } },
+                                                       getClipboard: { model.clipboard.fetchFromMac() },
+                                                       sendClipboard: { model.clipboard.sendToMac() }))
         }
         .onAppear {
             // Read on demand from the in-memory connect request (cleared on

@@ -80,6 +80,10 @@ struct PillPlacement: Equatable {
 struct SessionControls {
     var inputAvailable: Bool
     var disconnect: () -> Void
+    /// "Get Clipboard": fetch the Mac's clipboard onto the iPad (nil: unavailable).
+    var getClipboard: (() -> Void)? = nil
+    /// "Send Clipboard": send the iPad's text to the Mac; false if there was none.
+    var sendClipboard: (() -> Bool)? = nil
 }
 
 struct FloatingMenuView: View {
@@ -230,6 +234,11 @@ private struct ControlPanel: View {
     @AppStorage(TouchInputMode.defaultsKey) private var touchModeRaw = TouchInputMode.default.rawValue
     private var touchMode: TouchInputMode { TouchInputMode(rawValue: touchModeRaw) ?? .default }
     @AppStorage(AudioPlayer.mutedDefaultsKey) private var audioMuted = false
+    @AppStorage(ClipboardSyncMode.defaultsKey) private var clipboardModeRaw = ClipboardSyncMode.default.rawValue
+    private var clipboardAuto: Bool { (ClipboardSyncMode(rawValue: clipboardModeRaw) ?? .default) == .automatic }
+    /// Brief confirmation on a clipboard tile ("Sent", "No Text", …).
+    @State private var clipboardFlash: (tile: Int, text: String)?
+    @State private var clipboardFlashTask: Task<Void, Never>?
 
     var body: some View {
         ViewThatFits(in: .vertical) {
@@ -238,7 +247,7 @@ private struct ControlPanel: View {
         }
         .frame(width: 372)
         .menuGlass(RoundedRectangle(cornerRadius: 26, style: .continuous))
-        .onDisappear { disarmTask?.cancel() }
+        .onDisappear { disarmTask?.cancel(); clipboardFlashTask?.cancel() }
     }
 
     private var content: some View {
@@ -320,8 +329,25 @@ private struct ControlPanel: View {
                 typePasswordTapped()
             }
             .disabled(!controls.inputAvailable || !menu.canTypePassword)
-            tile("Get Clipboard", "doc.on.clipboard", hint: "Coming soon") {}.disabled(true)
-            tile("Send Clipboard", "clipboard", hint: "Coming soon") {}.disabled(true)
+            tile(clipboardFlash?.tile == 0 ? clipboardFlash!.text : "Get Clipboard", "doc.on.clipboard",
+                 hint: "Copies the Mac's clipboard text to this iPad.") {
+                controls.getClipboard?()
+                flashClipboard(0, "Requested")
+            }
+            .disabled(controls.getClipboard == nil || !controls.inputAvailable)
+            tile(clipboardFlash?.tile == 1 ? clipboardFlash!.text : "Send Clipboard", "clipboard",
+                 hint: "Sends this iPad's clipboard text to the Mac.") {
+                flashClipboard(1, controls.sendClipboard?() == true ? "Sent" : "No Text")
+            }
+            .disabled(controls.sendClipboard == nil || !controls.inputAvailable)
+            tile("Auto Clipboard", clipboardAuto ? "arrow.left.arrow.right.circle.fill" : "arrow.left.arrow.right.circle",
+                 selected: clipboardAuto,
+                 hint: "On: text copied on either side is copied to the other automatically; iPadOS may ask "
+                    + "to allow pasting. Off: use Get Clipboard and Send Clipboard.") {
+                clipboardModeRaw = (clipboardAuto ? ClipboardSyncMode.manual : .automatic).rawValue
+            }
+            .accessibilityValue(clipboardAuto ? "On" : "Off")
+            .accessibilityAddTraits(.isToggle)
             tile("Mute", audioMuted ? "speaker.slash.fill" : "speaker.wave.2", selected: audioMuted,
                  hint: "Silences the Mac's sound on this iPad.") { audioMuted.toggle() }
                 .accessibilityValue(audioMuted ? "On" : "Off")
@@ -345,6 +371,16 @@ private struct ControlPanel: View {
             .buttonStyle(.plain)
             .accessibilityLabel("Share Log")
             tile("Disconnect", "xmark.circle.fill", destructive: true) { controls.disconnect() }
+        }
+    }
+
+    private func flashClipboard(_ tile: Int, _ text: String) {
+        clipboardFlashTask?.cancel()
+        clipboardFlash = (tile, text)
+        clipboardFlashTask = Task { @MainActor in
+            try? await Task.sleep(for: .seconds(1.5))
+            guard !Task.isCancelled else { return }
+            clipboardFlash = nil
         }
     }
 

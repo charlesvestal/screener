@@ -32,6 +32,11 @@
 // backing/scaled factor; 0x450 STORE / SELECT update RemoteCursor. Both are
 // dropped at teardown (cursor cache ids are per connection).
 //
+// Clipboard (Task 17): `clipboard` (ClipboardBridge) is attached once the
+// stream starts (0x15 enable + prime), gets the 0x14 / 0x1f control events,
+// re-checks the iPad pasteboard when the scene becomes active, and is
+// detached at teardown. Its sync bookkeeping outlives sessions.
+//
 // Concurrency: every connect runs in `connectTask` under a generation number.
 // `disconnect()` and any session failure bump the generation, cancel the task
 // and tear down; the connect task re-checks its generation after every await
@@ -127,6 +132,8 @@ final class SessionCoordinator {
     let frames = VideoFrameStore()
     /// The host's cursor shape and the local pointer position (rendered over the video).
     let cursor = RemoteCursor()
+    /// Two-way text clipboard (attached while a session's stream runs).
+    let clipboard = ClipboardBridge()
     /// Sends pointer / keyboard input; nil until the stream has started.
     private(set) var input: InputController?
     /// Releases every held key and pointer button on the UI layer (weakly
@@ -295,6 +302,7 @@ final class SessionCoordinator {
             await reconnect()
         case .none, .suspend:
             if state == .suspended { state = .idle; isReconnecting = false }
+            clipboard.appBecameActive()
         }
     }
 
@@ -427,6 +435,7 @@ final class SessionCoordinator {
             case .started:
                 frames.configure(canvas: CGSize(width: params.canvas.width, height: params.canvas.height))
                 startInput(session, params)
+                clipboard.start(send: { try await session.send($0) })
                 state = .connected(canvasWidth: params.canvas.width, canvasHeight: params.canvas.height)
                 startFirstFrameDeadline(gen, media)
                 return
@@ -488,6 +497,7 @@ final class SessionCoordinator {
         // and clearing `input`/`media`, which callers (and tests) read as
         // one atomic transition.
         releaseInput?()
+        clipboard.stop()
         let input = input
         self.input = nil
         cursor.reset()
@@ -580,6 +590,8 @@ final class SessionCoordinator {
             cursor.store(id: id, hotspot: hotspot, size: size, bgra: bgra, alpha: alpha)
         case .cursorSelect(let id):
             cursor.select(id: id)
+        case .miscStatus, .clipboard:
+            clipboard.handle(event)
         default:
             break
         }
