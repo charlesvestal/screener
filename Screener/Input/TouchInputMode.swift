@@ -195,9 +195,6 @@ final class TouchInterpreter {
     /// Gesture semantics for this gesture: Pencil is always direct.
     private var effectiveMode: TouchInputMode { pencil ? .direct : mode }
 
-    /// Something is in progress (a gesture, a pending click, a lock).
-    var isActive: Bool { phase != .idle || pendingClick != nil || pendingRightClick != nil || dragLocked }
-
     // MARK: input
 
     func began(_ id: Int, at p: CGPoint, time t: TimeInterval, pencil isPencil: Bool = false) {
@@ -246,6 +243,7 @@ final class TouchInterpreter {
         case .pending:
             guard let f = fingers.values.first, distance(f.start, f.last) > Tuning.slop else { return }
             let delta = sub(f.last, f.start)
+            flushPendingRightClick()
             if effectiveMode == .trackpad {
                 cancelTimer()
                 if owedClick {
@@ -482,12 +480,14 @@ final class TouchInterpreter {
         timer = nil
         guard phase == .pending, owedClick else { return }
         owedClick = false
+        flushPendingRightClick()
         startDrag()
     }
 
     private func longPressFired() {
         timer = nil
         guard phase == .pending, let f = fingers.values.first else { return }
+        flushPendingRightClick()
         phase = .longPressed
         perform(.moveTo(f.start))
         perform(.haptic(.medium))
@@ -518,6 +518,16 @@ final class TouchInterpreter {
         guard owedClick else { return }
         owedClick = false
         click(InputController.Button.left, haptic: .light)
+    }
+
+    /// A one-finger gesture committed while a zoomed two-finger tap waited
+    /// for its double tap: right click now, before the cursor moves.
+    private func flushPendingRightClick() {
+        guard let cancelRight = pendingRightClick else { return }
+        cancelRight()
+        pendingRightClick = nil
+        rightClick(at: pendingRightClickAt ?? startCentroid)
+        pendingRightClickAt = nil
     }
 
     private func flushPendingClicks() {

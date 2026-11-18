@@ -279,6 +279,20 @@ final class TrackpadModeTests: XCTestCase {
         XCTAssertEqual(buttonsAndHaptics, [.haptic(.medium)] + click(R))
     }
 
+    func testZoomedRightClickIsSentBeforeAFollowingMove() {
+        let t = make()
+        zoomed = true
+        t.began(1, at: CGPoint(x: 100, y: 100), time: clock.now)
+        t.began(2, at: CGPoint(x: 160, y: 100), time: clock.now)
+        t.ended(1, at: .zero, time: at(0.06))
+        t.ended(2, at: .zero, time: clock.now)
+        t.began(3, at: .zero, time: at(0.05))
+        t.moved(3, to: CGPoint(x: 30, y: 0), time: at(0.05))
+        clock.advance(by: 1)
+        XCTAssertEqual(Array(actions.suffix(4)), [.haptic(.medium)] + click(R) + [.moveBy(CGPoint(x: 30, y: 0))])
+        XCTAssertEqual(buttonsAndHaptics, [.haptic(.medium)] + click(R), "exactly one right click")
+    }
+
     // MARK: direct
 
     func testDirectTapClicksAtTheTouch() {
