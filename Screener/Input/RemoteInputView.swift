@@ -60,7 +60,8 @@
 // Pointer lock (PointerLock.swift): while connected, a mouse / trackpad is
 //   attached and the floating menu is closed, the view asks for the pointer
 //   lock (granted by iPadOS in full screen only). Locked, GCMouse supplies
-//   relative motion (moves like trackpad mode, with the viewport following),
+//   relative motion (one count ≈ one Mac point, gently accelerated, ×
+//   Settings → Pointer Speed: PointerScaling; the viewport follows),
 //   buttons and scroll; UIKit's pointer touches and scroll pans are ignored
 //   so nothing is sent twice.
 // Keyboard:
@@ -131,9 +132,6 @@ final class RemoteInputView: UIView, UIPointerInteractionDelegate, UIGestureReco
         /// interval between repeats (≈ macOS defaults).
         static let keyRepeatDelay: TimeInterval = 0.5
         static let keyRepeatInterval: TimeInterval = 0.033
-        /// Pointer lock: view points of cursor travel per GCMouse delta unit
-        /// (before acceleration). Tune on device.
-        static let lockedMouseGain: CGFloat = 1
         /// Pointer lock: GCMouse scroll units → view points of "finger"
         /// travel (sign: + = content follows a downward swipe). Tune on device.
         static let lockedScrollPoints: CGFloat = 1
@@ -947,7 +945,7 @@ final class RemoteInputView: UIView, UIPointerInteractionDelegate, UIGestureReco
         case .began:
             stopInertia()
         case .moveBy(let d):
-            moveCursor(by: d)
+            moveCursor(by: PointerScaling.touchDelta(d, speed: preferences.touchPointerSpeed))
             if let p = cursorBasePoint { feedback?.feedback(.cursorMoved(to: p)) }
         case .moveTo(let p):
             movePointer(to: p, coalescable: true, clampToPicture: true)
@@ -1138,14 +1136,23 @@ final class RemoteInputView: UIView, UIPointerInteractionDelegate, UIGestureReco
         }
     }
 
-    /// GCMouse motion (y up) → a relative move (y down), accelerated like a finger.
+    /// GCMouse motion (y up) → a relative move (y down), scaled like macOS
+    /// at its default tracking speed (PointerScaling) × Settings → Pointer Speed.
     func lockedMouseMoved(dx: CGFloat, dy: CGFloat) {
         guard pointerLocked else { return }
         let now = ProcessInfo.processInfo.systemUptime
         let dt = lastLockedMove.map { now - $0 } ?? 1.0 / 120
         lastLockedMove = now
-        let d = CGPoint(x: dx * Tuning.lockedMouseGain, y: -dy * Tuning.lockedMouseGain)
-        moveCursor(by: TrackpadAcceleration.apply(d, dt: dt))
+        hardwareMouseMoved(dx: dx, dy: dy, dt: dt)
+    }
+
+    /// A GCMouse delta of (dx, dy) counts (y up) over `dt` seconds.
+    func hardwareMouseMoved(dx: CGFloat, dy: CGFloat, dt: TimeInterval) {
+        guard let input else { return }
+        moveCursor(by: PointerScaling.viewDelta(
+            counts: CGPoint(x: dx, y: -dy), dt: dt, speed: preferences.pointerSpeed,
+            hostPointScale: input.pointScale,
+            hostPixelsPerViewPoint: input.hostPixelsPerPoint(viewSize: bounds.size, zoom: 1)))
     }
 
     private func lockedButton(_ button: Int, pressed: Bool) {

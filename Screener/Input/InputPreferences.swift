@@ -14,6 +14,8 @@
 // - Long-press to right-click ("input.longPressRightClick", default on):
 //   trackpad mode, one finger held still for TouchInterpreter.Tuning.longPress
 //   is a right click (with a haptic) — TouchInterpreter.longPressRightClick.
+// - Pointer Speed / Touch Pointer Speed ("input.pointerSpeed",
+//   "input.touchPointerSpeed", 0.25×–3×, default 1×): PointerScaling.swift.
 // - Keyboard Tester ("input.keyboardTester", default off): a diagnostic
 //   overlay of the last hardware key events (HardwareKeyboard.swift).
 import Foundation
@@ -72,6 +74,10 @@ struct InputPreferences: Equatable, Sendable {
     var scrollDirection = ScrollDirection.default
     var longPressRightClick = InputPreferences.longPressRightClickDefault
     var keyboardTester = false
+    /// Hardware mouse / trackpad under pointer lock (PointerScaling).
+    var pointerSpeed = PointerScaling.defaultSpeed
+    /// Trackpad-mode finger moves (PointerScaling).
+    var touchPointerSpeed = PointerScaling.defaultSpeed
 
     /// The stored preferences (unknown / missing values → defaults).
     static func load(_ d: UserDefaults = .standard) -> InputPreferences {
@@ -86,6 +92,12 @@ struct InputPreferences: Equatable, Sendable {
             p.longPressRightClick = d.bool(forKey: longPressRightClickKey)
         }
         p.keyboardTester = d.bool(forKey: keyboardTesterKey)
+        if d.object(forKey: PointerScaling.pointerSpeedKey) != nil {
+            p.pointerSpeed = PointerScaling.clamp(d.double(forKey: PointerScaling.pointerSpeedKey))
+        }
+        if d.object(forKey: PointerScaling.touchPointerSpeedKey) != nil {
+            p.touchPointerSpeed = PointerScaling.clamp(d.double(forKey: PointerScaling.touchPointerSpeedKey))
+        }
         return p
     }
 }

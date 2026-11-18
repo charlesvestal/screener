@@ -19,6 +19,8 @@ struct SettingsView: View {
     @AppStorage(InputPreferences.longPressRightClickKey) private var longPressRightClick =
         InputPreferences.longPressRightClickDefault
     @AppStorage(InputPreferences.keyboardTesterKey) private var keyboardTester = false
+    @AppStorage(PointerScaling.pointerSpeedKey) private var pointerSpeed = PointerScaling.defaultSpeed
+    @AppStorage(PointerScaling.touchPointerSpeedKey) private var touchPointerSpeed = PointerScaling.defaultSpeed
     @AppStorage(ResumeOnLaunch.enabledKey) private var reconnectOnLaunch = ResumeOnLaunch.enabledDefault
     @State private var showAcknowledgements = false
     @State private var showHelp = false
@@ -30,6 +32,23 @@ struct SettingsView: View {
             (ClipboardSyncMode(rawValue: clipboardModeRaw) ?? .default) == .automatic
         } set: { on in
             clipboardModeRaw = (on ? ClipboardSyncMode.automatic : .manual).rawValue
+        }
+    }
+
+    /// A 0.25×–3× speed slider (PointerScaling.speedRange) with its value.
+    private func speedSlider(_ title: String, value: Binding<Double>) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            LabeledContent(title) {
+                Text(String(format: "%.2g×", value.wrappedValue)).monospacedDigit()
+            }
+            Slider(value: value, in: PointerScaling.speedRange) {
+                Text(title)
+            } minimumValueLabel: {
+                Image(systemName: "tortoise").accessibilityLabel("Slower")
+            } maximumValueLabel: {
+                Image(systemName: "hare").accessibilityLabel("Faster")
+            }
+            .accessibilityValue(String(format: "%.2g times", value.wrappedValue))
         }
     }
 
@@ -55,6 +74,8 @@ struct SettingsView: View {
                         }
                         .accessibilityValue(String(format: "%.1f times", scrollSpeed))
                     }
+                    speedSlider("Pointer Speed", value: $pointerSpeed)
+                    speedSlider("Touch Pointer Speed", value: $touchPointerSpeed)
                     Picker("Scroll Direction", selection: $scrollDirectionRaw) {
                         ForEach(ScrollDirection.allCases, id: \.self) { d in
                             Text(d.title).tag(d.rawValue)
@@ -72,6 +93,8 @@ struct SettingsView: View {
                     Text("Input")
                 } footer: {
                     Text("Trackpad: drag to move the pointer, tap to click. Touch: the pointer goes where you touch. "
+                         + "Pointer Speed sets how fast a mouse or trackpad moves the Mac's pointer when it is "
+                         + "captured (full screen); Touch Pointer Speed sets it for finger moves in Trackpad mode. "
                          + "Scroll Direction: Natural follows the iPad; Reversed flips every scroll. "
                          + "Tap to Click Delay is how long a tap waits for a double tap or tap-and-drag: Fast "
                          + "clicks sooner, Relaxed gives more time. Long-Press to Right-Click: in Trackpad mode, "
