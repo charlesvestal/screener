@@ -22,10 +22,28 @@
 //     1:1 to host pixels (PixelScroll); a wheel (`.discrete`) goes through
 //     the reference's wheel curve (WheelScroll). Vertical only, as the
 //     reference.
-// Touch (direct):
-//   tap = left click at the point; two-finger tap = right click; long press
-//   (0.4 s) then drag = left-button drag; two-finger pan = scroll. The host
-//   cursor follows the touch.
+// Touch (fingers and Pencil, Task 22): raw `.direct` / `.pencil` touches go
+//   to TouchInterpreter (TouchInputMode.swift: the gestures of trackpad mode
+//   — the default — and direct mode), whose TouchActions are performed here
+//   (`perform`): relative cursor moves (trackpad; the host cursor position is
+//   kept fractionally in `cursorHost` and the viewport follows it), absolute
+//   moves (direct / Pencil), button presses with the sticky modifiers,
+//   scrolls (PixelScroll, then ScrollInertia momentum on a display link —
+//   stopped by any new touch), pinch zoom / pan / reset (Viewport, shared with
+//   MetalRenderer through ViewportModel) and haptics (touch only; a hardware
+//   pointer never triggers one). Pencil hover moves the cursor through the
+//   hover recognizer; a Pencil double-tap / squeeze is a right click at the
+//   cursor (UIPencilInteraction, unless the user set it to do nothing).
+// Zoom: every view point is mapped through the viewport's inverse before the
+//   aspect-fit mapping (InputController.hostPoint), the system pointer is
+//   hidden over the zoomed picture's on-screen rect, and a trackpad pinch
+//   (UIPinchGestureRecognizer on transform events) zooms around the pointer.
+// Pointer lock (PointerLock.swift): while connected, a mouse / trackpad is
+//   attached and the floating menu is closed, the view asks for the pointer
+//   lock (granted by iPadOS in full screen only). Locked, GCMouse supplies
+//   relative motion (moves like trackpad mode, with the viewport following),
+//   buttons and scroll; UIKit's pointer touches and scroll pans are ignored
+//   so nothing is sent twice.
 // Keyboard:
 //   - Hardware keys via pressesBegan/Ended (UIKey.keyCode + modifierFlags +
 //     characters → HardwareKeyState / Keysyms: layout-aware character when
@@ -72,10 +90,12 @@
 //   - The keyboard accessory row (KeyboardAccessoryBar: ⌘ ⌥ ⌃ ⇧ esc ⇥ ← ↑
 //     ↓ →) and the menu's special keys go through ControlMenuModel (sticky +
 //     fn layer, hold-to-repeat with the modifiers held).
+import GameController
 import UIKit
 
 @MainActor
-final class RemoteInputView: UIView, UIPointerInteractionDelegate, UIGestureRecognizerDelegate, RemoteKeySink {
+final class RemoteInputView: UIView, UIPointerInteractionDelegate, UIGestureRecognizerDelegate,
+                             UIPencilInteractionDelegate, RemoteKeySink {
     /// Device-tunable input constants, in one place.
     enum Tuning {
         /// Points of wheel translation per wheel notch (GLFW reports 1.0 per
@@ -85,6 +105,30 @@ final class RemoteInputView: UIView, UIPointerInteractionDelegate, UIGestureReco
         /// interval between repeats (≈ macOS defaults).
         static let keyRepeatDelay: TimeInterval = 0.5
         static let keyRepeatInterval: TimeInterval = 0.033
+        /// Pointer lock: view points of cursor travel per GCMouse delta unit
+        /// (before acceleration). Tune on device.
+        static let lockedMouseGain: CGFloat = 1
+        /// Pointer lock: GCMouse scroll units → view points of "finger"
+        /// travel (sign: + = content follows a downward swipe). Tune on device.
+        static let lockedScrollPoints: CGFloat = 1
+    }
+
+    /// How finger touches drive the pointer (the floating menu's Input Mode).
+    var touchMode: TouchInputMode = .default {
+        didSet { touchInterpreter.mode = touchMode }
+    }
+    /// The session's zoom/pan, shared with the renderer.
+    var viewport = ViewportModel() {
+        didSet { if viewport !== oldValue { viewport.update { $0.reset() } } }
+    }
+    /// The floating menu is open: the pointer lock is released and touch
+    /// gestures (a drag lock too) are cancelled.
+    var menuOpen = false {
+        didSet {
+            guard menuOpen != oldValue else { return }
+            if menuOpen { touchInterpreter.cancel() }
+            updatePointerLock()
+        }
     }
 
     var input: InputController? {
@@ -97,6 +141,9 @@ final class RemoteInputView: UIView, UIPointerInteractionDelegate, UIGestureReco
             guard input !== oldValue else { return }
             buttons = 0
             lastHost = nil
+            cursorHost = nil
+            stopInertia()
+            updatePointerLock()
         }
     }
 
@@ -158,6 +205,24 @@ final class RemoteInputView: UIView, UIPointerInteractionDelegate, UIGestureReco
 
     private var buttons = 0
     private var lastHost: (x: Int, y: Int)?
+    /// The cursor in host pixels, fractional (relative moves accumulate).
+    private var cursorHost: CGPoint?
+    private let schedule: KeyRepeater.Schedule
+    private lazy var touchInterpreter: TouchInterpreter = {
+        let t = TouchInterpreter(schedule: schedule) { [weak self] in self?.perform($0) }
+        t.mode = touchMode
+        t.isZoomed = { [weak self] in self?.viewport.value.isZoomed ?? false }
+        return t
+    }()
+    private var inertia: ScrollInertia?
+    private var inertiaLink: CADisplayLink?
+    private var lastLayoutSize = CGSize.zero
+    private var trackpadPinchScale: CGFloat = 1
+    private var pointerLocked = false
+    private var lastLockedMove: TimeInterval?
+    private var lockedScroll = PixelScroll()
+    private lazy var lightImpact = UIImpactFeedbackGenerator(style: .light, view: self)
+    private lazy var mediumImpact = UIImpactFeedbackGenerator(style: .medium, view: self)
     private var keys = HardwareKeyState()
     private let repeater: KeyRepeater
     private var wheel = WheelScroll()
@@ -175,6 +240,7 @@ final class RemoteInputView: UIView, UIPointerInteractionDelegate, UIGestureReco
     /// `repeatSchedule`: the key-repeat timer (injected by tests).
     init(frame: CGRect, repeatSchedule: @escaping KeyRepeater.Schedule) {
         repeater = KeyRepeater(schedule: repeatSchedule)
+        schedule = repeatSchedule
         super.init(frame: frame)
         backgroundColor = .clear
         isMultipleTouchEnabled = true
@@ -185,6 +251,10 @@ final class RemoteInputView: UIView, UIPointerInteractionDelegate, UIGestureReco
                        name: UIApplication.willResignActiveNotification, object: nil)
         nc.addObserver(self, selector: #selector(sceneWillDeactivate(_:)),
                        name: UIScene.willDeactivateNotification, object: nil)
+        nc.addObserver(self, selector: #selector(miceChanged(_:)), name: .GCMouseDidConnect, object: nil)
+        nc.addObserver(self, selector: #selector(miceChanged(_:)), name: .GCMouseDidDisconnect, object: nil)
+        nc.addObserver(self, selector: #selector(pointerLockChanged(_:)),
+                       name: UIPointerLockState.didChangeNotification, object: nil)
     }
 
     required init?(coder: NSCoder) { fatalError("init(coder:) is not used") }
@@ -207,29 +277,15 @@ final class RemoteInputView: UIView, UIPointerInteractionDelegate, UIGestureReco
         wheelPan.allowedScrollTypesMask = .discrete
         wheelPan.delegate = self
         addGestureRecognizer(wheelPan)
-        scrollRecognizers = [ObjectIdentifier(trackpad), ObjectIdentifier(wheelPan)]
 
-        let direct = [UITouch.TouchType.direct.rawValue as NSNumber]
-        let tap = UITapGestureRecognizer(target: self, action: #selector(tap(_:)))
-        tap.allowedTouchTypes = direct
-        addGestureRecognizer(tap)
+        // A trackpad pinch (transform events, never finger touches: those
+        // go raw to the TouchInterpreter, which does its own pinch).
+        let pinch = UIPinchGestureRecognizer(target: self, action: #selector(trackpadPinch(_:)))
+        pinch.delegate = self
+        addGestureRecognizer(pinch)
+        scrollRecognizers = [ObjectIdentifier(trackpad), ObjectIdentifier(wheelPan), ObjectIdentifier(pinch)]
 
-        let twoFingerTap = UITapGestureRecognizer(target: self, action: #selector(twoFingerTap(_:)))
-        twoFingerTap.numberOfTouchesRequired = 2
-        twoFingerTap.allowedTouchTypes = direct
-        addGestureRecognizer(twoFingerTap)
-
-        let press = UILongPressGestureRecognizer(target: self, action: #selector(longPress(_:)))
-        press.minimumPressDuration = 0.4
-        press.allowedTouchTypes = direct
-        addGestureRecognizer(press)
-
-        let twoFingerPan = UIPanGestureRecognizer(target: self, action: #selector(touchScroll(_:)))
-        twoFingerPan.minimumNumberOfTouches = 2
-        twoFingerPan.maximumNumberOfTouches = 2
-        twoFingerPan.allowedTouchTypes = direct
-        twoFingerPan.allowedScrollTypesMask = []
-        addGestureRecognizer(twoFingerPan)
+        addInteraction(UIPencilInteraction(delegate: self))
 
         // alpha 0 rather than isHidden: the proxy must stay an ordinary,
         // focusable responder; it is 1×1 and invisible either way.
@@ -248,9 +304,28 @@ final class RemoteInputView: UIView, UIPointerInteractionDelegate, UIGestureReco
 
     override var canBecomeFirstResponder: Bool { true }
 
+    override func willMove(toWindow newWindow: UIWindow?) {
+        super.willMove(toWindow: newWindow)
+        if newWindow == nil {
+            stopInertia()
+            PointerLock.withdraw(self, from: window)
+        }
+    }
+
     override func didMoveToWindow() {
         super.didMoveToWindow()
         if window != nil, !softwareKeyboardVisible { becomeFirstResponder() }
+        updatePointerLock()
+    }
+
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        // Rotation / resize: the zoomed region no longer means the same thing.
+        if bounds.size != lastLayoutSize {
+            lastLayoutSize = bounds.size
+            viewport.update { $0.reset() }
+            pointerInteraction?.invalidate()
+        }
     }
 
     override func resignFirstResponder() -> Bool {
@@ -264,6 +339,8 @@ final class RemoteInputView: UIView, UIPointerInteractionDelegate, UIGestureReco
     /// buttons 0 at the last host position; stops key repeat. Safe to call
     /// repeatedly. The session calls this before tearing the controller down.
     func releaseAll() {
+        stopInertia()
+        touchInterpreter.cancel()
         releaseHeldKeys()
         releaseButtons()
     }
@@ -442,21 +519,61 @@ final class RemoteInputView: UIView, UIPointerInteractionDelegate, UIGestureReco
     /// outside the fitted video rect (the letterbox) sends nothing and hides
     /// our cursor — the system pointer shows there instead, via
     /// `pointerInteraction(_:regionFor:defaultRegion:)` / `styleFor`.
-    func movePointer(to point: CGPoint, coalescable: Bool) {
+    /// `point` is where it is drawn (zoomed); `clampToPicture`: a touch in
+    /// the letterbox goes to the nearest edge instead of hiding the cursor.
+    func movePointer(to point: CGPoint, coalescable: Bool, clampToPicture: Bool = false) {
         guard let input else { return }
-        if buttons == 0, !input.fittedRect(in: bounds.size).contains(point) {
+        let size = bounds.size, zoom = viewport.value
+        if buttons == 0, !clampToPicture,
+           !input.fittedRect(in: size).contains(zoom.toBase(point, viewSize: size)) {
             cursor?.hide()
             onPointerMoved?(nil)
             return
         }
-        guard let host = input.hostPoint(forViewPoint: point, viewSize: bounds.size) else { return }
+        guard let host = input.hostPoint(forViewPoint: point, viewSize: size, viewport: zoom) else { return }
+        cursorHost = CGPoint(x: host.x, y: host.y)
+        sendCursor(host, coalescable: coalescable)
+        onPointerMoved?(convert(point, to: nil))
+    }
+
+    /// Sends the pointer at `host` with the current buttons (a coalescable
+    /// pure move only when it changed) and moves the drawn cursor there.
+    private func sendCursor(_ host: (x: Int, y: Int), coalescable: Bool) {
+        guard let input else { return }
         let moved = lastHost.map { $0 != host } ?? true
         lastHost = host
         if moved || !coalescable {
             input.pointer(buttons: buttons, x: host.x, y: host.y, coalescable: coalescable)
         }
         cursor?.move(toHostX: host.x, y: host.y, hostWidth: input.serverWidth, hostHeight: input.serverHeight)
-        onPointerMoved?(convert(point, to: nil))
+    }
+
+    /// Relative move by `delta` view points of finger travel (trackpad mode,
+    /// pointer lock): the cursor moves that far on screen at any zoom, and
+    /// a zoomed viewport pans to keep it inside its 10% margins.
+    func moveCursor(by delta: CGPoint) {
+        guard let input else { return }
+        let size = bounds.size
+        let k = input.hostPixelsPerPoint(viewSize: size, zoom: viewport.value.scale)
+        let w = CGFloat(input.serverWidth), h = CGFloat(input.serverHeight)
+        var c = cursorHost ?? lastHost.map { CGPoint(x: $0.x, y: $0.y) } ?? CGPoint(x: w / 2, y: h / 2)
+        c.x = min(w - 1, max(0, c.x + delta.x * k))
+        c.y = min(h - 1, max(0, c.y + delta.y * k))
+        cursorHost = c
+        sendCursor((Int(c.x), Int(c.y)), coalescable: delta != .zero)
+        guard let base = input.baseViewPoint(forHostX: CGFloat(Int(c.x)), y: CGFloat(Int(c.y)), viewSize: size)
+        else { return }
+        let fit = input.fittedRect(in: size)
+        viewport.update { $0.follow(base, viewSize: size, content: fit) }
+        onPointerMoved?(convert(viewport.value.toScreen(base, viewSize: size), to: nil))
+    }
+
+    /// Where the cursor is drawn (view points), if it has a position.
+    var cursorViewPoint: CGPoint? {
+        guard let input, let host = lastHost,
+              let base = input.baseViewPoint(forHostX: CGFloat(host.x), y: CGFloat(host.y), viewSize: bounds.size)
+        else { return nil }
+        return viewport.value.toScreen(base, viewSize: bounds.size)
     }
 
     /// Sends the current buttons at the last pointer position.
@@ -466,6 +583,7 @@ final class RemoteInputView: UIView, UIPointerInteractionDelegate, UIGestureReco
     }
 
     @objc private func hover(_ g: UIHoverGestureRecognizer) {
+        guard !pointerLocked else { return }
         switch g.state {
         case .began, .changed:
             movePointer(to: g.location(in: self), coalescable: true)
@@ -493,8 +611,26 @@ final class RemoteInputView: UIView, UIPointerInteractionDelegate, UIGestureReco
         touches.first { $0.type == .indirectPointer }
     }
 
+    /// Finger and Pencil touches (TouchInterpreter's input).
+    private func gestureTouches(_ touches: Set<UITouch>) -> [UITouch] {
+        touches.filter { $0.type == .direct || $0.type == .pencil }
+    }
+
+    private static func touchID(_ t: UITouch) -> Int { ObjectIdentifier(t).hashValue }
+
     override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
-        guard let t = pointerTouch(touches) else { return super.touchesBegan(touches, with: event) }
+        for t in gestureTouches(touches) {
+            touchInterpreter.began(Self.touchID(t), at: t.location(in: self), time: t.timestamp,
+                                   pencil: t.type == .pencil)
+        }
+        guard let t = pointerTouch(touches) else {
+            let rest = touches.filter { $0.type != .direct && $0.type != .pencil }
+            if !rest.isEmpty { super.touchesBegan(rest, with: event) }
+            return
+        }
+        stopInertia()
+        guard !pointerLocked else { return }          // GCMouse has the buttons
+        if touchInterpreter.dragLocked { touchInterpreter.cancel() }   // a real click ends a touch drag lock
         let m = Self.mask(event?.buttonMask ?? .primary)
         pointerDown(buttons: m == 0 ? InputController.Button.left : m, at: t.location(in: self))
     }
@@ -507,7 +643,18 @@ final class RemoteInputView: UIView, UIPointerInteractionDelegate, UIGestureReco
     }
 
     override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent?) {
-        guard let t = pointerTouch(touches) else { return super.touchesMoved(touches, with: event) }
+        let fingers = gestureTouches(touches)
+        if !fingers.isEmpty {
+            var points: [Int: CGPoint] = [:]
+            for t in fingers { points[Self.touchID(t)] = t.location(in: self) }
+            touchInterpreter.moved(points, time: event?.timestamp ?? fingers[0].timestamp)
+        }
+        guard let t = pointerTouch(touches) else {
+            let rest = touches.filter { $0.type != .direct && $0.type != .pencil }
+            if !rest.isEmpty { super.touchesMoved(rest, with: event) }
+            return
+        }
+        guard !pointerLocked else { return }
         let m = Self.mask(event?.buttonMask ?? [])
         let changed = m != 0 && m != buttons
         if changed { buttons = m }
@@ -515,15 +662,30 @@ final class RemoteInputView: UIView, UIPointerInteractionDelegate, UIGestureReco
     }
 
     override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent?) {
-        guard let t = pointerTouch(touches) else { return super.touchesEnded(touches, with: event) }
-        lastHost = input?.hostPoint(forViewPoint: t.location(in: self), viewSize: bounds.size) ?? lastHost
+        for t in gestureTouches(touches) {
+            touchInterpreter.ended(Self.touchID(t), at: t.location(in: self), time: t.timestamp)
+        }
+        guard let t = pointerTouch(touches) else {
+            let rest = touches.filter { $0.type != .direct && $0.type != .pencil }
+            if !rest.isEmpty { super.touchesEnded(rest, with: event) }
+            return
+        }
+        guard !pointerLocked else { return }
+        lastHost = input?.hostPoint(forViewPoint: t.location(in: self), viewSize: bounds.size,
+                                    viewport: viewport.value) ?? lastHost
         buttons = 0
         sendButtons()
         releaseStickyForPointer()
     }
 
     override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent?) {
-        guard pointerTouch(touches) != nil else { return super.touchesCancelled(touches, with: event) }
+        for t in gestureTouches(touches) { touchInterpreter.cancelled(Self.touchID(t)) }
+        guard pointerTouch(touches) != nil else {
+            let rest = touches.filter { $0.type != .direct && $0.type != .pencil }
+            if !rest.isEmpty { super.touchesCancelled(rest, with: event) }
+            return
+        }
+        guard !pointerLocked else { return }
         buttons = 0
         sendButtons()
         releaseStickyForPointer()
@@ -550,25 +712,57 @@ final class RemoteInputView: UIView, UIPointerInteractionDelegate, UIGestureReco
 
     @objc private func trackpadScroll(_ g: UIPanGestureRecognizer) {
         guard let input else { return }
+        if g.state == .began { stopInertia() }
         let d = delta(g)
-        let ticks = trackpadScroll.ticks(points: d.y, ticksPerPoint: input.scrollTicksPerPoint(viewSize: bounds.size))
+        guard !pointerLocked else { return }          // GCMouse has the scroll
+        let ticks = trackpadScroll.ticks(points: d.y, ticksPerPoint: input.scrollTicksPerPoint(
+            viewSize: bounds.size, zoom: viewport.value.scale))
         scrollAtPointer(ticks, fallback: g.location(in: self))
     }
 
     @objc private func wheelScroll(_ g: UIPanGestureRecognizer) {
+        if g.state == .began { stopInertia() }
         let d = delta(g)
-        guard d.y != 0 else { return }
+        guard d.y != 0, !pointerLocked else { return }
         let ticks = wheel.ticks(wheelDelta: d.y / Tuning.pointsPerWheelNotch,
                                 atMilliseconds: ProcessInfo.processInfo.systemUptime * 1000)
         scrollAtPointer(ticks, fallback: g.location(in: self))
     }
 
-    @objc private func touchScroll(_ g: UIPanGestureRecognizer) {
+    /// A finger scroll (or a momentum step) of `d` view points.
+    private func scrollTouch(_ d: CGPoint) {
         guard let input else { return }
-        if g.state == .began { movePointer(to: g.location(in: self), coalescable: false) }
-        let d = delta(g)
-        let ticks = touchScroll.ticks(points: d.y, ticksPerPoint: input.scrollTicksPerPoint(viewSize: bounds.size))
-        scrollAtPointer(ticks, fallback: g.location(in: self))
+        let ticks = touchScroll.ticks(points: d.y, ticksPerPoint: input.scrollTicksPerPoint(
+            viewSize: bounds.size, zoom: viewport.value.scale))
+        scrollAtPointer(ticks, fallback: CGPoint(x: bounds.midX, y: bounds.midY))
+    }
+
+    // MARK: scroll momentum
+
+    /// Starts momentum after a finger scroll left at `velocity` (vertical
+    /// only, as the wire's scroll).
+    func startInertia(_ velocity: CGPoint) {
+        stopInertia()
+        guard input != nil, let run = ScrollInertia(velocity: CGPoint(x: 0, y: velocity.y)) else { return }
+        inertia = run
+        let link = CADisplayLink(target: self, selector: #selector(inertiaTick(_:)))
+        link.add(to: .main, forMode: .common)
+        inertiaLink = link
+    }
+
+    func stopInertia() {
+        inertiaLink?.invalidate()
+        inertiaLink = nil
+        inertia = nil
+    }
+
+    var isCoasting: Bool { inertia != nil }
+
+    @objc private func inertiaTick(_ link: CADisplayLink) {
+        let dt = min(1.0 / 30, max(1.0 / 240, link.targetTimestamp - link.timestamp))
+        guard var run = inertia, let d = run.step(dt) else { return stopInertia() }
+        inertia = run
+        scrollTouch(d)
     }
 
     // MARK: touch clicks
@@ -585,32 +779,186 @@ final class RemoteInputView: UIView, UIPointerInteractionDelegate, UIGestureReco
         releaseStickyForPointer()
     }
 
-    @objc private func tap(_ g: UITapGestureRecognizer) {
-        guard g.state == .ended else { return }
-        click(at: g.location(in: self), button: InputController.Button.left)
+    // MARK: touch gestures (TouchInterpreter's actions)
+
+    /// Performs one gesture action (TouchInputMode.swift).
+    func perform(_ action: TouchAction) {
+        switch action {
+        case .began:
+            stopInertia()
+        case .moveBy(let d):
+            moveCursor(by: d)
+        case .moveTo(let p):
+            movePointer(to: p, coalescable: true, clampToPicture: true)
+        case .button(let b, let down):
+            pressButton(b, down: down)
+        case .scroll(let d):
+            scrollTouch(d)
+        case .scrollEnded(let v):
+            startInertia(v)
+        case .zoom(let factor, let center, let pan):
+            zoom(by: factor, around: center, pan: pan)
+        case .resetZoom:
+            viewport.update { $0.reset() }
+            pointerInteraction?.invalidate()
+        case .haptic(let h):
+            let g = h == .light ? lightImpact : mediumImpact
+            g.impactOccurred()
+        }
     }
 
-    @objc private func twoFingerTap(_ g: UITapGestureRecognizer) {
-        guard g.state == .ended else { return }
-        click(at: g.location(in: self), button: InputController.Button.right)
+    /// Presses / releases `button` at the cursor (placed mid-screen if it
+    /// has no position yet); the sticky modifiers are held from the first
+    /// press until the last release.
+    func pressButton(_ button: Int, down: Bool) {
+        guard input != nil else { return }
+        if lastHost == nil { moveCursor(by: .zero) }
+        if down {
+            guard buttons & button == 0 else { return }
+            if buttons == 0 { pressStickyForPointer() }
+            buttons |= button
+            sendButtons()
+        } else {
+            guard buttons & button != 0 else { return }
+            buttons &= ~button
+            sendButtons()
+            if buttons == 0 { releaseStickyForPointer() }
+        }
     }
 
-    @objc private func longPress(_ g: UILongPressGestureRecognizer) {
+    /// Pans by `pan`, then zooms by `factor` around `center` (view points).
+    func zoom(by factor: CGFloat, around center: CGPoint, pan: CGPoint) {
+        guard let input else { return }
+        let size = bounds.size, fit = input.fittedRect(in: size)
+        viewport.update {
+            $0.pan(by: pan, viewSize: size, content: fit)
+            $0.zoom(by: factor, around: center, viewSize: size, content: fit)
+        }
+        pointerInteraction?.invalidate()
+    }
+
+    @objc private func trackpadPinch(_ g: UIPinchGestureRecognizer) {
         switch g.state {
         case .began:
-            movePointer(to: g.location(in: self), coalescable: false)
-            pressStickyForPointer()
-            buttons = InputController.Button.left
-            sendButtons()
+            stopInertia()
+            trackpadPinchScale = 1
         case .changed:
-            movePointer(to: g.location(in: self), coalescable: true)
-        case .ended, .cancelled, .failed:
-            buttons = 0
-            sendButtons()
-            releaseStickyForPointer()
+            let factor = trackpadPinchScale > 0 ? g.scale / trackpadPinchScale : 1
+            trackpadPinchScale = g.scale
+            zoom(by: factor, around: g.location(in: self), pan: .zero)
         default:
             break
         }
+    }
+
+    // MARK: Apple Pencil
+
+    /// Pencil double-tap (unless set to do nothing in Settings): right click
+    /// at the cursor.
+    func pencilInteraction(_ interaction: UIPencilInteraction, didReceiveTap tap: UIPencilInteraction.Tap) {
+        guard UIPencilInteraction.preferredTapAction != .ignore else { return }
+        rightClickAtCursor()
+    }
+
+    /// Pencil Pro squeeze (unless set to do nothing): right click at the cursor.
+    func pencilInteraction(_ interaction: UIPencilInteraction,
+                           didReceiveSqueeze squeeze: UIPencilInteraction.Squeeze) {
+        guard squeeze.phase == .ended, UIPencilInteraction.preferredSqueezeAction != .ignore else { return }
+        rightClickAtCursor()
+    }
+
+    private func rightClickAtCursor() {
+        guard input != nil, buttons == 0 else { return }
+        pressButton(InputController.Button.right, down: true)
+        pressButton(InputController.Button.right, down: false)
+    }
+
+    // MARK: pointer lock (hardware mouse / trackpad)
+
+    /// Asks for (or gives up) the pointer lock: wanted while connected, in
+    /// a window, a mouse/trackpad attached and the menu closed.
+    func updatePointerLock() {
+        let want = window != nil && input != nil && !menuOpen && PointerLock.mouseConnected
+        PointerLock.setWanted(want, by: self)
+        if !want { setPointerLocked(false) }
+    }
+
+    @objc private func miceChanged(_ note: Notification) {
+        updatePointerLock()
+        if pointerLocked { attachMice() }
+    }
+
+    @objc private func pointerLockChanged(_ note: Notification) {
+        guard let scene = window?.windowScene else { return }
+        if let changed = note.userInfo?[UIPointerLockState.sceneUserInfoKey] as? UIScene, changed !== scene { return }
+        setPointerLocked(scene.pointerLockState?.isLocked ?? false)
+    }
+
+    private func setPointerLocked(_ locked: Bool) {
+        guard locked != pointerLocked else { return }
+        // Buttons pressed under one regime are released before the other takes over.
+        releaseButtons()
+        pointerLocked = locked
+        lastLockedMove = nil
+        Log.input.info("pointer lock \(locked ? "on" : "off")")
+        if locked { attachMice() } else { detachMice() }
+    }
+
+    private func attachMice() {
+        for mouse in GCMouse.mice() {
+            guard let m = mouse.mouseInput else { continue }
+            m.mouseMovedHandler = { [weak self] _, dx, dy in
+                MainActor.assumeIsolated { self?.lockedMouseMoved(dx: CGFloat(dx), dy: CGFloat(dy)) }
+            }
+            let pairs: [(GCControllerButtonInput?, Int)] = [
+                (m.leftButton, InputController.Button.left), (m.rightButton, InputController.Button.right),
+                (m.middleButton, InputController.Button.middle),
+            ]
+            for (control, button) in pairs {
+                control?.pressedChangedHandler = { [weak self] _, _, pressed in
+                    MainActor.assumeIsolated { self?.lockedButton(button, pressed: pressed) }
+                }
+            }
+            m.scroll.valueChangedHandler = { [weak self] _, _, y in
+                MainActor.assumeIsolated { self?.lockedScrolled(dy: CGFloat(y)) }
+            }
+        }
+    }
+
+    private func detachMice() {
+        for mouse in GCMouse.mice() {
+            guard let m = mouse.mouseInput else { continue }
+            m.mouseMovedHandler = nil
+            m.leftButton.pressedChangedHandler = nil
+            m.rightButton?.pressedChangedHandler = nil
+            m.middleButton?.pressedChangedHandler = nil
+            m.scroll.valueChangedHandler = nil
+        }
+    }
+
+    /// GCMouse motion (y up) → a relative move (y down), accelerated like a finger.
+    func lockedMouseMoved(dx: CGFloat, dy: CGFloat) {
+        guard pointerLocked else { return }
+        let now = ProcessInfo.processInfo.systemUptime
+        let dt = lastLockedMove.map { now - $0 } ?? 1.0 / 120
+        lastLockedMove = now
+        let d = CGPoint(x: dx * Tuning.lockedMouseGain, y: -dy * Tuning.lockedMouseGain)
+        moveCursor(by: TrackpadAcceleration.apply(d, dt: dt))
+    }
+
+    private func lockedButton(_ button: Int, pressed: Bool) {
+        guard pointerLocked else { return }
+        stopInertia()
+        if pressed, touchInterpreter.dragLocked { touchInterpreter.cancel() }
+        pressButton(button, down: pressed)
+    }
+
+    private func lockedScrolled(dy: CGFloat) {
+        guard pointerLocked, let input, dy != 0 else { return }
+        stopInertia()
+        let ticks = lockedScroll.ticks(points: dy * Tuning.lockedScrollPoints, ticksPerPoint: input.scrollTicksPerPoint(
+            viewSize: bounds.size, zoom: viewport.value.scale))
+        scrollAtPointer(ticks, fallback: CGPoint(x: bounds.midX, y: bounds.midY))
     }
 
     // MARK: UIGestureRecognizerDelegate
@@ -635,7 +983,8 @@ final class RemoteInputView: UIView, UIPointerInteractionDelegate, UIGestureReco
     func pointerInteraction(_ interaction: UIPointerInteraction, regionFor request: UIPointerRegionRequest,
                             defaultRegion: UIPointerRegion) -> UIPointerRegion? {
         guard let input else { return defaultRegion }
-        let fit = input.fittedRect(in: bounds.size)
+        let size = bounds.size
+        let fit = viewport.value.toScreen(input.fittedRect(in: size), viewSize: size).intersection(bounds)
         guard fit.contains(request.location) else { return defaultRegion }
         return UIPointerRegion(rect: fit, identifier: Self.videoRegionID)
     }

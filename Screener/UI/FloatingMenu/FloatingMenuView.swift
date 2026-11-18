@@ -227,6 +227,8 @@ private struct ControlPanel: View {
     @State private var passwordArmed = false
     @State private var disarmTask: Task<Void, Never>?
     @AppStorage(PacingConfig.defaultsKey) private var smoothPlayback = false
+    @AppStorage(TouchInputMode.defaultsKey) private var touchModeRaw = TouchInputMode.default.rawValue
+    private var touchMode: TouchInputMode { TouchInputMode(rawValue: touchModeRaw) ?? .default }
 
     var body: some View {
         ViewThatFits(in: .vertical) {
@@ -321,7 +323,11 @@ private struct ControlPanel: View {
             tile("Send Clipboard", "clipboard", hint: "Coming soon") {}.disabled(true)
             tile("Mute", "speaker.slash", hint: "Coming soon") {}.disabled(true)
             tile("Display", "display", hint: "Coming soon") {}.disabled(true)
-            tile("Input Mode", "hand.point.up.left", hint: "Coming soon") {}.disabled(true)
+            tile(touchMode.title, touchMode == .trackpad ? "rectangle.and.hand.point.up.left" : "hand.point.up.left",
+                 hint: "Input mode for your fingers. Trackpad: drag to move the pointer, tap to click. "
+                    + "Touch: the pointer goes where you touch. Tap to switch.") {
+                touchModeRaw = (touchMode == .trackpad ? TouchInputMode.direct : .trackpad).rawValue
+            }
             tile("Stats", "chart.bar", hint: "Coming soon") {}.disabled(true)
             tile("Smooth Playback", smoothPlayback ? "waveform.path" : "waveform.path.ecg",
                  selected: smoothPlayback,

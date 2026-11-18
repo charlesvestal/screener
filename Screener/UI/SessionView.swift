@@ -12,12 +12,14 @@ struct SessionView: View {
     @State private var keyboardVisible = false
     @State private var menu = ControlMenuModel()
     @State private var menuExpanded = false
+    @AppStorage(TouchInputMode.defaultsKey) private var touchModeRaw = TouchInputMode.default.rawValue
 
     var body: some View {
         ZStack {
             Color.black.ignoresSafeArea()
             RemoteScreenView(model: model, store: model.frames, cursor: model.cursor, input: model.input,
-                             menu: menu, keyboardVisible: $keyboardVisible, menuExpanded: $menuExpanded)
+                             menu: menu, keyboardVisible: $keyboardVisible, menuExpanded: $menuExpanded,
+                             touchMode: TouchInputMode(rawValue: touchModeRaw) ?? .default)
                 .ignoresSafeArea()
             if model.isReconnecting || !model.hasFirstFrame {
                 VStack(spacing: 12) {
@@ -66,6 +68,7 @@ struct RemoteScreenView: UIViewRepresentable {
     let menu: ControlMenuModel
     @Binding var keyboardVisible: Bool
     @Binding var menuExpanded: Bool
+    let touchMode: TouchInputMode
 
     final class Coordinator {
         var renderer: MetalRenderer?
@@ -74,6 +77,8 @@ struct RemoteScreenView: UIViewRepresentable {
     final class Container: UIView {
         let video = MTKView(frame: .zero)
         let remoteInput = RemoteInputView(frame: .zero)
+        /// Zoom/pan: changed by the input view, drawn by the renderer.
+        let viewport = ViewportModel()
 
         override init(frame: CGRect) {
             super.init(frame: frame)
@@ -93,7 +98,9 @@ struct RemoteScreenView: UIViewRepresentable {
 
     func makeUIView(context: Context) -> Container {
         let view = Container(frame: .zero)
+        view.remoteInput.viewport = view.viewport
         if let renderer = MetalRenderer(store: store, cursor: cursor) {
+            renderer.viewport = view.viewport
             renderer.attach(to: view.video)
             context.coordinator.renderer = renderer
         }
@@ -108,6 +115,8 @@ struct RemoteScreenView: UIViewRepresentable {
 
     func updateUIView(_ view: Container, context: Context) {
         view.remoteInput.input = input
+        view.remoteInput.touchMode = touchMode
+        view.remoteInput.menuOpen = menuExpanded
         let binding = $keyboardVisible
         view.remoteInput.onSoftwareKeyboardDismissed = { binding.wrappedValue = false }
         view.remoteInput.softwareKeyboardVisible = keyboardVisible && input != nil

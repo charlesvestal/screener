@@ -27,7 +27,8 @@
 // canvas, clamped to [0, 1], times the canvas size, truncated and clamped.
 // Here the canvas is aspect-fitted (CompositeLayout.aspectFit), so the
 // fraction is taken across the fitted rect and letterbox points clamp to the
-// nearest edge.
+// nearest edge. Zoomed (Viewport), the view point is first mapped back
+// through the viewport's inverse to the unzoomed one.
 //
 // Pacing: the reference sends one pointer event per OS motion event, unpaced.
 // Here sends are serialised on one task; a pure move queued behind an
@@ -123,13 +124,17 @@ final class InputController {
     // MARK: mapping
 
     /// The host pixel under `point` of a view of `viewSize` showing the
-    /// aspect-fitted canvas; letterbox points clamp to the nearest edge.
-    func hostPoint(forViewPoint point: CGPoint, viewSize: CGSize) -> (x: Int, y: Int)? {
+    /// aspect-fitted canvas through `viewport` (its inverse maps the drawn
+    /// point back to the unzoomed one); letterbox points clamp to the
+    /// nearest edge.
+    func hostPoint(forViewPoint point: CGPoint, viewSize: CGSize,
+                   viewport: Viewport = .identity) -> (x: Int, y: Int)? {
         let w = serverWidth, h = serverHeight
         let fit = CompositeLayout.aspectFit(CGSize(width: w, height: h), in: viewSize)
         guard fit.width > 0, fit.height > 0 else { return nil }
-        let u = min(1, max(0, (point.x - fit.minX) / fit.width))
-        let v = min(1, max(0, (point.y - fit.minY) / fit.height))
+        let base = viewport.toBase(point, viewSize: viewSize)
+        let u = min(1, max(0, (base.x - fit.minX) / fit.width))
+        let v = min(1, max(0, (base.y - fit.minY) / fit.height))
         let x = min(w - 1, Int(u * CGFloat(w)))
         let y = min(h - 1, Int(v * CGFloat(h)))
         return (max(0, x), max(0, y))
@@ -143,12 +148,29 @@ final class InputController {
         CompositeLayout.aspectFit(CGSize(width: serverWidth, height: serverHeight), in: viewSize)
     }
 
+    /// The UNZOOMED view point at the centre of host pixel (x, y) — the
+    /// inverse of hostPoint without the viewport (Viewport.toScreen gives
+    /// where it is drawn).
+    func baseViewPoint(forHostX x: CGFloat, y: CGFloat, viewSize: CGSize) -> CGPoint? {
+        let fit = fittedRect(in: viewSize)
+        guard fit.width > 0, fit.height > 0 else { return nil }
+        return CGPoint(x: fit.minX + (x + 0.5) / CGFloat(serverWidth) * fit.width,
+                       y: fit.minY + (y + 0.5) / CGFloat(serverHeight) * fit.height)
+    }
+
+    /// Host canvas pixels per view point of finger travel at `zoom`.
+    func hostPixelsPerPoint(viewSize: CGSize, zoom: CGFloat = 1) -> CGFloat {
+        let fit = fittedRect(in: viewSize)
+        guard fit.width > 0 else { return 1 }
+        return CGFloat(serverWidth) / fit.width / max(zoom, 1)
+    }
+
     /// Host scroll pixels (logical points: one press scrolls 1 px) per view
-    /// point, so content under the fingers moves 1:1.
-    func scrollTicksPerPoint(viewSize: CGSize) -> CGFloat {
+    /// point, so content under the fingers moves 1:1 (at any zoom).
+    func scrollTicksPerPoint(viewSize: CGSize, zoom: CGFloat = 1) -> CGFloat {
         let fit = CompositeLayout.aspectFit(CGSize(width: serverWidth, height: serverHeight), in: viewSize)
         guard fit.width > 0 else { return 1 }
-        return CGFloat(serverWidth) / max(pointScale, 1) / fit.width
+        return CGFloat(serverWidth) / max(pointScale, 1) / fit.width / max(zoom, 1)
     }
 
     // MARK: sending

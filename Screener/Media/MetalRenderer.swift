@@ -41,6 +41,13 @@
 // the hotspot, sized cursor px × (view px per canvas px) × backing/scaled.
 // A cursor change (shape, position, visibility) asks for a redraw through
 // the same coalescer and forces a redraw of the current picture.
+//
+// Zoom (Viewport, Task 22): strips and cursor are mapped through the
+// session's viewport (scale + origin in unit view coordinates) after the
+// aspect fit — the same transform whose inverse InputController uses — so
+// the drawn cursor stays on the pointer's host pixel at any zoom. The cursor
+// sprite scales with the picture. A viewport change redraws like a cursor
+// change.
 import CoreVideo
 import Metal
 import MetalKit
@@ -118,6 +125,9 @@ final class MetalRenderer: NSObject, MTKViewDelegate {
     private var cursorTexture: MTLTexture?
     private var cursorTextureSerial: Int?
     private var lastCursorRevision: Int?
+    /// The zoom/pan the picture is drawn through (nil: always fitted).
+    var viewport: ViewportModel?
+    private var lastViewportRevision: Int?
     private let textureCache: CVMetalTextureCache
     private let store: VideoFrameStore
     private var lastVersion: Int?
@@ -203,6 +213,7 @@ final class MetalRenderer: NSObject, MTKViewDelegate {
         self.coalescer = coalescer
         store.setOnChange(owner: self) { coalescer.signal() }
         cursor?.onChange = { coalescer.signal() }
+        viewport?.onChange = { coalescer.signal() }
         view.setNeedsDisplay()
     }
 
@@ -210,6 +221,7 @@ final class MetalRenderer: NSObject, MTKViewDelegate {
     func detach() {
         store.clearOnChange(owner: self)
         cursor?.onChange = nil
+        viewport?.onChange = nil
         coalescer = nil
     }
 
@@ -241,6 +253,7 @@ final class MetalRenderer: NSObject, MTKViewDelegate {
         let size = view.drawableSize
         let resized = size != lastDrawableSize
         let cursorChanged = cursor.map { $0.revision != lastCursorRevision } ?? false
+            || viewport.map { $0.revision != lastViewportRevision } ?? false
         guard let snap = store.snapshot(ifNewerThan: resized || cursorChanged ? nil : lastVersion) else { return }
         guard let ref = snap.frames[0] ?? snap.frames.first?.value else {
             // Nothing drawable (new session, reconnecting): keep the last
@@ -266,6 +279,7 @@ final class MetalRenderer: NSObject, MTKViewDelegate {
         guard encode(snap, into: pass, size: size, commandBuffer: cmd) else {
             lastVersion = snap.version
             lastCursorRevision = cursor?.revision
+            lastViewportRevision = viewport?.revision
             lastDrawableSize = size
             return
         }
@@ -275,6 +289,7 @@ final class MetalRenderer: NSObject, MTKViewDelegate {
         CVMetalTextureCacheFlush(textureCache, 0)
         lastVersion = snap.version
         lastCursorRevision = cursor?.revision
+        lastViewportRevision = viewport?.revision
         lastDrawableSize = size
         framesDrawn += 1
         if framesDrawn == 1 { onFirstDraw?() }
@@ -316,6 +331,7 @@ final class MetalRenderer: NSObject, MTKViewDelegate {
         }
         guard let enc = cmd.makeRenderCommandEncoder(descriptor: pass) else { return false }
         enc.setRenderPipelineState(pipeline)
+        let zoom = viewport?.value ?? .identity
         var keep: [CVMetalTexture] = []
         var drew = false
         for strip in layout.strips {
@@ -338,7 +354,7 @@ final class MetalRenderer: NSObject, MTKViewDelegate {
                 lastColorDescription = colorDescription
                 Log.video.info("M4 render colour: \(colorDescription)")
             }
-            let r = layout.viewRect(of: strip, in: size)
+            let r = zoom.toScreen(layout.viewRect(of: strip, in: size), viewSize: size)
             var u = StripUniforms(
                 dstRect: SIMD4(Float(r.minX / size.width * 2 - 1), Float(1 - r.minY / size.height * 2),
                                Float(r.maxX / size.width * 2 - 1), Float(1 - r.maxY / size.height * 2)),
@@ -351,7 +367,7 @@ final class MetalRenderer: NSObject, MTKViewDelegate {
             enc.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4)
             drew = true
         }
-        if drew { drawCursor(enc, canvas: layout.canvas, size: size) }
+        if drew { drawCursor(enc, canvas: layout.canvas, size: size, viewport: zoom) }
         enc.endEncoding()
         // The CVMetalTextures (and through them the pixel buffers) must live
         // until the GPU is done with them.
@@ -360,15 +376,17 @@ final class MetalRenderer: NSObject, MTKViewDelegate {
         return drew
     }
 
-    private func drawCursor(_ enc: MTLRenderCommandEncoder, canvas: CGSize, size: CGSize) {
+    private func drawCursor(_ enc: MTLRenderCommandEncoder, canvas: CGSize, size: CGSize, viewport: Viewport) {
         guard let cursor, let img = cursor.image, let pos = cursor.position, img.width > 0, img.height > 0
         else { return }
         let host = cursor.hostSize.width > 0 && cursor.hostSize.height > 0 ? cursor.hostSize : canvas
         let fit = CompositeLayout.aspectFit(host, in: size)
         guard fit.width > 0, let tex = cursorTexture(for: img) else { return }
-        let scl = fit.width / host.width                       // view px per canvas px
+        let scl = fit.width / host.width * viewport.scale      // view px per canvas px (zoomed)
         let d = scl * cursor.pointScale
-        let px = fit.minX + pos.x * scl, py = fit.minY + pos.y * scl
+        let p = viewport.toScreen(CGPoint(x: fit.minX + pos.x * fit.width / host.width,
+                                          y: fit.minY + pos.y * fit.height / host.height), viewSize: size)
+        let px = p.x, py = p.y
         let x0 = px - CGFloat(img.hotspot.x) * d, y0 = py - CGFloat(img.hotspot.y) * d
         let x1 = x0 + CGFloat(img.width) * d, y1 = y0 + CGFloat(img.height) * d
         var rect = SIMD4<Float>(Float(x0 / size.width * 2 - 1), Float(1 - y0 / size.height * 2),
