@@ -150,13 +150,17 @@ final class HostReachabilityTests: XCTestCase {
         XCTAssertTrue(HostReachability.online.isOnline)
     }
 
-    func testMatchedByResolvedAddressOrHostName() {
+    /// H1(d): only the exact Bonjour name makes a saved host "online" (and
+    /// re-resolvable); a resolved IP or a look-alike name does not.
+    func testOnlyTheExactBonjourNameMatches() {
         let byIP = SavedHost(name: "x", host: "10.0.0.5", username: "u")
         XCTAssertEqual(HostReachability.of(byIP, discovered: [service("Desk")], resolved: ["Desk": "10.0.0.5"],
-                                           isBrowsing: true), .online)
+                                           isBrowsing: true), .offline)
         let byName = SavedHost(name: "x", host: "Alexs-MacBook-Pro.local", username: "u")
         XCTAssertEqual(HostReachability.of(byName, discovered: [service("Alex’s MacBook Pro")], resolved: [:],
-                                           isBrowsing: true), .online)
+                                           isBrowsing: true), .offline)
+        let byBonjour = SavedHost(name: "x", host: "10.0.0.5", username: "u", bonjourName: "Studio")
+        XCTAssertEqual(HostReachability.of(byBonjour, discovered: [service("studio")], isBrowsing: true), .offline)
     }
 
     func testOfflineWhileBrowsingUnknownOtherwise() {

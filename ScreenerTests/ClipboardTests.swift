@@ -271,6 +271,7 @@ private final class FakePasteboard: PasteboardAccess {
     var changeCount = 0
     var stored: String?
     var hasImageOnly = false
+    var types: [String] = ["public.utf8-plain-text"]
     private(set) var reads = 0
     var hasStrings: Bool { stored != nil && !hasImageOnly }
     var string: String? {
@@ -383,6 +384,24 @@ final class ClipboardBridgeTests: XCTestCase {
         await bridge.flush()
         XCTAssertEqual(pb.reads, 0)
         XCTAssertEqual(wire.sent.count, 2)
+    }
+
+    /// M3: a password manager's concealed / transient item is never read or
+    /// sent automatically (types only: no paste prompt); an explicit
+    /// "Send Clipboard" still sends it.
+    func testConcealedOrTransientCopyIsNotSentAutomatically() async {
+        await start()
+        for marker in ["org.nspasteboard.ConcealedType", "org.nspasteboard.TransientType", "com.agilebits.onepassword"] {
+            pb.userCopied("hunter2")
+            pb.types = ["public.utf8-plain-text", marker]
+            bridge.appBecameActive()
+            await bridge.flush()
+            XCTAssertEqual(pb.reads, 0, marker)
+            XCTAssertEqual(wire.sent.count, 2, marker)
+        }
+        XCTAssertTrue(bridge.sendToMac())
+        await bridge.flush()
+        XCTAssertEqual(wire.types.last, 0x1f)
     }
 
     func testReconnectAfterIPadCopyPushesInsteadOfPriming() async throws {

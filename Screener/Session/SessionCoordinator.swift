@@ -94,6 +94,16 @@ final class SessionCoordinator {
         var password: String
         var order: ControlSession.StartupOrder = .reference
         var localAddress: String?
+        /// Pinned Mac key / legacy sign-in permission (H1). A first sign-in
+        /// pins the key here too, so this session's reconnects are pinned.
+        var authPolicy = AuthPolicy()
+    }
+
+    /// A connect refused because the Mac's key isn't the pinned one (H1):
+    /// the UI asks "This Mac's identity changed" → Cancel / Trust New Key.
+    struct IdentityChange: Equatable, Sendable {
+        let host: String
+        let presentedSHA256: Data
     }
 
     struct Policy: Sendable {
@@ -169,6 +179,16 @@ final class SessionCoordinator {
     private(set) var stage: ConnectionStage = .idle
     /// The Mac's model identifier (DeviceInfo 0x456), once this session sent it.
     private(set) var deviceModel: String?
+    /// The Mac's key fingerprint and sign-in method of the current (or last
+    /// successful) session; HostConnector pins / checks it on the saved host.
+    private(set) var serverKeySHA256: Data?
+    private(set) var authMethod: AuthResult.Method?
+    /// Set when a connect failed with `AuthError.serverKeyMismatch`;
+    /// cleared by the next connect (or `clearIdentityChange`).
+    private(set) var identityChange: IdentityChange?
+    /// The last connect failed because the Mac asked for the legacy (non-SRP)
+    /// sign-in and the host doesn't allow it (`AuthError.legacyAuthRequired`).
+    private(set) var legacyAuthRequested = false
     /// The last picture of the session torn down most recently (downscaled,
     /// rendered off the main thread by FrameSnapshot): the "Reconnecting…"
     /// backdrop and the host card thumbnail. `serial` grows per capture.
@@ -271,10 +291,15 @@ final class SessionCoordinator {
     /// `localAddress` (DEBUG harness only) pins the TCP and UDP source address
     /// (the server sends media to the TCP peer address); nil lets the system choose.
     func connect(host: String, port: UInt16, username: String, password: String,
+                 authPolicy: AuthPolicy = AuthPolicy(),
                  order: ControlSession.StartupOrder = .reference, localAddress: String? = nil) async {
         guard connectTask == nil, control == nil, media == nil, state != .connecting else { return }
         let request = ConnectRequest(host: host, port: port, username: username, password: password,
-                                     order: order, localAddress: localAddress)
+                                     order: order, localAddress: localAddress, authPolicy: authPolicy)
+        identityChange = nil
+        legacyAuthRequested = false
+        serverKeySHA256 = nil
+        authMethod = nil
         lifecycle.userConnected()
         isReconnecting = false
         lastRequest = request
@@ -291,12 +316,14 @@ final class SessionCoordinator {
         let task = Task<Void, Never> { [weak self] in
             guard let self else { return }
             await self.run(gen, host: r.host, port: r.port, username: r.username, password: r.password,
-                           order: r.order, localAddress: r.localAddress)
+                           order: r.order, localAddress: r.localAddress, authPolicy: r.authPolicy)
         }
         connectTask = task
         await task.value
         if connectTask == task { connectTask = nil }
     }
+
+    func clearIdentityChange() { identityChange = nil }
 
     func disconnect() async {
         lifecycle.userDisconnected()
@@ -353,7 +380,7 @@ final class SessionCoordinator {
             lifecycle.deferReconnect()
             return
         }
-        Log.app.info("reconnecting to \(r.host)")
+        Log.app.info("reconnecting to \(private: r.host)")
         isReconnecting = true
         await begin(r)
     }
@@ -365,6 +392,11 @@ final class SessionCoordinator {
         guard gen == generation else { return }
         let kind = UserFacingError.kind(of: error)
         let wasConnected = if case .connected = state { true } else { false }
+        if case AuthError.serverKeyMismatch(let presented) = error {
+            identityChange = IdentityChange(host: lastRequest?.host ?? "", presentedSHA256: presented)
+            return await end(gen, .failed(ControlSession.identityChangedMessage))
+        }
+        if case AuthError.legacyAuthRequired = error { legacyAuthRequested = true }
         Log.app.error("session failed (\(kind), connected=\(wasConnected)): \(ControlSession.describe(error))")
         switch lifecycle.sessionFailed(kind: kind, wasConnected: wasConnected, canReconnect: lastRequest != nil) {
         case .suspend:
@@ -383,7 +415,7 @@ final class SessionCoordinator {
     private func isCurrent(_ gen: Int) -> Bool { gen == generation && !Task.isCancelled }
 
     private func run(_ gen: Int, host: String, port: UInt16, username: String, password: String,
-                     order: ControlSession.StartupOrder, localAddress: String?) async {
+                     order: ControlSession.StartupOrder, localAddress: String?, authPolicy: AuthPolicy) async {
         // Never overlap a previous session's sockets.
         await pendingTeardown?.value
         guard isCurrent(gen) else { return }
@@ -402,7 +434,7 @@ final class SessionCoordinator {
             return await end(gen, .failed("Already connected to \(shown). Disconnect that session first."))
         }
         serverAddress = ip
-        Log.app.info("connecting to \(host) as \(ip)")
+        Log.app.info("connecting to \(private: host) as \(private: ip)")
 
         // 2) UDP first, consumers attached before any packet can arrive.
         let media = MediaTransport(config: .init(host: ip, controlPort: port, localAddress: localAddress),
@@ -438,6 +470,7 @@ final class SessionCoordinator {
         var config = ControlSession.Config(host: ip, port: port, username: username, password: password,
                                            logicalSize: logical, backingSize: backing, startupOrder: order)
         config.dynamicDisplay = mode.isDynamic
+        config.authPolicy = authPolicy
         config.onMilestone = { [weak self] m in Task { @MainActor in self?.milestone(m, gen) } }
         let attempts = max(1, policy.burstRetryAttempts)
         for attempt in 1...attempts {
@@ -467,6 +500,12 @@ final class SessionCoordinator {
             }
             guard isCurrent(gen) else { return }
             mediaParams = params
+            serverKeySHA256 = params.serverKeySHA256
+            authMethod = params.authMethod
+            // Pin for this session's reconnects (TOFU; a mismatch already failed).
+            if lastRequest?.authPolicy.pinnedKeySHA256 == nil, let key = params.serverKeySHA256 {
+                lastRequest?.authPolicy.pinnedKeySHA256 = key
+            }
             watch(session, gen)
 
             let outcome = await media.burstOutcome()
@@ -672,7 +711,9 @@ final class SessionCoordinator {
         case .miscStatus, .clipboard:
             clipboard.handle(event)
         case .deviceInfo(let model):
-            deviceModel = model
+            // Server text (L3): sanitized and capped before the UI / SwiftData.
+            let clean = ServerText.sanitize(model, maxLength: 64)
+            deviceModel = clean.isEmpty ? nil : clean
         default:
             break
         }

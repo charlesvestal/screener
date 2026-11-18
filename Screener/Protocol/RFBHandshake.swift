@@ -88,6 +88,8 @@ enum RFBHandshake {
         var r = ByteReader(lenBytes)
         guard let len = try? r.u32(), len > 0, len <= maxReasonLength,
               let text = try? await s.read(exactly: Int(len)) else { return nil }
-        return String(decoding: text, as: UTF8.self)
+        // Attacker-controllable: sanitized + capped before the log / UI (ServerText).
+        let reason = ServerText.sanitize(String(decoding: text, as: UTF8.self))
+        return reason.isEmpty ? nil : reason
     }
 }

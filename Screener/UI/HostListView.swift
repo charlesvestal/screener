@@ -39,7 +39,7 @@ struct HostListView: View {
 
     private var saved: [SavedHost] { HostStore.filter(HostStore.ordered(savedHosts), query: search) }
     private var discovered: [DiscoveredHost] {
-        let unmatched = HostMatcher.unmatched(browser.hosts, saved: savedHosts, resolved: connector.resolvedIPv4)
+        let unmatched = HostMatcher.unmatched(browser.hosts, saved: savedHosts)
         let q = search.trimmingCharacters(in: .whitespaces)
         return q.isEmpty ? unmatched : unmatched.filter { $0.name.localizedCaseInsensitiveContains(q) }
     }
@@ -79,6 +79,26 @@ struct HostListView: View {
                     Button("Delete", role: .destructive) { delete(host) }
                 } message: { _ in
                     Text("Its saved password is removed from the Keychain.")
+                }
+                // H1: the Mac presented a key other than the pinned one; the
+                // connect stopped before any credential was sent. Re-pin only
+                // on this explicit choice.
+                .alert("This Mac's identity changed", isPresented: Binding(
+                    get: { identityChangedHost != nil },
+                    set: { if !$0 { model.clearIdentityChange() } }),
+                       presenting: identityChangedHost) { host in
+                    let presented = model.identityChange?.presentedSHA256
+                    Button("Cancel", role: .cancel) { model.clearIdentityChange() }
+                    Button("Trust New Key", role: .destructive) {
+                        guard let presented else { return }
+                        connector.trustNewKey(presented, for: host, context: context)
+                        open(host)
+                    }
+                } message: { host in
+                    Text("\(host.name) presented a different identity than the one Screener remembered, so your "
+                         + "password wasn't sent. This is expected if the Mac was reinstalled or replaced — but it "
+                         + "can also mean someone on this network is impersonating it. Trust the new identity only "
+                         + "if you know why it changed.\n\nNew identity: \(Self.fingerprint(model.identityChange))")
                 }
         }
         // A connected session (from a card, ConnectSheet, or the DEBUG
@@ -262,6 +282,20 @@ struct HostListView: View {
         }
     }
 
+    /// The saved host whose connect was refused for a changed identity.
+    private var identityChangedHost: SavedHost? {
+        guard model.identityChange != nil, let id = connector.pendingIdentityHostID else { return nil }
+        return savedHosts.first { $0.id == id }
+    }
+
+    /// The first 8 bytes of a key fingerprint, "ab12 cd34 …" (for comparing by eye).
+    static func fingerprint(_ change: SessionCoordinator.IdentityChange?) -> String {
+        guard let d = change?.presentedSHA256 else { return "" }
+        let hex = d.prefix(8).map { String(format: "%02X", $0) }
+        return stride(from: 0, to: hex.count, by: 2).map { hex[$0..<min($0 + 2, hex.count)].joined() }
+            .joined(separator: " ")
+    }
+
     private var failureMessage: String? {
         if let e = connector.error { return e }
         if case .failed(let m) = model.state { return m }
@@ -306,7 +340,7 @@ struct HostListView: View {
     }
 
     private func connect(_ host: SavedHost, username: String?, password: String, remember: Bool) {
-        let service = HostMatcher.discovered(for: host, in: browser.hosts, resolved: connector.resolvedIPv4)
+        let service = HostMatcher.discovered(for: host, in: browser.hosts)
         Task {
             await connector.connect(saved: host, username: username, password: password, remember: remember,
                                     service: service, context: context)

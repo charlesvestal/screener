@@ -20,8 +20,6 @@
 	<string>1.0</string>
 	<key>CFBundleVersion</key>
 	<string>1</string>
-	<key>LSSupportsOpeningDocumentsInPlace</key>
-	<true/>
 	<key>NSBonjourServices</key>
 	<array>
 		<string>_rfb._tcp</string>
@@ -29,8 +27,6 @@
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>Screener connects to Macs on your local network for screen sharing.</string>
 	<key>UIApplicationSupportsIndirectInputEvents</key>
-	<true/>
-	<key>UIFileSharingEnabled</key>
 	<true/>
 	<key>UILaunchScreen</key>
 	<dict>

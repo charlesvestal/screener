@@ -72,7 +72,7 @@ actor VideoPipeline {
         /// SRTCP APP per marker in the native capture). SCREENER_FB_ACKALL=1.
         case allTiles
 
-        static func fromEnvironment(_ env: [String: String] = ProcessInfo.processInfo.environment) -> LTRAckMode {
+        static func fromEnvironment(_ env: [String: String] = ExperimentEnv.current) -> LTRAckMode {
             if env["SCREENER_FB_ACKALL"] == "1" { return .allTiles }
             if env["SCREENER_LTR_ACK"] == "1" { return .tile0 }
             return .off
@@ -84,7 +84,7 @@ actor VideoPipeline {
     /// SCREENER_REF_RECOVERY=0: IRAP-only loss recovery (the reference's),
     /// for A/B; SCREENER_LOSS_WAIT_MS: HEVCAssembler.Config.lossRecoveryWait.
     static let assemblerConfig: HEVCAssembler.Config = {
-        let env = ProcessInfo.processInfo.environment
+        let env = ExperimentEnv.current
         var c = HEVCAssembler.Config()
         if env["SCREENER_REF_RECOVERY"] == "0" { c.referenceRecovery = false }
         if let ms = env["SCREENER_LOSS_WAIT_MS"].flatMap(Int.init), ms > 0 { c.lossRecoveryWait = .milliseconds(ms) }
@@ -237,7 +237,7 @@ actor VideoPipeline {
                 }
             case .needKeyframe(let ssrc):
                 #if DEBUG
-                if let ms = Int(ProcessInfo.processInfo.environment["SCREENER_FIR_DELAY_MS"] ?? ""), ms > 0 {
+                if let ms = Int(ExperimentEnv.current["SCREENER_FIR_DELAY_MS"] ?? ""), ms > 0 {
                     // Experiment: give the host `ms` to recover on its own (LTR) first.
                     Task { [weak self] in
                         try? await Task.sleep(for: .milliseconds(ms))

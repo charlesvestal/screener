@@ -126,7 +126,7 @@ enum BSDSocket {
     /// The media sockets' service type: NET_SERVICE_TYPE_VI (interactive
     /// video, as AVConference marks its media) unless SCREENER_NETSVC says
     /// otherwise (vi / rv / av / vo / be / off; off = leave the default).
-    static func mediaServiceType(_ env: [String: String] = ProcessInfo.processInfo.environment) -> Int32? {
+    static func mediaServiceType(_ env: [String: String] = ExperimentEnv.current) -> Int32? {
         switch env["SCREENER_NETSVC"]?.lowercased() {
         case "off": return nil
         case "rv": return NET_SERVICE_TYPE_RV

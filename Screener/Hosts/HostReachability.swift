@@ -23,9 +23,11 @@ enum HostReachability: Equatable, Sendable {
         }
     }
 
-    static func of(_ saved: SavedHost, discovered: [DiscoveredHost], resolved: [String: String],
+    /// `resolved` is unused (kept for call-site stability): matching is by exact
+    /// Bonjour name only (HostMatcher, security review H1).
+    static func of(_ saved: SavedHost, discovered: [DiscoveredHost], resolved: [String: String] = [:],
                    isBrowsing: Bool) -> HostReachability {
-        if HostMatcher.discovered(for: saved, in: discovered, resolved: resolved) != nil { return .online }
+        if HostMatcher.discovered(for: saved, in: discovered) != nil { return .online }
         return isBrowsing ? .offline : .unknown
     }
 }

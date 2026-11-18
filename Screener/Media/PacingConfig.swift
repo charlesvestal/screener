@@ -8,19 +8,19 @@ import Foundation
 enum PacingConfig {
     static let defaultsKey = "video.smoothPlayback"
 
-    static func isOn(env: [String: String] = ProcessInfo.processInfo.environment,
+    static func isOn(env: [String: String] = ExperimentEnv.current,
                      defaults: UserDefaults = .standard) -> Bool {
         if let v = env["SCREENER_PACING"] { return v == "1" }
         return defaults.bool(forKey: defaultsKey)
     }
 
-    static func current(env: [String: String] = ProcessInfo.processInfo.environment,
+    static func current(env: [String: String] = ExperimentEnv.current,
                         defaults: UserDefaults = .standard) -> VideoFrameStore.Pacing? {
         isOn(env: env, defaults: defaults) ? VideoFrameStore.Pacing() : nil
     }
 
     /// For the log line.
     static var source: String {
-        ProcessInfo.processInfo.environment["SCREENER_PACING"] != nil ? "SCREENER_PACING=1" : "Smooth Playback"
+        ExperimentEnv.current["SCREENER_PACING"] != nil ? "SCREENER_PACING=1" : "Smooth Playback"
     }
 }

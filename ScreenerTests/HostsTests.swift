@@ -31,7 +31,24 @@ final class KeychainTests: XCTestCase {
         XCTAssertEqual(SecItemCopyMatching(query as CFDictionary, &item), errSecSuccess)
         let attrs = try XCTUnwrap(item as? [String: Any])
         XCTAssertEqual(attrs[kSecAttrAccessible as String] as? String,
+                       kSecAttrAccessibleWhenUnlockedThisDeviceOnly as String)
+    }
+
+    /// L6: an item saved by an earlier build ("after first unlock") is
+    /// re-saved as "when unlocked, this device only" when it's read.
+    func testReadMigratesOlderAccessibility() throws {
+        let add: [String: Any] = [kSecClass as String: kSecClassGenericPassword,
+                                  kSecAttrService as String: Keychain.service,
+                                  kSecAttrAccount as String: account,
+                                  kSecValueData as String: Data("old".utf8),
+                                  kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly]
+        XCTAssertEqual(SecItemAdd(add as CFDictionary, nil), errSecSuccess)
+        XCTAssertEqual(Keychain.accessibility(account: account),
                        kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly as String)
+        XCTAssertEqual(try Keychain.get(account: account), "old")
+        XCTAssertEqual(Keychain.accessibility(account: account),
+                       kSecAttrAccessibleWhenUnlockedThisDeviceOnly as String)
+        XCTAssertEqual(try Keychain.get(account: account), "old")
     }
 
     func testStoreUsesHostID() throws {
@@ -261,10 +278,12 @@ final class HostEditorModelTests: XCTestCase {
         context.insert(h)
         let connector = HostConnector(model: SessionCoordinator(), passwords: passwords)
         let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let key = Data(repeating: 0xAB, count: 32)
+        h.pinnedKeySHA256 = key
         connector.markConnected(h, resolvedAddress: "10.0.0.9", username: "alex", rememberPassword: "pw",
-                                context: context, now: now)
+                                context: context, now: now, presentedKey: key)
         XCTAssertEqual(h.lastConnected, now)
-        XCTAssertEqual(h.host, "10.0.0.9")
+        XCTAssertEqual(h.host, "10.0.0.9")            // pinned key matched → follow the new address
         XCTAssertEqual(h.username, "alex")
         XCTAssertEqual(try passwords.password(for: h.id), "pw")
 
@@ -274,6 +293,58 @@ final class HostEditorModelTests: XCTestCase {
         XCTAssertEqual(h2.host, "x")
         XCTAssertNil(try passwords.password(for: h2.id))
     }
+
+    /// H1: the first successful sign-in pins the key (TOFU) but does not
+    /// move the saved address; only a matching pin lets a Bonjour lookup
+    /// update it.
+    func testMarkConnectedPinsOnFirstUseAndKeepsAddressWithoutMatchedPin() throws {
+        let h = SavedHost(name: "Studio", host: "10.0.0.2", username: "u", bonjourName: "Studio")
+        context.insert(h)
+        let connector = HostConnector(model: SessionCoordinator(), passwords: passwords)
+        let key = Data(repeating: 0x11, count: 32)
+        connector.markConnected(h, resolvedAddress: "10.0.0.66", rememberPassword: nil, context: context,
+                                presentedKey: key)
+        XCTAssertEqual(h.pinnedKeySHA256, key)
+        XCTAssertEqual(h.host, "10.0.0.2")
+
+        // Pinned, but a different key presented (cannot normally happen: auth
+        // refuses first) → neither the pin nor the address changes.
+        connector.markConnected(h, resolvedAddress: "10.0.0.77", rememberPassword: nil, context: context,
+                                presentedKey: Data(repeating: 0x22, count: 32))
+        XCTAssertEqual(h.pinnedKeySHA256, key)
+        XCTAssertEqual(h.host, "10.0.0.2")
+
+        // A saved host with no address yet takes the resolved one.
+        let empty = SavedHost(name: "New", host: "", username: "u", bonjourName: "New")
+        context.insert(empty)
+        connector.markConnected(empty, resolvedAddress: "10.0.0.5", rememberPassword: nil, context: context,
+                                presentedKey: key)
+        XCTAssertEqual(empty.host, "10.0.0.5")
+    }
+
+    /// H1: "Trust New Key" (the only way a pin changes) re-pins to the presented key.
+    func testTrustNewKeyRepins() throws {
+        let h = SavedHost(name: "Studio", host: "10.0.0.2", username: "u")
+        h.pinnedKeySHA256 = Data(repeating: 1, count: 32)
+        context.insert(h)
+        let connector = HostConnector(model: SessionCoordinator(), passwords: passwords)
+        let new = Data(repeating: 2, count: 32)
+        connector.trustNewKey(new, for: h, context: context)
+        XCTAssertEqual(h.pinnedKeySHA256, new)
+        XCTAssertEqual(HostConnector.authPolicy(for: h).pinnedKeySHA256, new)
+    }
+
+    func testAuthPolicyFromSavedHostAndLegacyToggle() throws {
+        let h = SavedHost(name: "Studio", host: "10.0.0.2", username: "u")
+        context.insert(h)
+        XCTAssertEqual(HostConnector.authPolicy(for: h), AuthPolicy())   // ad-hoc-equivalent: no pin, no legacy
+        let e = HostEditorModel(editing: h, passwords: passwords)
+        XCTAssertFalse(e.allowLegacyAuth)
+        e.allowLegacyAuth = true
+        try e.save(existing: h, context: context, passwords: passwords)
+        h.pinnedKeySHA256 = Data([1, 2, 3])
+        XCTAssertEqual(HostConnector.authPolicy(for: h), AuthPolicy(pinnedKeySHA256: Data([1, 2, 3]), allowLegacy: true))
+    }
 }
 
 @MainActor
@@ -282,29 +353,32 @@ final class HostMatcherTests: XCTestCase {
         DiscoveredHost(name: name, endpoint: .service(name: name, type: "_rfb._tcp", domain: "local.", interface: nil))
     }
 
-    func testNormalize() {
-        XCTAssertEqual(HostMatcher.normalize("Alex’s MacBook Pro"), "alexsmacbookpro")
-        XCTAssertEqual(HostMatcher.normalize("Alexs-MacBook-Pro.local."), "alexsmacbookpro")
-    }
-
-    func testMatching() {
+    /// H1(d): only the exact (case-sensitive) Bonjour service name the host
+    /// was saved from matches — no case folding, punctuation stripping,
+    /// ".local" names or resolved-IP matches.
+    func testMatchingIsExactBonjourNameOnly() {
         let byBonjour = SavedHost(name: "Mine", host: "10.0.0.5", username: "u", bonjourName: "Studio")
         let byLocalName = SavedHost(name: "Laptop", host: "Alexs-MacBook-Pro.local", username: "u")
         let byIP = SavedHost(name: "Mini", host: "10.0.0.8", username: "u")
-        XCTAssertTrue(HostMatcher.matches(byBonjour, discoveredName: "studio"))
-        XCTAssertTrue(HostMatcher.matches(byLocalName, discoveredName: "Alex’s MacBook Pro"))
+        XCTAssertTrue(HostMatcher.matches(byBonjour, discoveredName: "Studio"))
+        XCTAssertFalse(HostMatcher.matches(byBonjour, discoveredName: "studio"))
+        XCTAssertFalse(HostMatcher.matches(byBonjour, discoveredName: "Stu dio"))
+        XCTAssertFalse(HostMatcher.matches(byBonjour, discoveredName: "Studio "))
+        XCTAssertFalse(HostMatcher.matches(byLocalName, discoveredName: "Alex’s MacBook Pro"))
         XCTAssertFalse(HostMatcher.matches(byIP, discoveredName: "Mac mini"))
-        XCTAssertTrue(HostMatcher.matches(byIP, discoveredName: "Mac mini", resolvedIPv4: "10.0.0.8"))
-        // An IP literal never matches by name.
-        XCTAssertFalse(HostMatcher.matches(SavedHost(name: "x", host: "10.0.0.1", username: "u"), discoveredName: "10001"))
+        let studioLocal = SavedHost(name: "Studio", host: "studio.local", username: "u")
+        XCTAssertFalse(HostMatcher.matches(studioLocal, discoveredName: "Stu dio"))
+        XCTAssertFalse(HostMatcher.matches(SavedHost(name: "x", host: "h", username: "u", bonjourName: ""),
+                                           discoveredName: ""))
 
-        let found = [service("Studio"), service("Alex’s MacBook Pro"), service("Mac mini"), service("Guest Mac")]
+        let found = [service("Studio"), service("Alex’s MacBook Pro"), service("Mac mini"), service("studio")]
         let saved = [byBonjour, byLocalName, byIP]
-        XCTAssertEqual(HostMatcher.unmatched(found, saved: saved).map(\.name), ["Mac mini", "Guest Mac"])
-        XCTAssertEqual(HostMatcher.unmatched(found, saved: saved, resolved: ["Mac mini": "10.0.0.8"]).map(\.name),
-                       ["Guest Mac"])
-        XCTAssertEqual(HostMatcher.discovered(for: byLocalName, in: found)?.name, "Alex’s MacBook Pro")
+        XCTAssertEqual(HostMatcher.unmatched(found, saved: saved).map(\.name),
+                       ["Alex’s MacBook Pro", "Mac mini", "studio"])
+        XCTAssertEqual(HostMatcher.discovered(for: byBonjour, in: found)?.name, "Studio")
+        XCTAssertNil(HostMatcher.discovered(for: byLocalName, in: found))
         XCTAssertNil(HostMatcher.discovered(for: byIP, in: found))
+        XCTAssertNil(HostMatcher.savedHost(for: service("STUDIO"), in: saved))
     }
 
     func testIPv4FromResolvedEndpoint() {

@@ -98,7 +98,12 @@ enum UserFacingError {
         case .noRoute: return noRouteMessage
         case .peerEnded: return peerEndedMessage
         case .timeout: return timeoutMessage
-        case .authRejected: return authRejectedMessage
+        case .authRejected:
+            // The Mac's own reason, if it sent one: sanitized and labelled (L3).
+            if case AuthError.rejected(let reason) = error, let from = ServerText.labelled(reason) {
+                return authRejectedMessage + " " + from
+            }
+            return authRejectedMessage
         case .localNetwork: return MediaTransportError.localNetworkMessage
         case .other: break
         }

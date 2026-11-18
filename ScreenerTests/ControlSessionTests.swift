@@ -105,7 +105,7 @@ final class ControlSessionTests: XCTestCase {
                                            startupOrder: order)
         var seams = ControlSession.Seams.live
         seams.connect = { _, _ in client }
-        seams.authenticate = { _, _, connect in
+        seams.authenticate = { _, _, _, connect in
             let s = try await connect()
             return (s, AuthResult(wrapKey: ControlSessionTests.wrapKey, method: .srp, serverRSAPublicKeyDER: nil))
         }
@@ -318,7 +318,7 @@ final class ControlSessionTests: XCTestCase {
         config.dynamicDisplay = false
         var seams = ControlSession.Seams.live
         seams.connect = { _, _ in client }
-        seams.authenticate = { _, _, connect in
+        seams.authenticate = { _, _, _, connect in
             let s = try await connect()
             return (s, AuthResult(wrapKey: ControlSessionTests.wrapKey, method: .srp, serverRSAPublicKeyDER: nil))
         }

@@ -34,7 +34,7 @@ final class SessionCoordinatorTests: XCTestCase {
             controlSeams: { _ in
                 ControlSession.Seams(
                     connect: { _, _ in throw TransportError.closed },
-                    authenticate: { _, _, _ in
+                    authenticate: { _, _, _, _ in
                         rec.noteAuth()
                         try await Task.sleep(for: .seconds(60))   // parked until cancelled
                         throw TransportError.closed
@@ -188,7 +188,7 @@ final class SessionCoordinatorTests: XCTestCase {
         s.channelFactory = { flow, _ in let c = rec.make(flow); c.blocked = EPERM; return c }
         s.controlSeams = { _ in
             ControlSession.Seams(connect: { _, _ in throw TransportError.closed },
-                                 authenticate: { _, _, _ in throw TransportError.timeout })
+                                 authenticate: { _, _, _, _ in throw TransportError.timeout })
         }
         let c = SessionCoordinator(seams: s)
         await c.connect(host: "mac", port: 5900, username: "u", password: "p")
@@ -235,12 +235,50 @@ final class SessionCoordinatorTests: XCTestCase {
         s.channelFactory = { flow, _ in let c = rec.make(flow); c.blocked = EHOSTUNREACH; return c }
         s.controlSeams = { _ in
             ControlSession.Seams(connect: { _, _ in throw TransportError.closed },
-                                 authenticate: { _, _, _ in throw TransportError.timeout })
+                                 authenticate: { _, _, _, _ in throw TransportError.timeout })
         }
         let c = SessionCoordinator(seams: s)
         await c.connect(host: "mac", port: 5900, username: "u", password: "p")
         XCTAssertEqual(c.state, .failed(UserFacingError.noRouteMessage))
         XCTAssertTrue(rec.channels.allSatisfy(\.cancelled))
+    }
+
+    /// H1: the saved host's pin and legacy permission reach the
+    /// authenticator, and a key mismatch surfaces as `identityChange` (for
+    /// the "This Mac's identity changed" prompt), not a generic failure.
+    func testPinReachesAuthAndMismatchSetsIdentityChange() async {
+        let rec = Recorder()
+        var s = seams(rec, resolve: ["mac": "192.0.2.73"])
+        let seen = LockedValue<AuthPolicy?>(nil)
+        let presented = Data(repeating: 0xEE, count: 32)
+        s.controlSeams = { _ in
+            ControlSession.Seams(connect: { _, _ in throw TransportError.closed },
+                                 authenticate: { _, _, policy, _ in
+                                     seen.value = policy
+                                     throw AuthError.serverKeyMismatch(presentedSHA256: presented)
+                                 })
+        }
+        let c = SessionCoordinator(seams: s)
+        let policy = AuthPolicy(pinnedKeySHA256: Data(repeating: 1, count: 32), allowLegacy: true)
+        await c.connect(host: "mac", port: 5900, username: "u", password: "p", authPolicy: policy)
+        XCTAssertEqual(seen.value, policy)
+        XCTAssertEqual(c.identityChange, .init(host: "mac", presentedSHA256: presented))
+        XCTAssertEqual(c.state, .failed(ControlSession.identityChangedMessage))
+        c.clearIdentityChange()
+        XCTAssertNil(c.identityChange)
+    }
+
+    func testLegacyRequestedIsFlaggedForTheConnectSheet() async {
+        let rec = Recorder()
+        var s = seams(rec, resolve: ["mac": "192.0.2.74"])
+        s.controlSeams = { _ in
+            ControlSession.Seams(connect: { _, _ in throw TransportError.closed },
+                                 authenticate: { _, _, _, _ in throw AuthError.legacyAuthRequired })
+        }
+        let c = SessionCoordinator(seams: s)
+        await c.connect(host: "mac", port: 5900, username: "u", password: "p")
+        XCTAssertTrue(c.legacyAuthRequested)
+        XCTAssertEqual(c.state, .failed(ControlSession.legacyAuthRequiredMessage))
     }
 
     /// The TCP connect timed out (no SYN-ACK): "Can't reach this Mac".
@@ -249,7 +287,7 @@ final class SessionCoordinatorTests: XCTestCase {
         var s = seams(rec, resolve: ["mac": "192.0.2.72"])
         s.controlSeams = { _ in
             ControlSession.Seams(connect: { _, _ in throw ControlSessionError.timeout(step: "connect") },
-                                 authenticate: { _, _, connect in _ = try await connect(); throw TransportError.closed })
+                                 authenticate: { _, _, _, connect in _ = try await connect(); throw TransportError.closed })
         }
         let c = SessionCoordinator(seams: s)
         await c.connect(host: "mac", port: 5900, username: "u", password: "p")
@@ -271,7 +309,7 @@ final class SessionCoordinatorTests: XCTestCase {
         s.controlSeams = { _ in
             ControlSession.Seams(
                 connect: { _, _ in throw TransportError.closed },
-                authenticate: { _, _, _ in
+                authenticate: { _, _, _, _ in
                     rec.noteAuth()
                     return (stream, AuthResult(wrapKey: Data(count: 16), method: .srp, serverRSAPublicKeyDER: nil))
                 })
@@ -345,7 +383,7 @@ final class SessionCoordinatorTests: XCTestCase {
         var s = seams(rec, resolve: ["mac": "192.0.2.90"])
         s.controlSeams = { _ in
             ControlSession.Seams(connect: { _, _ in throw TransportError.posix(ECONNREFUSED) },
-                                 authenticate: { _, _, connect in _ = try await connect(); throw TransportError.closed })
+                                 authenticate: { _, _, _, connect in _ = try await connect(); throw TransportError.closed })
         }
         let c = SessionCoordinator(seams: s)
         await c.connect(host: "mac", port: 5900, username: "u", password: "p")

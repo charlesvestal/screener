@@ -1,5 +1,6 @@
 import MetalKit
 import SwiftUI
+import UniformTypeIdentifiers
 
 /// Full-screen remote desktop: the composited video with the input layer on
 /// top (RemoteInputView), the floating control menu (FloatingMenuView:
@@ -16,6 +17,7 @@ struct SessionView: View {
     @State private var feedback = FeedbackCenter()
     @AppStorage(TouchInputMode.defaultsKey) private var touchModeRaw = TouchInputMode.default.rawValue
     @AppStorage(DisplayMode.defaultsKey) private var displayModeRaw = DisplayMode.default.rawValue
+    @Environment(\.scenePhase) private var scenePhase
 
     var body: some View {
         ZStack {
@@ -32,6 +34,11 @@ struct SessionView: View {
                                                        disconnect: { Task { await model.disconnect() } },
                                                        getClipboard: { model.clipboard.fetchFromMac() },
                                                        sendClipboard: { model.clipboard.sendToMac() }))
+            // App-switcher privacy (L5): the snapshot iPadOS takes when the
+            // scene leaves the foreground must not show the Mac's screen.
+            if scenePhase != .active {
+                PrivacyCover().transition(.identity)
+            }
         }
         .onAppear {
             // Read on demand from the in-memory connect request (cleared on
@@ -49,14 +56,37 @@ struct SessionView: View {
     }
 }
 
-/// Shares Documents/screener.log (for remote TestFlight testing).
-struct ShareLogButton: View {
-    static var logURL: URL {
-        FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0].appendingPathComponent("screener.log")
-    }
-
+/// Covers the remote screen while the scene isn't active (app switcher snapshot).
+private struct PrivacyCover: View {
     var body: some View {
-        ShareLink(item: Self.logURL, preview: SharePreview("screener.log")) {
+        ZStack {
+            Rectangle().fill(.black)
+            Rectangle().fill(.ultraThinMaterial)
+            Image(systemName: "lock.display")
+                .font(.system(size: 64, weight: .light))
+                .foregroundStyle(.secondary)
+        }
+        .ignoresSafeArea()
+        .accessibilityHidden(true)
+        .allowsHitTesting(false)
+    }
+}
+
+/// Shares a redacted copy of the app log (for remote TestFlight testing):
+/// addresses and names are masked or hashed (LogExport), and the copy is a
+/// temporary file made when the share sheet asks for it.
+struct RedactedLog: Transferable {
+    static var transferRepresentation: some TransferRepresentation {
+        FileRepresentation(exportedContentType: .plainText) { _ in
+            SentTransferredFile(try LogExport.makeRedactedCopy())
+        }
+        .suggestedFileName("screener.log")
+    }
+}
+
+struct ShareLogButton: View {
+    var body: some View {
+        ShareLink(item: RedactedLog(), preview: SharePreview("screener.log")) {
             Label("Share Log", systemImage: "doc.text.magnifyingglass")
         }
     }

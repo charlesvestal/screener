@@ -82,8 +82,9 @@ final class BonjourBrowser {
         start()
     }
 
+    /// Exact (case-sensitive) service name: see HostMatcher.
     func host(named name: String) -> DiscoveredHost? {
-        hosts.first { $0.name.caseInsensitiveCompare(name) == .orderedSame }
+        hosts.first { $0.name == name }
     }
 
     private func update(_ found: [DiscoveredHost]) {
@@ -168,7 +169,7 @@ enum BonjourResolver {
         } onCancel: {
             connection.cancel()
         }
-        Log.hosts.info("bonjour resolved \(name) → \(result.0):\(result.1)")
+        Log.hosts.info("bonjour resolved \(private: name) → \(private: result.0):\(result.1)")
         return (result.0, result.1)
     }
 
@@ -194,47 +195,36 @@ private final class OnceFlag: @unchecked Sendable {
 
 // MARK: - Matching discovered ↔ saved
 
+/// Security review H1(d): a discovered service is "the saved Mac" only when
+/// its Bonjour service name is exactly (case-sensitively) the one the host
+/// was saved from. Anyone on the LAN can advertise any `_rfb._tcp` name, and
+/// tapping a saved card re-resolves its service and auto-sends the Keychain
+/// password, so looser matching (case-folded / punctuation-stripped names,
+/// ".local" host names, or a resolved IP) would let a look-alike service
+/// ("Stu dio" for "studio.local") capture that connect. Hosts saved by
+/// address never follow Bonjour. (The Mac's key pin is the second line of
+/// defence: a different Mac fails before any credential is sent.)
 enum HostMatcher {
-    /// Letters and digits only, lowercased, without a trailing ".local":
-    /// "Alex’s MacBook Pro" and "Alexs-MacBook-Pro.local" both become
-    /// "alexsmacbookpro" (the Mac derives its .local name from its
-    /// Sharing name that way).
-    static func normalize(_ s: String) -> String {
-        var t = s.lowercased()
-        while t.hasSuffix(".") { t.removeLast() }
-        if t.hasSuffix(".local") { t.removeLast(".local".count) }
-        return String(t.unicodeScalars.filter { CharacterSet.alphanumerics.contains($0) }.map(Character.init))
-    }
-
     static func isIPv4Literal(_ s: String) -> Bool { IPv4Address(s) != nil && s.split(separator: ".").count == 4 }
 
     /// Whether `saved` is the Mac behind the discovered service `name`.
-    /// `resolvedIPv4` is the service's IPv4, if it has been resolved.
-    static func matches(_ saved: SavedHost, discoveredName name: String, resolvedIPv4: String? = nil) -> Bool {
-        if let b = saved.bonjourName, b.caseInsensitiveCompare(name) == .orderedSame { return true }
-        let host = saved.host.trimmingCharacters(in: .whitespaces)
-        if let ip = resolvedIPv4, host == ip { return true }
-        if host.isEmpty || isIPv4Literal(host) { return false }
-        let n = normalize(name)
-        return !n.isEmpty && normalize(host) == n
+    static func matches(_ saved: SavedHost, discoveredName name: String) -> Bool {
+        guard let b = saved.bonjourName, !b.isEmpty else { return false }
+        return b == name
     }
 
     /// The discovered hosts that match no saved host (shown under "On This Network").
-    static func unmatched(_ discovered: [DiscoveredHost], saved: [SavedHost],
-                          resolved: [String: String] = [:]) -> [DiscoveredHost] {
-        discovered.filter { d in
-            !saved.contains { matches($0, discoveredName: d.name, resolvedIPv4: resolved[d.name]) }
-        }
+    static func unmatched(_ discovered: [DiscoveredHost], saved: [SavedHost]) -> [DiscoveredHost] {
+        discovered.filter { d in !saved.contains { matches($0, discoveredName: d.name) } }
     }
 
     /// The saved host that a discovered service belongs to, if any.
-    static func savedHost(for d: DiscoveredHost, in saved: [SavedHost], resolved: [String: String] = [:]) -> SavedHost? {
-        saved.first { matches($0, discoveredName: d.name, resolvedIPv4: resolved[d.name]) }
+    static func savedHost(for d: DiscoveredHost, in saved: [SavedHost]) -> SavedHost? {
+        saved.first { matches($0, discoveredName: d.name) }
     }
 
     /// The discovered service for a saved host, if it's on the network now.
-    static func discovered(for saved: SavedHost, in discovered: [DiscoveredHost],
-                           resolved: [String: String] = [:]) -> DiscoveredHost? {
-        discovered.first { matches(saved, discoveredName: $0.name, resolvedIPv4: resolved[$0.name]) }
+    static func discovered(for saved: SavedHost, in discovered: [DiscoveredHost]) -> DiscoveredHost? {
+        discovered.first { matches(saved, discoveredName: $0.name) }
     }
 }

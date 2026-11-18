@@ -46,8 +46,6 @@ targets:
            UIInterfaceOrientationLandscapeLeft, UIInterfaceOrientationLandscapeRight]
         NSLocalNetworkUsageDescription: Screener connects to Macs on your local network for screen sharing.
         NSBonjourServices: [_rfb._tcp]
-        UIFileSharingEnabled: true
-        LSSupportsOpeningDocumentsInPlace: true
         UIApplicationSupportsIndirectInputEvents: true
     settings:
       base:

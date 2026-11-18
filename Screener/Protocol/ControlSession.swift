@@ -84,7 +84,8 @@ enum ControlSessionError: Error, Equatable, LocalizedError {
         case .timeout(let step):
             return "The Mac stopped responding during \(step)."
         case .sessionSelectUnsupported(let user):
-            let who = user.isEmpty ? "Another user" : "Another user (\(user))"
+            let name = ServerText.sanitize(user, maxLength: 64)
+            let who = name.isEmpty ? "Another user" : "Another user (\(name))"
             return "\(who) is logged in on this Mac. Screener can't share another user's session yet — " +
                 "log that user out, or connect with their account."
         case .noRekey:
@@ -133,6 +134,8 @@ actor ControlSession {
         /// later `requestDisplay` resizes work; false (DisplayMode.matchMac):
         /// the bare descriptor, sized to ServerInit's framebuffer at 2×.
         var dynamicDisplay = true
+        /// Pinned server key / legacy sign-in permission (H1; Authenticator.runWithFallback).
+        var authPolicy = AuthPolicy()
         /// Handshake progress for the UI (ConnectionStage): auth ok, record
         /// layer active, media answer. Called on the session's actor.
         var onMilestone: (@Sendable (ConnectionMilestone) -> Void)?
@@ -158,7 +161,7 @@ actor ControlSession {
     /// Injection points for tests.
     struct Seams: Sendable {
         var connect: @Sendable (_ host: String, _ port: UInt16) async throws -> ByteStream
-        var authenticate: @Sendable (_ username: String, _ password: String,
+        var authenticate: @Sendable (_ username: String, _ password: String, _ policy: AuthPolicy,
                                      _ connect: @escaping @Sendable () async throws -> ByteStream)
             async throws -> (stream: ByteStream, result: AuthResult)
 
@@ -186,8 +189,9 @@ actor ControlSession {
                         throw ControlSessionError.timeout(step: "connect")
                     }
                 },
-                authenticate: { user, pass, connect in
-                    try await Authenticator.runWithFallback(username: user, password: pass, connect: connect)
+                authenticate: { user, pass, policy, connect in
+                    try await Authenticator.runWithFallback(username: user, password: pass, policy: policy,
+                                                            connect: connect)
                 })
         }
     }
@@ -202,6 +206,9 @@ actor ControlSession {
         let videoOffer: Data
         let ltrpEnabled: Bool?
         let serverInit: ServerInit
+        /// SHA-256 of the Mac's RSA1 key (the TOFU pin) and how we signed in.
+        var serverKeySHA256: Data? = nil
+        var authMethod: AuthResult.Method = .srp
     }
 
     /// Every server message after the rekey (plaintext prelude messages are
@@ -308,7 +315,7 @@ actor ControlSession {
 
     private func run() async throws -> MediaParams {
         let cfg = config, seams = seams, limit = tuning.stepTimeout
-        Log.control.info("connecting to \(cfg.host):\(cfg.port) order=\(cfg.startupOrder.rawValue)")
+        Log.control.info("connecting to \(private: cfg.host):\(cfg.port) order=\(cfg.startupOrder.rawValue)")
 
         // 1) TCP + handshake + auth (negotiation._phase_auth / _open_socket_and_handshake).
         let connect: @Sendable () async throws -> ByteStream = { [weak self] in
@@ -324,7 +331,7 @@ actor ControlSession {
         }
         currentStep = "connect+handshake+auth"
         let (stream, auth) = try await withStepTimeout("auth", limit * 2) {
-            try await seams.authenticate(cfg.username, cfg.password, connect)
+            try await seams.authenticate(cfg.username, cfg.password, cfg.authPolicy, connect)
         }
         guard adopt(stream) else { throw ControlSessionError.closed }
         Log.control.info("M1 auth ok")
@@ -430,7 +437,8 @@ actor ControlSession {
         startCursorPoll()
         return MediaParams(keys: keys, canvas: (answer.canvasWidth, answer.canvasHeight), tiles: answer.tiles,
                            contentKey: record.contentKey, audioOffer: offers.audio, videoOffer: offers.video,
-                           ltrpEnabled: answer.ltrpEnabled, serverInit: serverInit)
+                           ltrpEnabled: answer.ltrpEnabled, serverInit: serverInit,
+                           serverKeySHA256: auth.serverKeySHA256, authMethod: auth.method)
     }
 
     /// Records the newest stream so `close()` can abort it. False if already closed.
@@ -475,7 +483,7 @@ actor ControlSession {
             let ssi = first + rest
             let user = ssi.count > 0xC
                 ? String(decoding: ssi.dropFirst(0xC).prefix { $0 != 0 }, as: UTF8.self) : ""
-            Log.control.error("session-select prompt (console user \(user.isEmpty ? "?" : user)); unsupported in v1")
+            Log.control.error("session-select prompt (console user \(private: user.isEmpty ? "?" : ServerText.sanitize(user, maxLength: 64))); unsupported in v1")
             throw ControlSessionError.sessionSelectUnsupported(consoleUser: user)
         }
         var parser = ServerMessageParser(framing: .stream)
@@ -704,9 +712,20 @@ actor ControlSession {
     #if DEBUG
     // MARK: wire instrumentation (DEBUG only; never called with auth material)
 
+    /// Message types whose bodies are user secrets (M2): key events (0x04,
+    /// e.g. a typed password), encrypted pointer/key input (0x10), clipboard
+    /// (0x1f). Only their type and length are logged.
+    static let bodyRedactedTypes: Set<UInt8> = [0x04, 0x10, 0x1f]
+
     static func wireLog(_ what: String, _ d: Data, prefix: Int) {
-        let hex = d.prefix(prefix).map { String(format: "%02x", $0) }.joined()
-        Log.control.info("wire \(what) len=\(d.count) type=0x\(String(format: "%02x", d.first ?? 0)) \(hex)")
+        Log.control.info(wireLine(what, d, prefix: prefix))
+    }
+
+    static func wireLine(_ what: String, _ d: Data, prefix: Int) -> String {
+        let type = d.first ?? 0
+        let hex = bodyRedactedTypes.contains(type) ? "<body redacted>"
+            : d.prefix(prefix).map { String(format: "%02x", $0) }.joined()
+        return "wire \(what) len=\(d.count) type=0x\(String(format: "%02x", type)) \(hex)"
     }
 
     static func eventSummary(_ e: ServerEvent) -> String {
@@ -766,6 +785,12 @@ actor ControlSession {
         }
     }
 
+    static let legacyAuthRequiredMessage = "This Mac asked for the legacy sign-in method, which can expose your "
+        + "password to others on the network, so Screener didn't send it. If you trust this network, save the Mac "
+        + "and turn on “Allow legacy (less secure) sign-in” in Edit Mac."
+    static let identityChangedMessage = "This Mac's identity changed since you last connected. "
+        + "Screener didn't send your password."
+
     /// A user-readable message for any error `start()` or `failure` can carry.
     static func describe(_ error: Error) -> String {
         switch error {
@@ -773,14 +798,22 @@ actor ControlSession {
             return e.errorDescription ?? "\(e)"
         case let e as AuthError:
             switch e {
-            case .rejected: return "The Mac rejected the username or password."
+            case .rejected(let reason):
+                return "The Mac rejected the username or password."
+                    + (ServerText.labelled(reason).map { " \($0)" } ?? "")
             case .unsupported, .srpUnavailable: return "The Mac asked for an authentication method Screener doesn't support."
             case .malformed: return "Authentication failed (unexpected reply from the Mac)."
+            case .legacyAuthRequired: return legacyAuthRequiredMessage
+            case .serverKeyMismatch: return identityChangedMessage
+            case .serverProofMismatch:
+                return "The Mac's identity could not be verified, so Screener disconnected. "
+                    + "Something on the network may be impersonating it."
             }
         case let e as RFBHandshakeError:
             switch e {
             case .unsupportedVersion(let v): return "This isn't a macOS Screen Sharing server (\(v))."
-            case .serverRefused(let reason): return "The Mac refused the connection" + (reason.map { ": \($0)" } ?? ".")
+            case .serverRefused(let reason):
+                return "The Mac refused the connection." + (ServerText.labelled(reason).map { " \($0)" } ?? "")
             case .unsupported: return "The Mac doesn't offer the sign-in method Screener needs. Is High Performance screen sharing enabled?"
             case .malformedServerInit: return "Unexpected reply from the Mac."
             }

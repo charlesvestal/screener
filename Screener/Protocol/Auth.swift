@@ -19,8 +19,28 @@ struct AuthResult: Sendable, Equatable {
     let wrapKey: Data
     let method: Method
     /// The DER the server sent in the RSA key response (normally a
-    /// SubjectPublicKeyInfo). Kept for later TOFU pinning; not validated here.
+    /// SubjectPublicKeyInfo): the Mac's identity, pinned (SHA-256) on first use.
     let serverRSAPublicKeyDER: Data?
+
+    /// SHA-256 of `serverRSAPublicKeyDER` (what `SavedHost.pinnedKeySHA256` stores).
+    var serverKeySHA256: Data? { serverRSAPublicKeyDER.map(Authenticator.keyFingerprint) }
+}
+
+/// Per-host trust decisions for one connect (H1, security review).
+struct AuthPolicy: Sendable, Equatable {
+    /// SHA-256 of the Mac's RSA1 public key (DER) from an earlier successful
+    /// sign-in (TOFU). When set, a different key fails the connect BEFORE any
+    /// credential-bearing packet is sent (`AuthError.serverKeyMismatch`).
+    var pinnedKeySHA256: Data?
+    /// The user explicitly allowed the legacy (non-SRP) sign-in for this host
+    /// (Edit Mac › "Allow legacy (less secure) sign-in"). Off by default; ad-hoc
+    /// connections never allow it.
+    var allowLegacy = false
+
+    init(pinnedKeySHA256: Data? = nil, allowLegacy: Bool = false) {
+        self.pinnedKeySHA256 = pinnedKeySHA256
+        self.allowLegacy = allowLegacy
+    }
 }
 
 enum AuthError: Error, Equatable {
@@ -37,6 +57,16 @@ enum AuthError: Error, Equatable {
     /// of an SRP challenge: per `auth._read_srp_challenge` this means the
     /// server side "fell back to non-SRP" (it could not route to SRP).
     case srpUnavailable(challengeLength: Int)
+    /// SRP was unusable and the only alternative is the legacy (non-SRP)
+    /// sign-in, which this host doesn't allow (`AuthPolicy.allowLegacy`).
+    /// Nothing was sent with the password.
+    case legacyAuthRequired
+    /// The Mac's RSA key isn't the pinned one. Raised right after the key
+    /// response, before packet-1 (whose identity is encrypted to that key).
+    case serverKeyMismatch(presentedSHA256: Data)
+    /// The SRP server proof M2 was well-formed but wrong: the peer doesn't
+    /// know the password verifier (not the real Mac, or a MITM).
+    case serverProofMismatch
 }
 
 /// Test seam: deterministic randomness / SRP ephemeral. Production callers
@@ -92,16 +122,29 @@ struct AuthSeams: Sendable {
 /// wrong password) — and, for those two cases, in a few more situations
 /// than the reference: bad/truncated DER in the RSA key response, a
 /// truncated challenge parse, a too-long username, or a non-RFC5054 SRP
-/// group. (Task 23 will further gate non-SRP fallback on whether the
-/// server's RSA key matches a previously pinned one, closing the remaining
-/// MITM angle on `.srpUnavailable`/`.unsupported` fallbacks.) Known
-/// limitation: `password` is a `String` and cannot be zeroized, so it is
-/// retained in memory across the fallback attempt.
+/// group.
+///
+/// ### Deviation (security review H1): legacy sign-in is opt-in per host
+/// A LAN MITM can answer packet-1 with a short message (`.srpUnavailable`)
+/// or garbage to force the non-SRP fallback, whose credential blob it can
+/// decrypt with its own RSA key — i.e. harvest the Mac password. So the
+/// fallback to non-SRP happens only when `policy.allowLegacy` is set (the
+/// host's "Allow legacy sign-in" toggle) AND the fallback connection's RSA
+/// key matches `policy.pinnedKeySHA256` — or, for a host with no pin yet,
+/// the key the SRP attempt saw. Otherwise `.srpUnavailable` becomes
+/// `.legacyAuthRequired` and `.unsupported`/`.malformed` propagate, with no
+/// second connection. `.serverKeyMismatch` and `.serverProofMismatch` never
+/// fall back. Known limitation: `password` is a `String` and cannot be
+/// zeroized, so it is retained in memory across the fallback attempt.
 enum Authenticator {
     static func run(stream: ByteStream, username: String, password: String,
-                    method: AuthResult.Method = .srp) async throws -> AuthResult {
-        try await run(stream: stream, username: username, password: password, method: method, seams: AuthSeams())
+                    method: AuthResult.Method = .srp, pin: Data? = nil) async throws -> AuthResult {
+        try await run(stream: stream, username: username, password: password, method: method, pin: pin,
+                      seams: AuthSeams())
     }
+
+    /// SHA-256 of a server key's DER (the pin).
+    static func keyFingerprint(_ der: Data) -> Data { Hash.sha256(der) }
 
     /// `negotiation._phase_auth`: primary method on a fresh connection; on
     /// `AuthError`, close it, reconnect, and run the other method.
@@ -109,40 +152,88 @@ enum Authenticator {
     ///   version + security-type handshake, leaving the stream positioned for
     ///   the `0x21` selector (see the contract above).
     static func runWithFallback(username: String, password: String,
+                                policy: AuthPolicy = AuthPolicy(),
                                 primary: AuthResult.Method = .srp,
+                                seams: AuthSeams = AuthSeams(),
                                 connect: @Sendable () async throws -> ByteStream) async throws
         -> (stream: ByteStream, result: AuthResult) {
         let fallback: AuthResult.Method = primary == .srp ? .nonSRP : .srp
+        let seenKey = KeySeen()
         let first = try await connect()
         do {
-            return (first, try await run(stream: first, username: username, password: password, method: primary))
+            return (first, try await run(stream: first, username: username, password: password, method: primary,
+                                         pin: policy.pinnedKeySHA256, seams: seams, onKey: { seenKey.value = $0 }))
         } catch let error as AuthError {
             first.close()
-            if case .rejected = error {
+            switch error {
+            case .rejected:
                 Log.auth.error("\(primary) auth rejected by server; NOT falling back to \(fallback) " +
                                "(see runWithFallback doc comment: avoids retrying a wrong password over the weaker channel)")
                 throw error
+            case .serverKeyMismatch, .serverProofMismatch, .legacyAuthRequired:
+                Log.auth.error("\(primary) auth failed (\(error)); not falling back")
+                throw error
+            case .srpUnavailable, .unsupported, .malformed:
+                if fallback == .nonSRP, !policy.allowLegacy {
+                    Log.auth.error("\(primary) auth failed (\(error)); legacy sign-in not allowed for this host, " +
+                                   "NOT falling back to \(fallback)")
+                    if case .srpUnavailable = error { throw AuthError.legacyAuthRequired }
+                    throw error
+                }
+                Log.auth.error("\(primary) auth failed (\(error)); falling back to \(fallback) on a new connection")
             }
-            Log.auth.error("\(primary) auth failed (\(error)); falling back to \(fallback) on a new connection")
         } catch {
             first.close()
             throw error
         }
+        // The fallback must talk to the same Mac: the pinned key, else the
+        // key the first attempt saw (if it got that far).
+        let pin = policy.pinnedKeySHA256 ?? seenKey.value
         let second = try await connect()
         do {
-            return (second, try await run(stream: second, username: username, password: password, method: fallback))
+            return (second, try await run(stream: second, username: username, password: password, method: fallback,
+                                          pin: pin, seams: seams))
         } catch {
             second.close()
             throw error
         }
     }
 
+    /// One attempt. `pin`: the expected key fingerprint (checked before
+    /// anything key-encrypted is sent); `onKey`: the presented fingerprint.
     static func run(stream: ByteStream, username: String, password: String,
-                    method: AuthResult.Method = .srp, seams: AuthSeams) async throws -> AuthResult {
+                    method: AuthResult.Method = .srp, pin: Data? = nil, seams: AuthSeams,
+                    onKey: (Data) -> Void = { _ in }) async throws -> AuthResult {
         switch method {
-        case .srp: return try await doSRPAuth(stream, username: username, password: password, seams: seams)
-        case .nonSRP: return try await doNonSRPAuth(stream, username: username, password: password, seams: seams)
+        case .srp:
+            return try await doSRPAuth(stream, username: username, password: password, pin: pin, seams: seams,
+                                       onKey: onKey)
+        case .nonSRP:
+            return try await doNonSRPAuth(stream, username: username, password: password, pin: pin, seams: seams,
+                                          onKey: onKey)
         }
+    }
+
+    /// Throws `.serverKeyMismatch` unless `der` hashes to `pin` (nil: TOFU).
+    static func verifyPin(_ der: Data, pin: Data?, onKey: (Data) -> Void) throws {
+        let presented = keyFingerprint(der)
+        onKey(presented)
+        guard let pin else { return }
+        guard presented == pin else {
+            Log.auth.error("server RSA key does not match the pinned key for this host; refusing before packet-1")
+            throw AuthError.serverKeyMismatch(presentedSHA256: presented)
+        }
+        Log.auth.info("server RSA key matches the pinned key")
+    }
+}
+
+/// The first attempt's key fingerprint, read by the fallback (same task).
+private final class KeySeen: @unchecked Sendable {
+    private let lock = NSLock()
+    private var stored: Data?
+    var value: Data? {
+        get { lock.withLock { stored } }
+        set { lock.withLock { stored = newValue } }
     }
 }
 
@@ -231,11 +322,12 @@ extension Authenticator {
 
 extension Authenticator {
     /// `do_nonsrp_auth`.
-    static func doNonSRPAuth(_ s: ByteStream, username: String, password: String,
-                             seams: AuthSeams) async throws -> AuthResult {
+    static func doNonSRPAuth(_ s: ByteStream, username: String, password: String, pin: Data? = nil,
+                             seams: AuthSeams, onKey: (Data) -> Void = { _ in }) async throws -> AuthResult {
         var lap = Lap()
         let server = try await rsa1Init(s)
         lap.log("RSA1 init")
+        try verifyPin(server.der, pin: pin, onKey: onKey)
         let aesKey = seams.random(K.nonSRPAESKeyLen)
         try await sendNonSRPCredentials(s, server: server.key, aesKey: aesKey,
                                         username: username, password: password, random: seams.random)
@@ -297,11 +389,13 @@ struct SRPChallenge: Sendable, Equatable {
 
 extension Authenticator {
     /// `do_srp_auth`.
-    static func doSRPAuth(_ s: ByteStream, username: String, password: String,
-                          seams: AuthSeams) async throws -> AuthResult {
+    static func doSRPAuth(_ s: ByteStream, username: String, password: String, pin: Data? = nil,
+                          seams: AuthSeams, onKey: (Data) -> Void = { _ in }) async throws -> AuthResult {
         var lap = Lap()
         let server = try await rsa1Init(s)
         lap.log("RSA1 init")
+        // Before packet-1: its identity is encrypted to this key.
+        try verifyPin(server.der, pin: pin, onKey: onKey)
         try await sendSRPModulus(s, server: server.key, username: username)
         let challenge = try await readSRPChallenge(s)
         lap.log("SRP modulus sent + challenge read")
@@ -475,24 +569,31 @@ extension Authenticator {
     }
 
     /// `_read_srp_result`: `u32 len || final proof[len] || u32 SecurityResult`.
-    /// The reference treats the proof as opaque. We additionally extract M2
-    /// (RFC §4.2.4.7) and check it, but per SRP.swift's note the M2 formula is
-    /// unverified against a live server, so a mismatch only logs loudly —
-    /// SecurityResult and the record layer (keyed from K) are the real gates.
+    /// The reference treats the proof as opaque. We extract M2 (RFC §4.2.4.7)
+    /// and verify it; the formula has been verified against a live macOS
+    /// server, so a well-formed but WRONG M2 is a hard failure
+    /// (`.serverProofMismatch`: the peer doesn't hold the password verifier).
+    /// A proof that doesn't parse in either known header shape is only
+    /// logged: it carries no M2 to judge, and the record layer (keyed from
+    /// K, which only the real verifier holder can derive) still fails closed
+    /// at the rekey if the peer is not the Mac.
     static func readSRPResult(_ s: ByteStream, proof: SRPProof) async throws {
         let finalProof = try await readFrame(s, what: "SRP final proof")
+        // SecurityResult first: a wrong password is `.rejected` (whatever
+        // proof a rejecting server sends); nothing is sent between the two.
+        try await readSecurityResult(s, label: "SRP")
         if let m2 = extractM2(finalProof) {
             if proof.verifyServerProof(m2) {
                 Log.auth.info("SRP server proof M2 verified")
             } else {
-                Log.auth.error("SRP server proof M2 MISMATCH — continuing (formula unverified against live server); SecurityResult decides")
+                Log.auth.error("SRP server proof M2 MISMATCH — the Mac's identity could not be verified; failing")
+                throw AuthError.serverProofMismatch
             }
         } else {
             // Lengths only: the proof is public, but keep the log terse.
             let head = finalProof.prefix(10).map { String(format: "%02x", $0) }.joined()
             Log.auth.error("SRP final proof (\(finalProof.count)B, header \(head)) did not parse per RFC §4.2.4.7; M2 not checked")
         }
-        try await readSecurityResult(s, label: "SRP")
     }
 
     /// RFC §4.2.4.7 final proof → M2. The inner payload is
@@ -550,14 +651,7 @@ extension Authenticator {
     /// (including newlines, which could otherwise forge extra log lines)
     /// with spaces and cap the length, so a malicious/buggy server can't
     /// pollute or blow up the log.
-    static func sanitizeForLog(_ s: String) -> String {
-        let truncated = s.unicodeScalars.count > K.maxLoggedStringLen
-        var out = String.UnicodeScalarView()
-        for scalar in s.unicodeScalars.prefix(K.maxLoggedStringLen) {
-            out.append(scalar.value < 0x20 || scalar.value == 0x7f ? " " : scalar)
-        }
-        return String(out) + (truncated ? "…" : "")
-    }
+    static func sanitizeForLog(_ s: String) -> String { ServerText.sanitize(s, maxLength: K.maxLoggedStringLen) }
 
     /// `u32 len || body[len]`.
     static func readFrame(_ s: ByteStream, what: String) async throws -> Data {
@@ -571,8 +665,9 @@ extension Authenticator {
         var r = ByteReader(try await s.read(exactly: 4))
         let result = try r.u32()
         guard result == 0 else {
-            let reason = await readRejectionReason(s)
-            Log.auth.error("\(label) auth rejected: result=\(result) reason=\(reason.map(sanitizeForLog) ?? "<none>")")
+            // Attacker-controllable text: sanitized + capped before it reaches the log or the UI.
+            let reason = await readRejectionReason(s).map(ServerText.sanitize)
+            Log.auth.error("\(label) auth rejected: result=\(result) reason=\(reason ?? "<none>")")
             throw AuthError.rejected(reason: reason)
         }
     }

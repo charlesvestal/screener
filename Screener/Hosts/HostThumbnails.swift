@@ -3,7 +3,8 @@
 // Application Support/Thumbnails/<host id>.<ext>.
 //
 // Privacy: thumbnails show the Mac's screen, so they stay on this device —
-// excluded from backups, never in Documents (which is shared with Files).
+// excluded from backups, never in Documents (which is shared with Files),
+// and file-protected (complete: unreadable while the iPad is locked).
 // They are deleted with their host, and "Clear Thumbnail(s)" (host context
 // menu / host list menu) removes them on demand.
 import Foundation
@@ -44,7 +45,7 @@ struct ThumbnailStore: Sendable {
         }
         let (data, ext) = try Self.encode(image)
         let target = url(for: id, ext: ext)
-        try data.write(to: target, options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication])
+        try data.write(to: target, options: [.atomic, .completeFileProtection])   // unreadable while locked (L5)
         for other in Self.extensions where other != ext { try? fm.removeItem(at: url(for: id, ext: other)) }
         return target
     }

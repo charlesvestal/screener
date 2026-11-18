@@ -64,6 +64,18 @@ struct ConnectSheet: View {
                     Section {
                         Toggle("Save to Hosts", isOn: $editor.saveToHosts)
                     }
+                } else {
+                    Section {
+                        Toggle("Allow legacy (less secure) sign-in", isOn: $editor.allowLegacyAuth)
+                    } header: {
+                        Text("Security")
+                    } footer: {
+                        Text("Only for Macs that can't use the modern sign-in. The legacy method can expose your "
+                             + "password to someone on the same network who impersonates this Mac. Screener still "
+                             + "refuses if the Mac's identity doesn't match the one it remembered."
+                             + (editor.hasPinnedIdentity ? "" : "\nThis Mac's identity is remembered after the "
+                                + "first successful sign-in."))
+                    }
                 }
                 statusSection
             }
@@ -122,6 +134,11 @@ struct ConnectSheet: View {
                     HStack { ProgressView(); Text("Connecting…") }
                 case .failed(let message):
                     Label(message, systemImage: "exclamationmark.triangle").foregroundStyle(.red)
+                    // The Mac asked for legacy sign-in: allowing it is a per-Mac
+                    // choice made in Edit Mac, so offer to save it without connecting.
+                    if model.legacyAuthRequested, editor.saveToHosts, editor.canSave {
+                        Button("Save Mac Without Connecting") { saveWithoutConnecting() }
+                    }
                 default:
                     EmptyView()
                 }
@@ -140,8 +157,12 @@ struct ConnectSheet: View {
         if editor.passwordChanged, !editor.password.isEmpty, editor.canConnect {
             let editor = editor, connector = connector, context = context
             Task {
+                // The edited host's pin and legacy setting (as being saved) apply.
+                let policy = AuthPolicy(pinnedKeySHA256: existing.pinnedKeySHA256,
+                                        allowLegacy: editor.allowLegacyAuth)
                 let r = await connector.connect(host: editor.trimmedHost, port: editor.portValue ?? 5900,
-                                                username: editor.username, password: editor.password)
+                                                username: editor.username, password: editor.password,
+                                                authPolicy: policy, savedHostID: existing.id)
                 do {
                     try editor.save(existing: existing, context: context, passwords: connector.passwords,
                                     persistPassword: r.connected)
@@ -166,6 +187,19 @@ struct ConnectSheet: View {
                 Log.hosts.error("save host failed: \(error)")
                 saveError = "Couldn't save this Mac."
             }
+        }
+    }
+
+    /// After a "Mac asked for legacy sign-in" failure: keep the Mac (without
+    /// its unverified password) so legacy sign-in can be allowed in Edit Mac.
+    private func saveWithoutConnecting() {
+        do {
+            _ = try editor.save(context: context, passwords: connector.passwords, persistPassword: false)
+            Task { await connector.cancel() }
+            dismiss()
+        } catch {
+            Log.hosts.error("save host failed: \(error)")
+            saveError = "Couldn't save this Mac."
         }
     }
 

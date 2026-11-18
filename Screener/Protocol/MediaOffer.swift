@@ -113,7 +113,7 @@ enum MediaOffer {
         /// reference and the native viewer send?).
         static var current: EndpointInfo {
             var model = sysctlString("hw.machine") ?? "Generic"
-            let env = ProcessInfo.processInfo.environment
+            let env = ExperimentEnv.current
             if let sim = env["SIMULATOR_MODEL_IDENTIFIER"], !sim.isEmpty { model = sim }
             if let forced = env["SCREENER_ENDPOINT_MODEL"], !forced.isEmpty { model = forced }
             return EndpointInfo(hardwareModel: model.isEmpty ? "Generic" : model,

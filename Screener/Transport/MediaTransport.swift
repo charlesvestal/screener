@@ -302,7 +302,7 @@ actor MediaTransport {
         /// recovery events (a ×0.9 cut each, BandwidthEstimator). Default off.
         var keyframeRequestCutsBWE = false
 
-        static func fromEnvironment(_ env: [String: String] = ProcessInfo.processInfo.environment) -> Feedback {
+        static func fromEnvironment(_ env: [String: String] = ExperimentEnv.current) -> Feedback {
             var f = Feedback()
             if let v = env["SCREENER_FB_RR"] { f.splitReports = v == "1" }
             if let v = env["SCREENER_FB_RCTL"] { f.rateControl = v == "1" }
@@ -694,7 +694,7 @@ actor MediaTransport {
     /// SCREENER_KF_MODE (experiments): which messages a keyframe request
     /// carries, e.g. "pli" or "fir+legacy"; default all three (reference).
     static let keyframeRequestMode: String =
-        ProcessInfo.processInfo.environment["SCREENER_KF_MODE"] ?? "fir+pli+legacy"
+        ExperimentEnv.current["SCREENER_KF_MODE"] ?? "fir+pli+legacy"
 
     /// APP name 5 "LTRP ACK" on the video port. The u32 is the RTP
     /// TIMESTAMP of a decoded picture: AVConference's
@@ -1162,7 +1162,7 @@ struct DropTest {
     private var remaining = 0
     private(set) var dropped = 0
 
-    static func fromEnvironment(_ env: [String: String] = ProcessInfo.processInfo.environment) -> DropTest {
+    static func fromEnvironment(_ env: [String: String] = ExperimentEnv.current) -> DropTest {
         var t = DropTest()
         if let v = env["SCREENER_DROP_TEST"] {
             let parts = v.split(separator: ":").compactMap { Int($0) }

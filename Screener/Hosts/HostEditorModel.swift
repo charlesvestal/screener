@@ -23,6 +23,11 @@ final class HostEditorModel {
     var password = ""
     /// New / discovered hosts only: keep this Mac (and its password) in Hosts.
     var saveToHosts = true
+    /// Edit mode: "Allow legacy (less secure) sign-in" (SavedHost.allowLegacyAuth;
+    /// off by default — see AuthPolicy / security review H1).
+    var allowLegacyAuth = false
+    /// Edit mode: the Mac's identity key is pinned (shown in the form).
+    private(set) var hasPinnedIdentity = false
     /// The Bonjour service this host is tied to (see SavedHost.bonjourName).
     private(set) var bonjourName: String?
     private var originalHost = ""
@@ -49,6 +54,8 @@ final class HostEditorModel {
         bonjourName = saved.bonjourName
         password = (try? passwords.password(for: saved.id)) ?? ""
         originalPassword = password
+        allowLegacyAuth = saved.allowLegacyAuth ?? false
+        hasPinnedIdentity = saved.pinnedKeySHA256 != nil
     }
 
     var isEditing: Bool { if case .edit = mode { true } else { false } }
@@ -98,6 +105,7 @@ final class HostEditorModel {
             saved.host = trimmedHost
             saved.port = Int(portValue)
             saved.username = username
+            saved.allowLegacyAuth = allowLegacyAuth
             if password.isEmpty {
                 try passwords.deletePassword(for: saved.id)
             } else if persistPassword {

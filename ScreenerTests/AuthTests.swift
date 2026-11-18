@@ -295,16 +295,187 @@ final class AuthTests: XCTestCase {
         XCTAssertNil(Authenticator.extractM2(finalProofBody(m2: Data(repeating: 1, count: 63))))
     }
 
-    func testM2MismatchLogsButSucceeds() async throws {
+    /// L4: a well-formed but wrong server proof is a hard failure, even
+    /// though the SecurityResult that follows says success.
+    func testM2MismatchFails() async throws {
         let fx = try SRPFixture()
         let key = try TestRSAKey()
         let (client, server) = MemoryPipe.pair()
         var badM2 = fx.M2; badM2[0] ^= 0xff
         let serverTask = Task { try await runFakeSRPServer(server, key: key, fx: fx, m2: badM2) }
+        do {
+            _ = try await Authenticator.run(stream: client, username: "alice", password: fx.password,
+                                            seams: .init(privateA: fx.privateA))
+            XCTFail("expected a server-proof failure")
+        } catch {
+            XCTAssertEqual(error as? AuthError, .serverProofMismatch)
+        }
+        _ = try await serverTask.value
+        XCTAssertEqual(ControlSession.describe(AuthError.serverProofMismatch).contains("identity could not be verified"),
+                       true)
+    }
+
+    // MARK: H1 — key pinning and the legacy-sign-in gate
+
+    /// A pinned key that matches: SRP proceeds as usual.
+    func testPinnedKeyMatchSucceeds() async throws {
+        let fx = try SRPFixture()
+        let key = try TestRSAKey()
+        let (client, server) = MemoryPipe.pair()
+        let serverTask = Task { try await runFakeSRPServer(server, key: key, fx: fx, m2: fx.M2) }
         let result = try await Authenticator.run(stream: client, username: "alice", password: fx.password,
+                                                 pin: Authenticator.keyFingerprint(key.spki),
                                                  seams: .init(privateA: fx.privateA))
         _ = try await serverTask.value
-        XCTAssertEqual(result.wrapKey.hex, fx.wrapKey.hex)
+        XCTAssertEqual(result.serverKeySHA256, Authenticator.keyFingerprint(key.spki))
+        XCTAssertEqual(result.serverKeySHA256?.count, 32)
+    }
+
+    /// A different key than the pinned one fails right after the key
+    /// response: packet-1 (identity encrypted to the attacker's key) is never sent.
+    func testPinnedKeyMismatchRefusesBeforePacket1() async throws {
+        let pinned = try TestRSAKey()
+        let attacker = try TestRSAKey()
+        let (client, server) = MemoryPipe.pair()
+        let serverTask = Task { () -> Bool in
+            _ = try await serveKeyRequest(server, key: attacker)
+            do { _ = try await server.read(exactly: 1); return true } catch { return false }
+        }
+        do {
+            _ = try await Authenticator.run(stream: client, username: "alice", password: "pw",
+                                            pin: Authenticator.keyFingerprint(pinned.spki), seams: AuthSeams())
+            XCTFail("expected a key mismatch")
+        } catch {
+            XCTAssertEqual(error as? AuthError,
+                           .serverKeyMismatch(presentedSHA256: Authenticator.keyFingerprint(attacker.spki)))
+        }
+        client.close()
+        let receivedPacket1 = try await serverTask.value
+        XCTAssertFalse(receivedPacket1, "nothing may be sent after a key mismatch")
+    }
+
+    /// Same for the non-SRP path: no credential blob to a mismatched key.
+    func testPinnedKeyMismatchRefusesNonSRPCredentials() async throws {
+        let pinned = try TestRSAKey()
+        let attacker = try TestRSAKey()
+        let (client, server) = MemoryPipe.pair()
+        let serverTask = Task { () -> Bool in
+            _ = try await serveKeyRequest(server, key: attacker)
+            do { _ = try await server.read(exactly: 1); return true } catch { return false }
+        }
+        do {
+            _ = try await Authenticator.run(stream: client, username: "alice", password: "pw", method: .nonSRP,
+                                            pin: Authenticator.keyFingerprint(pinned.spki), seams: AuthSeams())
+            XCTFail("expected a key mismatch")
+        } catch {
+            XCTAssertEqual(error as? AuthError,
+                           .serverKeyMismatch(presentedSHA256: Authenticator.keyFingerprint(attacker.spki)))
+        }
+        client.close()
+        let receivedCreds = try await serverTask.value
+        XCTAssertFalse(receivedCreds)
+    }
+
+    /// A short challenge (the MITM downgrade lever) on a host without
+    /// "Allow legacy sign-in": no second connection, `.legacyAuthRequired`.
+    func testShortChallengeDoesNotFallBackWithoutLegacyPermission() async throws {
+        let key = try TestRSAKey()
+        let (c1, s1) = MemoryPipe.pair()
+        let (c2, _) = MemoryPipe.pair()
+        let srpServer = Task {
+            _ = try await serveKeyRequest(s1, key: key)
+            _ = try await s1.read(exactly: 654)
+            var w = ByteWriter(); w.u32(8); w.zeros(8)
+            try await s1.write(w.data)
+        }
+        let conns = ConnQueue([c1, c2])
+        do {
+            _ = try await Authenticator.runWithFallback(username: "a", password: "b") { try await conns.next() }
+            XCTFail("expected legacyAuthRequired")
+        } catch {
+            XCTAssertEqual(error as? AuthError, .legacyAuthRequired)
+        }
+        try await srpServer.value
+        let opened = await conns.opened
+        XCTAssertEqual(opened, 1, "no legacy fallback connection without the per-host permission")
+        XCTAssertTrue(ControlSession.describe(AuthError.legacyAuthRequired).contains("legacy"))
+    }
+
+    /// `.malformed` / `.unsupported` without permission: propagate, no fallback.
+    func testMalformedDoesNotFallBackWithoutLegacyPermission() async throws {
+        let (c1, s1) = MemoryPipe.pair()
+        let (c2, _) = MemoryPipe.pair()
+        let server = Task {
+            _ = try await s1.read(exactly: 15)
+            var w = ByteWriter(); w.u32(4); w.u16(0); w.u16(0)   // truncated key response
+            try await s1.write(w.data)
+        }
+        let conns = ConnQueue([c1, c2])
+        do {
+            _ = try await Authenticator.runWithFallback(username: "a", password: "b") { try await conns.next() }
+            XCTFail("expected malformed")
+        } catch {
+            guard case .malformed = error as? AuthError else { return XCTFail("\(error)") }
+        }
+        try await server.value
+        let opened = await conns.opened
+        XCTAssertEqual(opened, 1)
+    }
+
+    /// Permission given but the fallback connection presents a different key
+    /// than the SRP attempt saw (no stored pin): refused before credentials.
+    func testLegacyFallbackRefusesADifferentKey() async throws {
+        let key = try TestRSAKey()
+        let other = try TestRSAKey()
+        let (c1, s1) = MemoryPipe.pair()
+        let (c2, s2) = MemoryPipe.pair()
+        let srpServer = Task {
+            _ = try await serveKeyRequest(s1, key: key)
+            _ = try await s1.read(exactly: 654)
+            var w = ByteWriter(); w.u32(8); w.zeros(8)
+            try await s1.write(w.data)
+        }
+        let nonSRPServer = Task { () -> Bool in
+            _ = try await serveKeyRequest(s2, key: other)
+            do { _ = try await s2.read(exactly: 1); return true } catch { return false }
+        }
+        let conns = ConnQueue([c1, c2])
+        do {
+            _ = try await Authenticator.runWithFallback(username: "a", password: "b",
+                                                        policy: AuthPolicy(allowLegacy: true)) {
+                try await conns.next()
+            }
+            XCTFail("expected a key mismatch")
+        } catch {
+            XCTAssertEqual(error as? AuthError,
+                           .serverKeyMismatch(presentedSHA256: Authenticator.keyFingerprint(other.spki)))
+        }
+        try await srpServer.value
+        let gotCredentials = try await nonSRPServer.value
+        XCTAssertFalse(gotCredentials)
+    }
+
+    /// A pinned host whose (MITM) key differs: refused on the SRP attempt,
+    /// before packet-1, even with legacy allowed — no second connection.
+    func testPinMismatchNeverFallsBack() async throws {
+        let pinned = try TestRSAKey()
+        let attacker = try TestRSAKey()
+        let (c1, s1) = MemoryPipe.pair()
+        let (c2, _) = MemoryPipe.pair()
+        let server = Task { _ = try await serveKeyRequest(s1, key: attacker) }
+        let conns = ConnQueue([c1, c2])
+        do {
+            _ = try await Authenticator.runWithFallback(
+                username: "a", password: "b",
+                policy: AuthPolicy(pinnedKeySHA256: Authenticator.keyFingerprint(pinned.spki), allowLegacy: true)
+            ) { try await conns.next() }
+            XCTFail("expected a key mismatch")
+        } catch {
+            guard case .serverKeyMismatch = error as? AuthError else { return XCTFail("\(error)") }
+        }
+        try await server.value
+        let opened = await conns.opened
+        XCTAssertEqual(opened, 1)
     }
 
     func testRejectedSecurityResultWithReason() async throws {
@@ -446,7 +617,11 @@ final class AuthTests: XCTestCase {
             try await s2.write(out.data)
         }
         let conns = ConnQueue([c1, c2])
-        let (stream, result) = try await Authenticator.runWithFallback(username: "a", password: "b") {
+        // H1: only with the host's legacy permission, and the same (pinned) key.
+        let (stream, result) = try await Authenticator.runWithFallback(
+            username: "a", password: "b",
+            policy: AuthPolicy(pinnedKeySHA256: Authenticator.keyFingerprint(key.spki), allowLegacy: true)
+        ) {
             try await conns.next()
         }
         try await srpServer.value

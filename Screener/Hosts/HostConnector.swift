@@ -4,8 +4,16 @@
 // and that literal is what SessionCoordinator.connect gets, so TCP and UDP
 // use the same IPv4. A typed host name goes to the coordinator unchanged
 // (it resolves it once, IPv4Resolver). On success the saved host's
-// `lastConnected` (and, for Bonjour, its last address) is updated, and a
-// password the user chose to remember is stored in the Keychain only then.
+// `lastConnected` is updated, and a password the user chose to remember is
+// stored in the Keychain only then.
+//
+// Mac identity (security review H1): the first successful sign-in pins the
+// SHA-256 of the Mac's RSA1 key on the saved host (`pinnedKeySHA256`); every
+// later connect passes that pin down (AuthPolicy), and a different key fails
+// before any credential is sent (SessionCoordinator.identityChange → the
+// "This Mac's identity changed" sheet; only "Trust New Key" re-pins). A
+// saved host's address is updated from a Bonjour lookup only when its pinned
+// key matched, so a spoofed service can't redirect the saved host.
 import Foundation
 import Observation
 import SwiftData
@@ -46,9 +54,11 @@ final class HostConnector {
     /// literal used for a Bonjour host, and whether the session connected.
     @discardableResult
     func connect(host: String, port: UInt16, username: String, password: String,
-                 service: DiscoveredHost? = nil) async -> (connected: Bool, resolvedAddress: String?) {
+                 service: DiscoveredHost? = nil, authPolicy: AuthPolicy = AuthPolicy(),
+                 savedHostID: UUID? = nil) async -> (connected: Bool, resolvedAddress: String?) {
         guard !isBusy else { return (false, nil) }
         error = nil
+        pendingIdentityHostID = savedHostID
         activeHostID = nil   // set again by markConnected for a saved host
         generation += 1
         let gen = generation
@@ -58,7 +68,7 @@ final class HostConnector {
                 (target, targetPort) = try await resolve(service)
                 resolved = target
             } catch {
-                Log.hosts.error("bonjour resolve \(service.name) failed: \(error)")
+                Log.hosts.error("bonjour resolve \(private: service.name) failed: \(error)")
                 if host.isEmpty {
                     self.error = (error as? LocalizedError)?.errorDescription ?? "Couldn't find \(service.name)."
                     return (false, nil)
@@ -70,7 +80,8 @@ final class HostConnector {
             error = "This Mac has no address."
             return (false, nil)
         }
-        await model.connect(host: target, port: targetPort, username: username, password: password)
+        await model.connect(host: target, port: targetPort, username: username, password: password,
+                            authPolicy: authPolicy)
         if case .connected = model.state { return (true, resolved) }
         return (false, resolved)
     }
@@ -88,19 +99,55 @@ final class HostConnector {
                  service: DiscoveredHost?, context: ModelContext) async {
         guard let port = saved.portValue else { error = "Invalid port \(saved.port)."; return }
         let user = username ?? saved.username
-        let result = await connect(host: saved.host, port: port, username: user, password: password, service: service)
+        let result = await connect(host: saved.host, port: port, username: user, password: password, service: service,
+                                   authPolicy: Self.authPolicy(for: saved), savedHostID: saved.id)
         guard result.connected else { return }
         markConnected(saved, resolvedAddress: result.resolvedAddress, username: user,
                       rememberPassword: remember ? password : nil, context: context)
     }
 
-    /// Records a successful connect on `saved`.
+    /// The trust decisions stored on `saved` for its next connect.
+    static func authPolicy(for saved: SavedHost) -> AuthPolicy {
+        AuthPolicy(pinnedKeySHA256: saved.pinnedKeySHA256, allowLegacy: saved.allowLegacyAuth ?? false)
+    }
+
+    /// The saved host the last connect-from-a-card was for: the subject of
+    /// an identity-changed prompt (`model.identityChange`).
+    private(set) var pendingIdentityHostID: UUID?
+
+    /// "Trust New Key": pins the key the Mac just presented
+    /// (`model.identityChange`) on `saved` — only on this explicit user
+    /// choice. The caller then reconnects.
+    func trustNewKey(_ presentedSHA256: Data, for saved: SavedHost, context: ModelContext) {
+        saved.pinnedKeySHA256 = presentedSHA256
+        model.clearIdentityChange()
+        do { try context.save() } catch { Log.hosts.error("couldn't save the new key: \(error)") }
+        Log.hosts.info("host \(saved.id.uuidString): user trusted a new Mac identity key")
+    }
+
+    /// Records a successful connect on `saved`: TOFU-pins the Mac's key if
+    /// none is pinned, and follows a new (Bonjour) address only when the
+    /// pinned key matched.
+    /// `presentedKey`: the session's key fingerprint (default: the coordinator's).
     func markConnected(_ saved: SavedHost, resolvedAddress: String?, username: String? = nil,
-                       rememberPassword: String?, context: ModelContext, now: Date = .now) {
+                       rememberPassword: String?, context: ModelContext, now: Date = .now,
+                       presentedKey: Data? = nil) {
         activeHostID = saved.id
         saved.lastConnected = now
         if let m = model.deviceModel, !m.isEmpty { saved.macModel = m }
-        if let resolvedAddress { saved.host = resolvedAddress }
+        let presented = presentedKey ?? model.serverKeySHA256
+        let pinMatched = presented != nil && saved.pinnedKeySHA256 == presented
+        if saved.pinnedKeySHA256 == nil, let presented {
+            saved.pinnedKeySHA256 = presented
+            Log.hosts.info("host \(saved.id.uuidString): pinned the Mac's identity key (first sign-in)")
+        }
+        if let resolvedAddress, resolvedAddress != saved.host {
+            if pinMatched || saved.host.isEmpty {
+                saved.host = resolvedAddress
+            } else {
+                Log.hosts.info("host \(saved.id.uuidString): not updating its address (no pinned key matched)")
+            }
+        }
         if let username, !username.isEmpty { saved.username = username }
         if let pw = rememberPassword, !pw.isEmpty {
             do { try passwords.setPassword(pw, for: saved.id) } catch {

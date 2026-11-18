@@ -374,7 +374,7 @@ private struct ControlPanel: View {
                     + "Takes effect on the next connection.") { smoothPlayback.toggle() }
                 .accessibilityValue(smoothPlayback ? "On" : "Off")
                 .accessibilityAddTraits(.isToggle)
-            ShareLink(item: ShareLogButton.logURL, preview: SharePreview("screener.log")) {
+            ShareLink(item: RedactedLog(), preview: SharePreview("screener.log")) {
                 tileLabel("Share Log", "doc.text.magnifyingglass", selected: false, destructive: false)
             }
             .buttonStyle(.plain)

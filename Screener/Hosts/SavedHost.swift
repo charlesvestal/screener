@@ -136,8 +136,10 @@ enum HostStore {
             let dir = URL.applicationSupportDirectory
             try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         }
-        let config = if let url { ModelConfiguration(schema: schema, url: url) }
-            else { ModelConfiguration(schema: schema, isStoredInMemoryOnly: inMemory) }
+        // Never synced: saved hosts (addresses, usernames, pinned keys) stay on
+        // this device even if a CloudKit entitlement is ever added (L5).
+        let config = if let url { ModelConfiguration(schema: schema, url: url, cloudKitDatabase: .none) }
+            else { ModelConfiguration(schema: schema, isStoredInMemoryOnly: inMemory, cloudKitDatabase: .none) }
         return try ModelContainer(for: schema, migrationPlan: HostsMigrationPlan.self, configurations: config)
     }
 

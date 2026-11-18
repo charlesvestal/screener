@@ -104,7 +104,7 @@ final class SessionCoordinatorConnectedTests: XCTestCase {
                 controlSeams: { _ in
                     ControlSession.Seams(
                         connect: { [self] _, _ in self.newConnection() },
-                        authenticate: { [self] _, _, connect in
+                        authenticate: { [self] _, _, _, connect in
                             self.noteAuth()
                             let s = try await connect()
                             return (s, AuthResult(wrapKey: SessionCoordinatorConnectedTests.wrapKey,

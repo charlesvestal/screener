@@ -78,7 +78,10 @@ struct SettingsView: View {
                     Text("Session")
                 } footer: {
                     Text("Auto Clipboard copies text between the iPad and the Mac as you copy it; iPadOS may ask "
-                         + "to allow pasting. Keep Screen Awake stops the iPad from locking while connected.")
+                         + "to allow pasting. Items a password manager marks as concealed or transient are never "
+                         + "sent automatically, and text from the Mac stays on this iPad (not shared with your other "
+                         + "devices via Universal Clipboard). Keep Screen Awake stops the iPad from locking while "
+                         + "connected.")
                 }
 
                 Section {
