@@ -49,5 +49,7 @@ build-disp/
 build-disp-dev/
 build-polish2/
 build-polish2-dev/
+build-host-fx/
+build-host-fx-dev/
 build-fx/
 build-fx-dev/

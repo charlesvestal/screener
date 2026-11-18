@@ -5,6 +5,12 @@ import UIKit
 /// The host list (Task 18): saved Macs (recents first) and Macs found with
 /// Bonjour, as a grid of cards. Tap → connect (asking for the password when
 /// none is stored); "+" → ConnectSheet.
+///
+/// Delight: a card shows its Mac's last picture (HostThumbnails), model icon
+/// (MacModelSymbol) and Bonjour presence (HostReachability); while connecting
+/// it shows the connection stages, then zooms into the full-screen session
+/// (and the session shrinks back into it on disconnect). Pull to refresh
+/// restarts Bonjour discovery.
 struct HostListView: View {
     @State private var model: SessionCoordinator
     @State private var connector: HostConnector
@@ -13,6 +19,14 @@ struct HostListView: View {
     @State private var pendingDelete: SavedHost?
     @State private var showSettings = false
     @State private var search = ""
+    @State private var thumbnails = HostThumbnails()
+    /// The card the session zooms out of (fixed for a presentation; nil:
+    /// the default cover transition, e.g. for a ConnectSheet connect).
+    @State private var zoomSource: UUID?
+    /// The saved host whose card shows the connection stages.
+    @State private var connectingHostID: UUID?
+    @Namespace private var zoomNamespace
+    @AppStorage("feedback.visual") private var visualFeedback = true
     @Query private var savedHosts: [SavedHost]
     @Environment(\.modelContext) private var context
     @Environment(\.scenePhase) private var scenePhase
@@ -40,6 +54,11 @@ struct HostListView: View {
                         Button { sheet = .new } label: { Label("Add Mac", systemImage: "plus") }
                     }
                     ToolbarItem(placement: .secondaryAction) { ShareLogButton() }
+                    ToolbarItem(placement: .secondaryAction) {
+                        Button(role: .destructive) { thumbnails.removeAll() } label: {
+                            Label("Clear All Thumbnails", systemImage: "photo.badge.minus")
+                        }
+                    }
                     ToolbarItem(placement: .topBarLeading) {
                         Button { sheet = .about } label: { Label("About", systemImage: "info.circle") }
                     }
@@ -48,6 +67,10 @@ struct HostListView: View {
                     }
                 }
                 .sheet(item: $sheet) { sheet in sheetView(sheet) }
+                .onChange(of: sheet?.id) { _, id in
+                    // A connect from a sheet other than a card's password prompt has no card.
+                    if let id, !id.hasPrefix("password-") { zoomSource = nil; connectingHostID = nil }
+                }
                 .sheet(isPresented: $showSettings) { SettingsView() }
                 .confirmationDialog("Delete \(pendingDelete?.name ?? "this Mac")?",
                                     isPresented: Binding(get: { pendingDelete != nil },
@@ -64,7 +87,19 @@ struct HostListView: View {
             get: { model.isSessionActive },
             set: { shown in if !shown, model.isSessionActive { Task { await model.disconnect() } } })) {
             SessionView(model: model)
+                // Every touch belongs to the Mac: no swipe/pinch-to-dismiss.
+                .interactiveDismissDisabled()
+                .modifier(SessionZoom(sourceID: zoomSource, namespace: zoomNamespace))
         }
+        // The last picture of a session → its card's thumbnail; the Mac's
+        // model (DeviceInfo) → its card's icon.
+        .onChange(of: model.lastPicture?.serial) { _, _ in
+            guard let picture = model.lastPicture?.image, let id = connector.activeHostID,
+                  savedHosts.contains(where: { $0.id == id }) else { return }
+            Task { await thumbnails.save(picture, for: id) }
+        }
+        .onChange(of: model.deviceModel) { _, m in connector.recordDeviceModel(m, in: context) }
+        .task(id: savedHosts.map(\.id)) { await thumbnails.load(savedHosts.map(\.id)) }
         // Background: close the session at once (the Mac stops sharing);
         // active again: reconnect (SessionCoordinator / LifecyclePolicy).
         // The background task ends only after enterBackground returns, i.e.
@@ -92,6 +127,7 @@ struct HostListView: View {
         .onAppear { if !model.isSessionActive { browser.start() } }
         #if DEBUG
         .task { await DebugLaunch.runIfRequested(model) }
+        .task { await DemoHosts.seed(context: context, thumbnails: thumbnails, browser: browser) }
         #endif
     }
 
@@ -99,16 +135,14 @@ struct HostListView: View {
 
     @ViewBuilder private var content: some View {
         if savedHosts.isEmpty && browser.hosts.isEmpty && search.isEmpty {
-            VStack(spacing: 0) {
-                statusBanner.padding()
-                ContentUnavailableView {
-                    Label("No Macs yet", systemImage: "desktopcomputer")
-                } description: {
-                    Text("Macs with Screen Sharing on appear here. Tap + to add one by address.")
-                } actions: {
-                    Button("Add Mac") { sheet = .new }.buttonStyle(.borderedProminent)
+            ScrollView {
+                VStack(spacing: 0) {
+                    statusBanner.padding()
+                    HostsEmptyState { sheet = .new }
                 }
+                .frame(maxWidth: .infinity)
             }
+            .refreshable { await refreshDiscovery() }
         } else {
             ScrollView {
                 VStack(alignment: .leading, spacing: 24) {
@@ -130,7 +164,16 @@ struct HostListView: View {
                 }
                 .padding()
             }
+            .refreshable { await refreshDiscovery() }
         }
+    }
+
+    /// Pull to refresh: a fresh Bonjour browse, held long enough for the
+    /// Macs still advertised to come back.
+    private func refreshDiscovery() async {
+        guard !model.isSessionActive else { return }
+        browser.restart()
+        try? await Task.sleep(for: .seconds(1.5))
     }
 
     private static let columns = [GridItem(.adaptive(minimum: 220, maximum: 360), spacing: 16)]
@@ -145,12 +188,19 @@ struct HostListView: View {
     }
 
     private func savedCard(_ host: SavedHost) -> some View {
-        let online = HostMatcher.discovered(for: host, in: browser.hosts, resolved: connector.resolvedIPv4) != nil
+        let reachability = HostReachability.of(host, discovered: browser.hosts, resolved: connector.resolvedIPv4,
+                                               isBrowsing: browser.isBrowsing)
+        let thumbnail = thumbnails.image(for: host.id)
         return Button { open(host) } label: {
             HostCard(name: host.name, address: host.displayAddress,
                      detail: host.lastConnected.map { "Last connected \($0.formatted(.relative(presentation: .named)))" }
                         ?? "Never connected",
-                     onNetwork: online)
+                     symbol: MacModelSymbol.symbol(for: host.macModel),
+                     family: MacModelSymbol.family(for: host.macModel),
+                     reachability: reachability, thumbnail: thumbnail, stage: connectingStage(for: host))
+                .matchedTransitionSource(id: host.id, in: zoomNamespace) { source in
+                    source.clipShape(RoundedRectangle(cornerRadius: HostCard.cornerRadius, style: .continuous))
+                }
         }
         .buttonStyle(.plain)
         .disabled(connector.isBusy)
@@ -158,6 +208,11 @@ struct HostListView: View {
             Button { open(host) } label: { Label("Connect", systemImage: "play.display") }
             Button { sheet = .edit(host) } label: { Label("Edit", systemImage: "pencil") }
             Button { duplicate(host) } label: { Label("Duplicate", systemImage: "plus.square.on.square") }
+            if thumbnail != nil {
+                Button { thumbnails.remove(host.id) } label: {
+                    Label("Clear Thumbnail", systemImage: "photo.badge.minus")
+                }
+            }
             Divider()
             Button(role: .destructive) { pendingDelete = host } label: { Label("Delete", systemImage: "trash") }
         }
@@ -166,10 +221,17 @@ struct HostListView: View {
     private func discoveredCard(_ d: DiscoveredHost) -> some View {
         Button { sheet = .discovered(d) } label: {
             HostCard(name: d.name, address: connector.resolvedIPv4[d.name] ?? "Bonjour",
-                     detail: "On this network", onNetwork: true)
+                     detail: "On this network", reachability: .online)
         }
         .buttonStyle(.plain)
         .disabled(connector.isBusy)
+    }
+
+    /// The stage shown on `host`'s card while it connects (nil otherwise).
+    private func connectingStage(for host: SavedHost) -> ConnectionStage? {
+        guard connectingHostID == host.id, !model.isSessionActive,
+              connector.isResolving || model.state == .connecting else { return nil }
+        return connector.isResolving ? .idle : model.stage
     }
 
     /// Connecting / failure status for a connect started from a card.
@@ -177,7 +239,9 @@ struct HostListView: View {
         if connector.isResolving || (model.state == .connecting && !model.isSessionActive) {
             HStack(spacing: 12) {
                 ProgressView()
-                Text(connector.isResolving ? "Looking up the Mac…" : "Connecting…")
+                Text(connector.isResolving ? "Looking up the Mac…" : model.stage.title)
+                    .contentTransition(.opacity)
+                    .animation(.easeInOut(duration: 0.2), value: model.stage)
                 Spacer()
                 Button("Cancel") { Task { await connector.cancel() } }
             }
@@ -227,6 +291,8 @@ struct HostListView: View {
     /// Connects with the stored password, or asks for one.
     private func open(_ host: SavedHost) {
         guard !connector.isBusy else { return }
+        connectingHostID = host.id
+        zoomSource = visualFeedback ? host.id : nil
         let stored: String?
         do { stored = try connector.passwords.password(for: host.id) } catch {
             Log.hosts.error("keychain read failed for \(host.id.uuidString): \(error)")
@@ -248,7 +314,11 @@ struct HostListView: View {
     }
 
     private func delete(_ host: SavedHost) {
-        do { try HostStore.delete(host, in: context, passwords: connector.passwords) } catch {
+        let id = host.id
+        do {
+            try HostStore.delete(host, in: context, passwords: connector.passwords, thumbnails: thumbnails.store)
+            thumbnails.remove(id)
+        } catch {
             Log.hosts.error("delete host failed: \(error)")
             connector.error = "Couldn't delete \(host.name)."
         }
@@ -278,39 +348,19 @@ enum HostSheet: Identifiable {
     }
 }
 
-/// One Mac in the host grid.
-struct HostCard: View {
-    let name: String
-    let address: String
-    let detail: String
-    let onNetwork: Bool
+/// The session zooms out of the card it was opened from (iPadOS 26 zoom
+/// transition; with Reduce Motion the system cross-fades it) and shrinks back
+/// into it when it ends. Without a source card: the default cover transition.
+private struct SessionZoom: ViewModifier {
+    let sourceID: UUID?
+    let namespace: Namespace.ID
 
-    var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack(alignment: .top) {
-                Image(systemName: "desktopcomputer")
-                    .font(.system(size: 34, weight: .light))
-                    .foregroundStyle(.tint)
-                Spacer()
-                if onNetwork {
-                    Label("On network", systemImage: "circle.fill")
-                        .labelStyle(.iconOnly)
-                        .font(.caption2)
-                        .foregroundStyle(.green)
-                        .accessibilityLabel("On this network")
-                }
-            }
-            VStack(alignment: .leading, spacing: 2) {
-                Text(name).font(.headline).lineLimit(1)
-                Text(address).font(.subheadline).foregroundStyle(.secondary).lineLimit(1)
-                Text(detail).font(.caption).foregroundStyle(.tertiary).lineLimit(1)
-            }
+    func body(content: Content) -> some View {
+        if let sourceID {
+            content.navigationTransition(.zoom(sourceID: sourceID, in: namespace))
+        } else {
+            content
         }
-        .padding(16)
-        .frame(maxWidth: .infinity, minHeight: 130, alignment: .topLeading)
-        .background(.background.secondary, in: RoundedRectangle(cornerRadius: 16))
-        .contentShape(RoundedRectangle(cornerRadius: 16))
-        .accessibilityElement(children: .combine)
     }
 }
 

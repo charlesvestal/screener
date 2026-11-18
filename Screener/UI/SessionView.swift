@@ -4,9 +4,9 @@ import SwiftUI
 /// Full-screen remote desktop: the composited video with the input layer on
 /// top (RemoteInputView), the floating control menu (FloatingMenuView:
 /// sticky modifiers, special keys, Mac shortcuts, Keyboard, Type Password,
-/// Share Log, Disconnect, …) and a "Connecting…" overlay until the first
-/// picture decodes ("Reconnecting…" over the last picture while a session
-/// suspended by backgrounding is resumed).
+/// Share Log, Disconnect, …) and SessionStatusOverlay: the connection stage
+/// until the first picture decodes, which then fades in from a blur
+/// ("Reconnecting…" over the last picture while a suspended session is resumed).
 struct SessionView: View {
     let model: SessionCoordinator
     @State private var keyboardVisible = false
@@ -25,15 +25,8 @@ struct SessionView: View {
                              touchMode: TouchInputMode(rawValue: touchModeRaw) ?? .default, feedback: feedback)
                 .overlay { FeedbackOverlayView(center: feedback) }
                 .ignoresSafeArea()
-            if model.isReconnecting || !model.hasFirstFrame {
-                VStack(spacing: 12) {
-                    ProgressView().controlSize(.large).tint(.white)
-                    Text(model.isReconnecting ? "Reconnecting…" : "Connecting…")
-                        .font(.headline).foregroundStyle(.white)
-                }
-                .padding(24)
-                .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 16))
-            }
+            // Stages / first-picture reveal / "Reconnecting…" (SessionOverlays.swift).
+            SessionStatusOverlay(model: model)
             FloatingMenuView(menu: menu, expanded: $menuExpanded, keyboardVisible: $keyboardVisible,
                              controls: SessionControls(inputAvailable: model.input != nil,
                                                        disconnect: { Task { await model.disconnect() } },

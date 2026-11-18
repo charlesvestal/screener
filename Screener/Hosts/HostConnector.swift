@@ -22,6 +22,9 @@ final class HostConnector {
     var error: String?
     /// Bumped by `cancel()`: a connect whose Bonjour lookup outlives a cancel stops there.
     private var generation = 0
+    /// The saved host of the current (or last) session: its card gets the
+    /// session's last picture as a thumbnail and its model identifier.
+    private(set) var activeHostID: UUID?
 
     init(model: SessionCoordinator, passwords: any PasswordStore = KeychainPasswordStore()) {
         self.model = model
@@ -46,6 +49,7 @@ final class HostConnector {
                  service: DiscoveredHost? = nil) async -> (connected: Bool, resolvedAddress: String?) {
         guard !isBusy else { return (false, nil) }
         error = nil
+        activeHostID = nil   // set again by markConnected for a saved host
         generation += 1
         let gen = generation
         var target = host, targetPort = port, resolved: String?
@@ -93,7 +97,9 @@ final class HostConnector {
     /// Records a successful connect on `saved`.
     func markConnected(_ saved: SavedHost, resolvedAddress: String?, username: String? = nil,
                        rememberPassword: String?, context: ModelContext, now: Date = .now) {
+        activeHostID = saved.id
         saved.lastConnected = now
+        if let m = model.deviceModel, !m.isEmpty { saved.macModel = m }
         if let resolvedAddress { saved.host = resolvedAddress }
         if let username, !username.isEmpty { saved.username = username }
         if let pw = rememberPassword, !pw.isEmpty {
@@ -102,5 +108,16 @@ final class HostConnector {
             }
         }
         do { try context.save() } catch { Log.hosts.error("couldn't save host: \(error)") }
+    }
+
+    /// The session reported the Mac's model (DeviceInfo 0x456): remember it
+    /// on the active saved host (its card icon).
+    func recordDeviceModel(_ model: String?, in context: ModelContext) {
+        guard let model, !model.isEmpty, let id = activeHostID else { return }
+        let all = (try? context.fetch(FetchDescriptor<SavedHost>(predicate: #Predicate { $0.id == id }))) ?? []
+        guard let host = all.first, host.macModel != model else { return }
+        host.macModel = model
+        do { try context.save() } catch { Log.hosts.error("couldn't save the Mac model: \(error)") }
+        Log.hosts.info("host \(id.uuidString) is a \(model)")
     }
 }

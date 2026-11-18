@@ -165,6 +165,15 @@ final class SessionCoordinator {
     /// A suspended session is being resumed: from the background close until
     /// the resumed session's first picture (or its failure).
     private(set) var isReconnecting = false
+    /// "Signing in…" → "Securing…" → "Starting video…" (ConnectionStage.swift).
+    private(set) var stage: ConnectionStage = .idle
+    /// The Mac's model identifier (DeviceInfo 0x456), once this session sent it.
+    private(set) var deviceModel: String?
+    /// The last picture of the session torn down most recently (downscaled,
+    /// rendered off the main thread by FrameSnapshot): the "Reconnecting…"
+    /// backdrop and the host card thumbnail. `serial` grows per capture.
+    private(set) var lastPicture: (image: UIImage, serial: Int)?
+    @ObservationIgnored private var pictureSerial = 0
     /// The last connect request (cleared by a user disconnect).
     private(set) var lastRequest: ConnectRequest?
     private(set) var lifecycle = LifecyclePolicy()
@@ -225,6 +234,7 @@ final class SessionCoordinator {
         guard gen == generation else { return }
         hasFirstFrame = true
         isReconnecting = false
+        stage = stage.advanced(by: .firstFrame)
         firstFrameTask?.cancel(); firstFrameTask = nil
     }
 
@@ -276,6 +286,8 @@ final class SessionCoordinator {
         generation += 1
         let gen = generation
         state = .connecting
+        stage = stage.advanced(by: .started)
+        deviceModel = nil
         let task = Task<Void, Never> { [weak self] in
             guard let self else { return }
             await self.run(gen, host: r.host, port: r.port, username: r.username, password: r.password,
@@ -426,6 +438,7 @@ final class SessionCoordinator {
         var config = ControlSession.Config(host: ip, port: port, username: username, password: password,
                                            logicalSize: logical, backingSize: backing, startupOrder: order)
         config.dynamicDisplay = mode.isDynamic
+        config.onMilestone = { [weak self] m in Task { @MainActor in self?.milestone(m, gen) } }
         let attempts = max(1, policy.burstRetryAttempts)
         for attempt in 1...attempts {
             let session = ControlSession(config: config, tuning: seams.controlTuning,
@@ -467,6 +480,7 @@ final class SessionCoordinator {
                 display.start(initial: mode.isDynamic ? geometry : mac, mac: mac)
                 clipboard.start(send: { try await session.send($0) })
                 state = .connected(canvasWidth: params.canvas.width, canvasHeight: params.canvas.height)
+                stage = stage.advanced(by: .streamStarted)
                 startFirstFrameDeadline(gen, media)
                 return
             case .failed(let error):
@@ -537,6 +551,11 @@ final class SessionCoordinator {
         media = nil
         mediaParams = nil
         serverAddress = nil
+        // The last picture, for the reconnect backdrop and the card
+        // thumbnail: taken before the reset drops the buffers, rendered off
+        // the main thread.
+        stage = stage.advanced(by: .ended)
+        capturePicture()
         // New epoch: late VideoToolbox callbacks are dropped and the pixel
         // buffers are freed (the layer keeps showing the last picture).
         frames.reset()
@@ -579,6 +598,24 @@ final class SessionCoordinator {
         pendingTeardown = work
         await work.value
         if pendingTeardown == work { pendingTeardown = nil }
+    }
+
+    /// A connect milestone from session `gen` (ControlSession's arrive on
+    /// their own hop; the stage never steps back, so order doesn't matter).
+    private func milestone(_ m: ConnectionMilestone, _ gen: Int) {
+        guard gen == generation else { return }
+        stage = stage.advanced(by: m)
+    }
+
+    private func capturePicture() {
+        guard let snap = FrameSnapshot.capture(frames) else { return }
+        pictureSerial += 1
+        let serial = pictureSerial
+        Task { [weak self] in
+            guard let image = await snap.image() else { return }
+            guard let self, serial > (self.lastPicture?.serial ?? 0) else { return }
+            self.lastPicture = (image, serial)
+        }
     }
 
     /// Feeds control events to input and the cursor, and notices when the
@@ -634,6 +671,8 @@ final class SessionCoordinator {
             cursor.select(id: id)
         case .miscStatus, .clipboard:
             clipboard.handle(event)
+        case .deviceInfo(let model):
+            deviceModel = model
         default:
             break
         }

@@ -128,7 +128,7 @@ final class SavedHostTests: XCTestCase {
     func testPersistentStoreOpensWithMigrationPlan() throws {
         let url = FileManager.default.temporaryDirectory.appendingPathComponent("hosts-\(UUID().uuidString).store")
         defer { try? FileManager.default.removeItem(at: url) }
-        let schema = Schema(versionedSchema: HostsSchemaV1.self)
+        let schema = Schema(versionedSchema: HostsSchemaV2.self)
         do {
             let c = try ModelContainer(for: schema, migrationPlan: HostsMigrationPlan.self,
                                        configurations: ModelConfiguration(schema: schema, url: url))

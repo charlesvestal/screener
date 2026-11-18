@@ -27,8 +27,23 @@ final class BonjourBrowser {
     private(set) var isBrowsing = false
     private var browser: NWBrowser?
 
+    #if DEBUG
+    /// DemoHosts (screenshots): fixed fake services, no browsing.
+    private var demo = false
+    func showDemo(_ names: [String]) {
+        stop()
+        demo = true
+        hosts = names.map { DiscoveredHost(name: $0, endpoint: .service(name: $0, type: Self.serviceType,
+                                                                         domain: "local.", interface: nil)) }
+        isBrowsing = true
+    }
+    #endif
+
     /// Starts browsing (the first start triggers the Local Network prompt).
     func start() {
+        #if DEBUG
+        if demo { return }
+        #endif
         guard browser == nil else { return }
         let params = NWParameters.tcp
         params.includePeerToPeer = false
@@ -54,6 +69,17 @@ final class BonjourBrowser {
         browser?.cancel()
         browser = nil
         isBrowsing = false
+    }
+
+    /// Pull to refresh: a fresh browse (stale services drop out; the ones
+    /// still advertised come back with the new browser's first results).
+    func restart() {
+        #if DEBUG
+        if demo { return }
+        #endif
+        stop()
+        hosts = []
+        start()
     }
 
     func host(named name: String) -> DiscoveredHost? {

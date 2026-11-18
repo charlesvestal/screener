@@ -129,6 +129,9 @@ actor ControlSession {
         /// later `requestDisplay` resizes work; false (DisplayMode.matchMac):
         /// the bare descriptor, sized to ServerInit's framebuffer at 2×.
         var dynamicDisplay = true
+        /// Handshake progress for the UI (ConnectionStage): auth ok, record
+        /// layer active, media answer. Called on the session's actor.
+        var onMilestone: (@Sendable (ConnectionMilestone) -> Void)?
     }
 
     /// Timing knobs; defaults are the reference's values.
@@ -320,6 +323,7 @@ actor ControlSession {
         }
         guard adopt(stream) else { throw ControlSessionError.closed }
         Log.control.info("M1 auth ok")
+        cfg.onMilestone?(.authenticated)
         beginStep("server init")
 
         // 2) ClientInit / ServerInit (_phase_client_init).
@@ -360,6 +364,7 @@ actor ControlSession {
         record = rekey.record
         for e in rekey.events { continuation.yield(e) }
         Log.control.info("rekey received; record layer installed")
+        cfg.onMilestone?(.recordLayerActive)
         let initial = rekey.tail
         rxTask = Task { [weak self] in await self?.rxLoop(initial: initial) }
 
@@ -415,6 +420,7 @@ actor ControlSession {
         beginStep("done")
         guard case .answer(let answer) = outcome, let record else { throw ControlSessionError.closed }
         Log.control.info("M2 media answer canvas=\(answer.canvasWidth)x\(answer.canvasHeight) tiles=\(answer.tiles)")
+        cfg.onMilestone?(.mediaAnswered)
 
         offerMessage = msg1c
         startCursorPoll()
