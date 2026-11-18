@@ -21,7 +21,9 @@
 //   - Scroll: a two-finger trackpad pan (`.continuous`) maps finger travel
 //     1:1 to host pixels (PixelScroll); a wheel (`.discrete`) goes through
 //     the reference's wheel curve (WheelScroll). Vertical only, as the
-//     reference.
+//     reference. Settings → Scroll speed (InputController.scrollSpeed)
+//     scales wheel, touch (+ momentum) and pointer-lock scrolls, not the
+//     hardware trackpad's continuous one.
 // Touch (fingers and Pencil, Task 22): raw `.direct` / `.pencil` touches go
 //   to TouchInterpreter (TouchInputMode.swift: the gestures of trackpad mode
 //   — the default — and direct mode), whose TouchActions are performed here
@@ -738,7 +740,8 @@ final class RemoteInputView: UIView, UIPointerInteractionDelegate, UIGestureReco
         if g.state == .began { stopInertia() }
         let d = delta(g)
         guard d.y != 0, !pointerLocked else { return }
-        let ticks = wheel.ticks(wheelDelta: d.y / Tuning.pointsPerWheelNotch,
+        let speed = input?.scrollSpeed ?? 1
+        let ticks = wheel.ticks(wheelDelta: d.y / Tuning.pointsPerWheelNotch * speed,
                                 atMilliseconds: ProcessInfo.processInfo.systemUptime * 1000)
         scrollAtPointer(ticks, fallback: g.location(in: self))
     }
@@ -747,7 +750,7 @@ final class RemoteInputView: UIView, UIPointerInteractionDelegate, UIGestureReco
     private func scrollTouch(_ d: CGPoint) {
         guard let input else { return }
         if d.y != 0 { feedback?.feedback(.scrolled(dy: d.y)) }
-        let ticks = touchScroll.ticks(points: d.y, ticksPerPoint: input.scrollTicksPerPoint(
+        let ticks = touchScroll.ticks(points: d.y, ticksPerPoint: input.scrollSpeed * input.scrollTicksPerPoint(
             viewSize: bounds.size, zoom: viewport.value.scale))
         scrollAtPointer(ticks, fallback: CGPoint(x: bounds.midX, y: bounds.midY))
     }
@@ -1016,7 +1019,8 @@ final class RemoteInputView: UIView, UIPointerInteractionDelegate, UIGestureReco
     private func lockedScrolled(dy: CGFloat) {
         guard pointerLocked, let input, dy != 0 else { return }
         stopInertia()
-        let ticks = lockedScroll.ticks(points: dy * Tuning.lockedScrollPoints, ticksPerPoint: input.scrollTicksPerPoint(
+        let ticks = lockedScroll.ticks(points: dy * Tuning.lockedScrollPoints * input.scrollSpeed,
+                                       ticksPerPoint: input.scrollTicksPerPoint(
             viewSize: bounds.size, zoom: viewport.value.scale))
         scrollAtPointer(ticks, fallback: CGPoint(x: bounds.midX, y: bounds.midY))
     }

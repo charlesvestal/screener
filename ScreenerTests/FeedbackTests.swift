@@ -653,3 +653,48 @@ final class RippleRenderTests: XCTestCase {
         CGImageDestinationFinalize(dest)
     }
 }
+
+// MARK: scroll speed (Settings)
+
+@MainActor
+final class ScrollSpeedTests: XCTestCase {
+    private final class Counter: @unchecked Sendable {
+        var n = 0
+    }
+
+    /// Messages sent for one 20-point touch scroll at `speed` (under the 50-tick cap).
+    private func scrollMessages(speed: CGFloat) async -> Int {
+        let counter = Counter()
+        let input = InputController(contentKey: nil, serverWidth: 200, serverHeight: 100,
+                                    send: { _ in counter.n += 1 })
+        input.pointScale = 1
+        input.scrollSpeed = speed
+        let clock = FakeRepeatClock()
+        let view = RemoteInputView(frame: CGRect(x: 0, y: 0, width: 200, height: 100), repeatSchedule: clock.schedule)
+        view.input = input
+        view.perform(.moveTo(CGPoint(x: 100, y: 50)))
+        await input.flush()
+        let before = counter.n
+        view.perform(.scroll(CGPoint(x: 0, y: 20)))
+        await input.flush()
+        return counter.n - before
+    }
+
+    func testScrollSpeedScalesTouchScrolls() async {
+        let base = await scrollMessages(speed: 1)
+        XCTAssertEqual(base, 2 * 20)                      // 1 host px per point, press + release
+        let fast = await scrollMessages(speed: 2)
+        XCTAssertEqual(fast, 2 * base)
+        let slow = await scrollMessages(speed: 0.5)
+        XCTAssertEqual(slow, base / 2)
+    }
+
+    func testSessionReadsTheClampedSetting() {
+        let d = UserDefaults(suiteName: "ScrollSpeedTests")!
+        d.removePersistentDomain(forName: "ScrollSpeedTests")
+        XCTAssertEqual(ScreenerSettings.scrollSpeed(d), 1)
+        d.set(5.0, forKey: ScreenerSettings.scrollSpeedKey)
+        XCTAssertEqual(ScreenerSettings.scrollSpeed(d), 2)
+        XCTAssertEqual(InputController(contentKey: nil, serverWidth: 1, serverHeight: 1, send: { _ in }).scrollSpeed, 1)
+    }
+}

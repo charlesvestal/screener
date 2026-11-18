@@ -54,6 +54,11 @@ final class InputController {
     private(set) var serverHeight: Int
     /// Backing pixels per logical point on the host (0x451 backing / scaled).
     var pointScale: CGFloat = 2
+    /// Settings → Scroll speed (ScreenerSettings.scrollSpeed, 0.5–2×), set at
+    /// session start: RemoteInputView multiplies touch scrolls (and their
+    /// momentum), wheel scrolls and pointer-lock scrolls by it. A hardware
+    /// trackpad's continuous scroll keeps its 1:1 feel.
+    var scrollSpeed: CGFloat = 1
     /// Messages handed to the control channel (input.py tx_pkts).
     private(set) var sentCount = 0
 

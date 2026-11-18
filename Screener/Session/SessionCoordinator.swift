@@ -686,11 +686,8 @@ final class SessionCoordinator {
                                     send: { try await session.send($0) })
         if let b = hostBacking { input.setServerDims(width: b.width, height: b.height) }
         input.pointScale = hostPointScale
-        // TODO(coordinator, Input owner): apply the Settings scroll speed
-        // (ScreenerSettings.scrollSpeed(), "input.scrollSpeed", 0.5–2.0,
-        // default 1.0) at session start: scale the scroll deltas
-        // RemoteInputView / ScrollInertia hand to InputController.scroll.
-        // Not wired here because Input/* is owned by another change.
+        // Settings → Scroll speed, read once per session (InputController.scrollSpeed).
+        input.scrollSpeed = CGFloat(ScreenerSettings.scrollSpeed())
         self.input?.close()
         self.input = input
         Log.input.info("M5 input ready: canvas \(input.serverWidth)x\(input.serverHeight), pointer via 0x10")
