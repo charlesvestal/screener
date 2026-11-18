@@ -34,8 +34,13 @@
 //     does (one APP per marker). Both stay off: on 2026-11-18 the per-tile
 //     acks did not raise the bitrate and coincided with decode stalls;
 //   * every 2 s: `video fps=… decode_ms=… tiles=[…] kbps=… au_avg=[…]
-//     au_max=[…] idr=… partial=…` (AU payload bytes of what was fed;
-//     `partial` = pictures shown with a strip missing).
+//     au_max=[…] idr=… partial=… shown=… merged=… skips=… fills=… wait_ms=…
+//     ooo=… hold_ms=… pace_skips=… drawn=… age_ms=… rx_gap_max_ms=…
+//     rx_gaps50=…` (AU payload bytes of what was fed; `partial` = pictures
+//     shown after their strips stopped coming; then VideoFrameStore.
+//     PresentStats; then the largest gap between video packet arrival stamps
+//     and the gaps over 50 ms: in the simulator the receive path stalls
+//     ~100 ms 2–3 times a second while the wire shows none, 2026-11-18).
 import CoreMedia
 import CoreVideo
 import Foundation
@@ -81,6 +86,9 @@ actor VideoPipeline {
     private var fed = 0
     private var dropped = 0
     private var interval = IntervalStats()
+    private var lastArrival: ContinuousClock.Instant?
+    private var rxGapMax: Duration = .zero
+    private var rxGaps50 = 0
     private let publishThrottle = PublishThrottle()
 
     init(store: VideoFrameStore, hooks: Hooks, ltrAcks: LTRAckMode = VideoPipeline.ltrAckMode) {
@@ -138,6 +146,12 @@ actor VideoPipeline {
 
     func ingest(_ p: MediaPacket) async {
         guard !stopped else { return }
+        if let last = lastArrival, p.arrival > last {
+            let gap = p.arrival - last
+            rxGapMax = max(rxGapMax, gap)
+            if gap > .milliseconds(50) { rxGaps50 += 1 }
+        }
+        lastArrival = max(lastArrival ?? p.arrival, p.arrival)
         if assembler == nil || !assembler!.tileSSRCs.contains(p.ssrc) {
             let group = await hooks.activeSSRCs()
             guard !stopped, group.contains(p.ssrc) else { return }   // not (yet) an adopted tile
@@ -248,10 +262,12 @@ actor VideoPipeline {
         let perTile = (0..<tiles).map { String(format: "%.0f", Double(c.frames[$0] ?? 0) / secs) }
         let fps = Double(c.frames.values.max() ?? 0) / secs
         let ms = total > 0 ? Double(c.decodeNanos) / Double(total) / 1e6 : 0
-        Log.video.info(String(format: "video fps=%.1f decode_ms=%.2f tiles=[%@] fed=%d errors=%d dropped=%d mode=%@ %@ partial=%d",
+        Log.video.info(String(format: "video fps=%.1f decode_ms=%.2f tiles=[%@] fed=%d errors=%d dropped=%d mode=%@ %@ partial=%d %@ rx_gap_max_ms=%d rx_gaps50=%d",
                               fps, ms, perTile.joined(separator: ","), fed, c.errors, dropped,
                               decoder.mode.map { "\($0)" } ?? "-", interval.summary(seconds: secs, tiles: tiles),
-                              store.takePartialCommits()))
+                              store.takePartialCommits(), store.takePresentStats().summary, rxGapMax.ms, rxGaps50))
+        rxGapMax = .zero
+        rxGaps50 = 0
         fed = 0
         dropped = 0
         interval = IntervalStats()

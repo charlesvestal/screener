@@ -14,6 +14,17 @@
 // drawables. A redraw with nothing drawable marks the version seen and keeps
 // the last presented picture on the layer (e.g. behind "Reconnecting…").
 //
+// Pacing (VideoFrameStore header; OPT-IN with SCREENER_PACING=1, for a
+// device A/B): pictures are queued with due times, so while any is queued
+// the view runs its display link (up to the screen's maximum rate) and each
+// vsync presents the newest due picture; `pacingIdle` after the queue
+// empties it goes back to on-demand drawing. A vsync with nothing new due
+// acquires no drawable. Off by default: in the simulator (2026-11-18, host
+// load ~20–30) both paced runs starved the app — video receive stalls up to
+// 1.4 s, 13–21k packets lost before the app with none missing on the wire —
+// while the same runs drawing on arrival were clean; not yet tried on a
+// device.
+//
 // The CAMetalLayer's colorspace is set explicitly from the pixel buffers'
 // colour-primaries attachment: Display P3 → displayP3, BT.2020 → itur_2020,
 // BT.709 or absent → sRGB (709 and sRGB share primaries, and desktop pixels
@@ -116,11 +127,18 @@ final class MetalRenderer: NSObject, MTKViewDelegate {
     private var droppedFormatLogged = false
     private var layerColorSpace: CFString?
     private var coalescer: RedrawCoalescer?
+    private var lastQueued: ContinuousClock.Instant?
     private(set) var framesDrawn = 0
     /// Called on the main actor after the first picture is presented.
     var onFirstDraw: (() -> Void)?
 
     static let colorPixelFormat: MTLPixelFormat = .bgra8Unorm
+
+    /// Presentation pacing, opt-in (SCREENER_PACING=1; see the header).
+    nonisolated static let pacing: VideoFrameStore.Pacing? =
+        ProcessInfo.processInfo.environment["SCREENER_PACING"] == "1" ? VideoFrameStore.Pacing() : nil
+    /// How long the display link keeps running after the queue empties.
+    static let pacingIdle: Duration = .milliseconds(250)
 
     init?(store: VideoFrameStore, cursor: RemoteCursor? = nil,
           device: MTLDevice? = MTLCreateSystemDefaultDevice()) {
@@ -176,6 +194,11 @@ final class MetalRenderer: NSObject, MTKViewDelegate {
         view.enableSetNeedsDisplay = true
         view.isPaused = true
         view.delegate = self
+        store.setPacing(Self.pacing)
+        if Self.pacing != nil {
+            view.preferredFramesPerSecond = 120             // capped to the screen's maximum
+            Log.video.info("M4 pacing ON (SCREENER_PACING=1): pictures presented on their RTP timeline")
+        }
         setLayerColorSpace(CGColorSpace.sRGB, on: view)
         let coalescer = RedrawCoalescer { [weak view] in view?.setNeedsDisplay() }
         self.coalescer = coalescer
@@ -215,6 +238,7 @@ final class MetalRenderer: NSObject, MTKViewDelegate {
     }
 
     private func drawFrame(in view: MTKView) {
+        defer { updateDisplayLink(view) }
         let size = view.drawableSize
         let resized = size != lastDrawableSize
         let cursorChanged = cursor.map { $0.revision != lastCursorRevision } ?? false
@@ -248,12 +272,27 @@ final class MetalRenderer: NSObject, MTKViewDelegate {
         }
         cmd.present(drawable)
         cmd.commit()
+        if snap.version != lastVersion { store.noteDrawn(changedAt: snap.changedAt, rtpTimestamp: snap.rtpTimestamp) }
         CVMetalTextureCacheFlush(textureCache, 0)
         lastVersion = snap.version
         lastCursorRevision = cursor?.revision
         lastDrawableSize = size
         framesDrawn += 1
         if framesDrawn == 1 { onFirstDraw?() }
+    }
+
+    /// Runs the view's display link while paced pictures are queued, and
+    /// returns to on-demand drawing `pacingIdle` after the queue empties.
+    private func updateDisplayLink(_ view: MTKView) {
+        guard Self.pacing != nil else { return }
+        let now = ContinuousClock.now
+        if store.nextDue != nil {
+            lastQueued = now
+            if view.isPaused { view.enableSetNeedsDisplay = false; view.isPaused = false }
+        } else if !view.isPaused, lastQueued.map({ now - $0 >= Self.pacingIdle }) ?? true {
+            view.isPaused = true
+            view.enableSetNeedsDisplay = true
+        }
     }
 
     /// Encodes the composite of `snap` into `pass` (target `size` pixels).
