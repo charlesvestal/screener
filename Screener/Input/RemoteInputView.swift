@@ -67,6 +67,13 @@
 //   - Hardware keys via pressesBegan/Ended (UIKey.keyCode + modifierFlags +
 //     characters → HardwareKeyState / Keysyms: layout-aware character when
 //     no Cmd/Ctrl/Opt is held, US table otherwise).
+//   - While a GameController keyboard is connected (GCKeyboardSource), every
+//     hardware key's down/up comes from GC as well and KeyArbiter merges the
+//     two (HardwareKeyboard.swift): GC decides which key and when (so ⌥←,
+//     ⌘→, ⌥⌫ that UIKit's text system swallows still reach the Mac), UIKit
+//     supplies the layout character for unmodified printable keys and stays
+//     the fallback. GC keys only count while this view (or the keyboard
+//     proxy) is first responder, as UIKit's would.
 //   - Auto-repeat: iPadOS sends no repeats, so the most recently pressed
 //     non-modifier key re-sends its key-down (no key-up between) after 500 ms,
 //     then every ~33 ms, as the reference forwards glfw.REPEAT (KeyRepeater).
@@ -166,6 +173,7 @@ final class RemoteInputView: UIView, UIPointerInteractionDelegate, UIGestureReco
             stopInertia()
             if input != nil { reloadPreferences() }     // session start
             updatePointerLock()
+            updateGCKeyboard()
         }
     }
 
@@ -215,6 +223,7 @@ final class RemoteInputView: UIView, UIPointerInteractionDelegate, UIGestureReco
         didSet {
             touchInterpreter.tapDelay = preferences.tapDelay.seconds
             touchInterpreter.longPressRightClick = preferences.longPressRightClick
+            if preferences.keyboardTester != oldValue.keyboardTester { updateKeyTester() }
         }
     }
     /// Where `preferences` are read from (injected by tests).
@@ -257,6 +266,14 @@ final class RemoteInputView: UIView, UIPointerInteractionDelegate, UIGestureReco
     private var inertiaLink: CADisplayLink?
     private var lastLayoutSize = CGSize.zero
     private var shake = ShakeDetector()
+    private let gcKeyboard = GCKeyboardSource()
+    /// Merges GameController and UIKit hardware key reports (HardwareKeyboard.swift).
+    private(set) lazy var keyArbiter: KeyArbiter = KeyArbiter(
+        schedule: schedule, now: { [weak self] in self?.now() ?? 0 },
+        emit: { [weak self] in self?.applyArbitrated($0) })
+    /// Settings → Input → Keyboard Tester: the last hardware key events.
+    let keyTesterLog = KeyTesterLog()
+    private let keyTesterLabel = UILabel()
     /// The last hardware pointer location (view points) for hover deltas.
     private var lastPointerLocation: CGPoint?
     private var trackpadPinchScale: CGFloat = 1
@@ -341,6 +358,18 @@ final class RemoteInputView: UIView, UIPointerInteractionDelegate, UIGestureReco
         keyboardProxy.onResign = { [weak self] in self?.softwareKeyboardResigned() }
         keyboardProxy.accessory = keyboardAccessory
         addSubview(keyboardProxy)
+
+        gcKeyboard.onKey = { [weak self] usage, pressed in self?.gcKey(usage, pressed: pressed) }
+        gcKeyboard.onAvailability = { [weak self] on in self?.gcKeyboardAvailability(on) }
+
+        keyTesterLabel.numberOfLines = 0
+        keyTesterLabel.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
+        keyTesterLabel.textColor = .white
+        keyTesterLabel.backgroundColor = UIColor.black.withAlphaComponent(0.65)
+        keyTesterLabel.isUserInteractionEnabled = false
+        keyTesterLabel.isHidden = true
+        keyTesterLabel.accessibilityLabel = "Keyboard Tester"
+        addSubview(keyTesterLabel)
     }
 
     private var scrollRecognizers: Set<ObjectIdentifier> = []
@@ -361,11 +390,13 @@ final class RemoteInputView: UIView, UIPointerInteractionDelegate, UIGestureReco
         super.didMoveToWindow()
         if window != nil, !softwareKeyboardVisible { becomeFirstResponder() }
         updatePointerLock()
+        updateGCKeyboard()
     }
 
     override func layoutSubviews() {
         super.layoutSubviews()
         // Rotation / resize: the zoomed region no longer means the same thing.
+        if !keyTesterLabel.isHidden { layoutKeyTester() }
         if bounds.size != lastLayoutSize {
             lastLayoutSize = bounds.size
             viewport.update { $0.reset() }
@@ -528,7 +559,12 @@ final class RemoteInputView: UIView, UIPointerInteractionDelegate, UIGestureReco
             $0.input == sender.input && $0.flags == sender.modifierFlags
         }) else { return }
         Log.input.debug("forwarded key command \(chord.input) flags \(chord.flags.rawValue)")
-        forward(chord)
+        if keyArbiter.gcActive {
+            // GC delivers the real key down/up; this only claims the chord from iPadOS.
+            keyArbiter.uikitTap(chord.usage, flags: chord.flags)
+        } else {
+            forward(chord)
+        }
     }
 
     /// Sends a claimed chord as one tap of its key. The modifiers its flags
@@ -1191,12 +1227,120 @@ final class RemoteInputView: UIView, UIPointerInteractionDelegate, UIGestureReco
         var rest = Set<UIPress>()
         for press in presses {
             guard let key = press.key else { rest.insert(press); continue }
-            let handled = down
-                ? keyDown(key.keyCode, modifiers: key.modifierFlags, characters: key.characters)
-                : keyUp(key.keyCode)
-            if !handled { rest.insert(press) }
+            if uikitKey(key.keyCode, down: down, modifiers: key.modifierFlags, characters: key.characters) == false {
+                rest.insert(press)
+            }
         }
         return rest
+    }
+
+    /// One UIKit hardware key event. With a GC keyboard it goes to the
+    /// arbiter (which decides whether it is sent); without, straight to
+    /// keyDown/keyUp. False: not a key we map (passed on).
+    @discardableResult
+    func uikitKey(_ usage: UIKeyboardHIDUsage, down: Bool, modifiers flags: UIKeyModifierFlags,
+                  characters: String) -> Bool {
+        #if DEBUG
+        Log.input.debug("key UIKit \(down ? "down" : "up") usage 0x\(String(usage.rawValue, radix: 16)) "
+                        + "flags 0x\(String(flags.rawValue, radix: 16)) gc \(keyArbiter.gcActive)")
+        #endif
+        guard keyArbiter.gcActive else {
+            if !down { noteKeyTester(source: "UIKit", down: false, usage: usage, flags: flags, keysym: keys.keysym(of: usage)) }
+            let handled = down ? keyDown(usage, modifiers: flags, characters: characters) : keyUp(usage)
+            if down, handled { noteKeyTester(source: "UIKit", down: true, usage: usage, flags: flags, keysym: keys.keysym(of: usage)) }
+            return handled
+        }
+        guard Self.isMappable(usage, characters: characters), !Self.isMenuShortcut(usage, modifiers: flags)
+        else { return false }
+        keyArbiter.uikit(usage, down: down, flags: flags, characters: characters)
+        return true
+    }
+
+    /// Keys the hardware path can send: modifiers, table keys, or a key
+    /// whose layout character is printable.
+    static func isMappable(_ usage: UIKeyboardHIDUsage, characters: String) -> Bool {
+        Keysyms.isModifier(usage) || Keysyms.keysym(for: usage, shifted: false) != nil
+            || Keysyms.character(in: characters) != nil
+    }
+
+    // MARK: GameController keyboard
+
+    /// GC reports keys only while there is a session in a window.
+    private func updateGCKeyboard() {
+        gcKeyboard.enabled = window != nil && input != nil
+    }
+
+    func gcKeyboardAvailability(_ on: Bool) {
+        Log.input.info("hardware keyboard via GameController \(on ? "on" : "off")")
+        keyArbiter.gcActive = on
+        if !on { releaseHeldKeys() }             // nothing GC held may stick
+    }
+
+    /// GC keys count only where UIKit's would: this view or the keyboard
+    /// proxy has focus in the key window (a text field elsewhere keeps its
+    /// keys). Key-ups always pass, so nothing sticks.
+    private var acceptsHardwareKeys: Bool {
+        guard let window, window.isKeyWindow else { return false }
+        return isFirstResponder || keyboardProxy.isFirstResponder
+    }
+
+    /// A GCKeyboard key changed (the seam tests drive).
+    func gcKey(_ usage: UIKeyboardHIDUsage, pressed: Bool, force: Bool = false) {
+        #if DEBUG
+        Log.input.debug("key GC \(pressed ? "down" : "up") usage 0x\(String(usage.rawValue, radix: 16))")
+        #endif
+        guard input != nil, keyArbiter.gcActive, !pressed || force || acceptsHardwareKeys else { return }
+        keyArbiter.gc(usage, pressed: pressed)
+    }
+
+    /// Sends what the arbiter decided.
+    private func applyArbitrated(_ k: ArbitratedKey) {
+        let source = k.source == .gc ? (k.uikitSaw ? "GC+UIKit" : "GC") : "UIKit"
+        switch k.kind {
+        case .down:
+            keyDown(k.usage, modifiers: k.flags, characters: k.characters)
+            noteKeyTester(source: source, down: true, usage: k.usage, flags: k.flags, keysym: keys.keysym(of: k.usage))
+        case .up:
+            noteKeyTester(source: source, down: false, usage: k.usage, flags: k.flags, keysym: keys.keysym(of: k.usage))
+            keyUp(k.usage)
+        case .tap:
+            guard keyDown(k.usage, modifiers: k.flags, characters: k.characters) else { return }
+            noteKeyTester(source: source, down: true, usage: k.usage, flags: k.flags, keysym: keys.keysym(of: k.usage))
+            keyUp(k.usage)
+        }
+    }
+
+    // MARK: keyboard tester
+
+    private func noteKeyTester(source: String, down: Bool, usage: UIKeyboardHIDUsage, flags: UIKeyModifierFlags,
+                               keysym: UInt32?) {
+        let ks = keysym.map { "0x" + String($0, radix: 16) } ?? "–"
+        #if DEBUG
+        Log.input.debug("key sent \(source) \(down ? "down" : "up") usage 0x\(String(usage.rawValue, radix: 16)) "
+                        + "flags 0x\(String(flags.rawValue, radix: 16)) keysym \(ks)")
+        #endif
+        guard preferences.keyboardTester else { return }
+        let line = "\(source.padding(toLength: 8, withPad: " ", startingAt: 0)) \(down ? "↓" : "↑") "
+            + "0x\(String(format: "%02x", usage.rawValue)) \(KeyTesterLog.symbols(flags).padding(toLength: 4, withPad: " ", startingAt: 0)) → \(ks)"
+        keyTesterLog.append(line)
+        keyTesterLabel.text = keyTesterLog.lines.joined(separator: "\n")
+        layoutKeyTester()
+    }
+
+    private func updateKeyTester() {
+        keyTesterLabel.isHidden = !preferences.keyboardTester
+        if !preferences.keyboardTester { keyTesterLog.clear(); keyTesterLabel.text = nil }
+        else {
+            keyTesterLabel.text = "Keyboard Tester — press keys"
+            layoutKeyTester()
+        }
+    }
+
+    private func layoutKeyTester() {
+        let maxW = min(360, bounds.width - 32)
+        let size = keyTesterLabel.sizeThatFits(CGSize(width: maxW, height: .greatestFiniteMagnitude))
+        keyTesterLabel.frame = CGRect(x: 16, y: safeAreaInsets.top + 16, width: min(maxW, size.width + 8),
+                                      height: size.height + 8)
     }
 
     /// A hardware key went down; false if it has no keysym (passed on).
@@ -1258,6 +1402,7 @@ final class RemoteInputView: UIView, UIPointerInteractionDelegate, UIGestureReco
     }
 
     private func releaseHeldKeys() {
+        keyArbiter.reset()
         repeater.cancel()
         lastSoftDelete = nil
         for ks in keys.releaseAll() where modifierHolds[ks] == nil { input?.key(down: false, keysym: ks) }
@@ -1281,6 +1426,8 @@ final class RemoteInputView: UIView, UIPointerInteractionDelegate, UIGestureReco
     /// character ("a" → "A"). Newline/tab are Return/Tab (with the modifiers).
     func typeText(_ text: String) {
         guard let input else { return }
+        // A hardware key the GC path already sent, echoed by the text system.
+        if keyArbiter.recentGCDown({ !Keysyms.isModifier($0) && $0 != .keyboardDeleteOrBackspace }) { return }
         for ch in text {
             let state = sticky
             let commandLike = state.commandLikeActive
@@ -1310,6 +1457,7 @@ final class RemoteInputView: UIView, UIPointerInteractionDelegate, UIGestureReco
     /// so latched ⌥ + held Delete deletes word after word.
     func softDelete() {
         guard input != nil else { return }
+        if keyArbiter.recentGCDown({ $0 == .keyboardDeleteOrBackspace }) { return }    // the GC path sent it
         let t = now()
         var carried: [UInt32] = []
         var fn = sticky.fnActive

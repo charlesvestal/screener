@@ -244,6 +244,9 @@ struct HardwareKeyState {
     /// The key is down (its key-up hasn't been seen).
     func isHeld(_ usage: UIKeyboardHIDUsage) -> Bool { held[usage.rawValue] != nil }
 
+    /// The keysym the key went down as (nil if it isn't down).
+    func keysym(of usage: UIKeyboardHIDUsage) -> UInt32? { held[usage.rawValue] }
+
     /// The modifier keys (Shift/Control/Option/Command, either side; not Caps
     /// Lock) currently down.
     var heldModifierUsages: [UIKeyboardHIDUsage] {

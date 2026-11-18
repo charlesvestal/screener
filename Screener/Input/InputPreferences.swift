@@ -14,6 +14,8 @@
 // - Long-press to right-click ("input.longPressRightClick", default on):
 //   trackpad mode, one finger held still for TouchInterpreter.Tuning.longPress
 //   is a right click (with a haptic) — TouchInterpreter.longPressRightClick.
+// - Keyboard Tester ("input.keyboardTester", default off): a diagnostic
+//   overlay of the last hardware key events (HardwareKeyboard.swift).
 import Foundation
 
 enum TapClickDelay: String, CaseIterable, Sendable {
@@ -64,10 +66,12 @@ enum ScrollDirection: String, CaseIterable, Sendable {
 struct InputPreferences: Equatable, Sendable {
     static let longPressRightClickKey = "input.longPressRightClick"
     static let longPressRightClickDefault = true
+    static let keyboardTesterKey = "input.keyboardTester"
 
     var tapDelay = TapClickDelay.default
     var scrollDirection = ScrollDirection.default
     var longPressRightClick = InputPreferences.longPressRightClickDefault
+    var keyboardTester = false
 
     /// The stored preferences (unknown / missing values → defaults).
     static func load(_ d: UserDefaults = .standard) -> InputPreferences {
@@ -81,6 +85,7 @@ struct InputPreferences: Equatable, Sendable {
         if d.object(forKey: longPressRightClickKey) != nil {
             p.longPressRightClick = d.bool(forKey: longPressRightClickKey)
         }
+        p.keyboardTester = d.bool(forKey: keyboardTesterKey)
         return p
     }
 }

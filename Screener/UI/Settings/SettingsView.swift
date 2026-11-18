@@ -18,6 +18,7 @@ struct SettingsView: View {
     @AppStorage(ScrollDirection.defaultsKey) private var scrollDirectionRaw = ScrollDirection.default.rawValue
     @AppStorage(InputPreferences.longPressRightClickKey) private var longPressRightClick =
         InputPreferences.longPressRightClickDefault
+    @AppStorage(InputPreferences.keyboardTesterKey) private var keyboardTester = false
     @AppStorage(ResumeOnLaunch.enabledKey) private var reconnectOnLaunch = ResumeOnLaunch.enabledDefault
     @State private var showAcknowledgements = false
     @State private var showHelp = false
@@ -65,6 +66,7 @@ struct SettingsView: View {
                         }
                     }
                     Toggle("Long-Press to Right-Click", isOn: $longPressRightClick)
+                    Toggle("Keyboard Tester", isOn: $keyboardTester)
                     Toggle("Visual Feedback", isOn: $visualFeedback)
                 } header: {
                     Text("Input")
@@ -74,7 +76,8 @@ struct SettingsView: View {
                          + "Tap to Click Delay is how long a tap waits for a double tap or tap-and-drag: Fast "
                          + "clicks sooner, Relaxed gives more time. Long-Press to Right-Click: in Trackpad mode, "
                          + "hold one finger still to right-click. Shake the pointer to find it. "
-                         + "Visual Feedback shows where touches and clicks land.")
+                         + "Visual Feedback shows where touches and clicks land. Keyboard Tester lists the last "
+                         + "hardware key events on screen during a session (for checking a keyboard).")
                 }
 
                 Section {
