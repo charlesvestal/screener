@@ -26,6 +26,9 @@ final class HostEditorModel {
     /// The Bonjour service this host is tied to (see SavedHost.bonjourName).
     private(set) var bonjourName: String?
     private var originalHost = ""
+    /// Edit mode only: the password loaded from the Keychain, to detect a
+    /// typed change (see `passwordChanged`).
+    private var originalPassword = ""
 
     init() { mode = .new }
 
@@ -45,10 +48,14 @@ final class HostEditorModel {
         username = saved.username
         bonjourName = saved.bonjourName
         password = (try? passwords.password(for: saved.id)) ?? ""
+        originalPassword = password
     }
 
     var isEditing: Bool { if case .edit = mode { true } else { false } }
     var discoveredService: DiscoveredHost? { if case .discovered(let d) = mode { d } else { nil } }
+    /// Edit mode only: the typed password differs from the one loaded from
+    /// the Keychain, so it hasn't been verified by a successful connect yet.
+    var passwordChanged: Bool { isEditing && password != originalPassword }
 
     var trimmedHost: String { host.trimmingCharacters(in: .whitespacesAndNewlines) }
     var portValue: UInt16? {
@@ -67,11 +74,17 @@ final class HostEditorModel {
     var canConnect: Bool { canSave && !username.isEmpty }
 
     /// Writes the form. Edit mode updates `existing`; new / discovered mode
-    /// inserts a host when `saveToHosts` is on (else returns nil). The
-    /// password goes only to `passwords`; an empty password field removes
-    /// a stored one in edit mode.
+    /// inserts a host when `saveToHosts` is on (else returns nil).
+    ///
+    /// The password goes only to `passwords`, and only when `persistPassword`
+    /// is true — callers pass false for a typed password that hasn't been
+    /// verified by a successful connect yet, so a mistyped password never
+    /// overwrites a working one (host entry and other fields still save).
+    /// An empty password field always removes a stored one, in either mode:
+    /// clearing it is an explicit, immediate choice, not an unverified typo.
     @discardableResult
-    func save(existing: SavedHost? = nil, context: ModelContext, passwords: any PasswordStore) throws -> SavedHost? {
+    func save(existing: SavedHost? = nil, context: ModelContext, passwords: any PasswordStore,
+              persistPassword: Bool = true) throws -> SavedHost? {
         guard let portValue, canSave else { return nil }
         let saved: SavedHost
         if isEditing {
@@ -87,7 +100,7 @@ final class HostEditorModel {
             saved.username = username
             if password.isEmpty {
                 try passwords.deletePassword(for: saved.id)
-            } else {
+            } else if persistPassword {
                 try passwords.setPassword(password, for: saved.id)
             }
         } else {
@@ -95,7 +108,7 @@ final class HostEditorModel {
             saved = SavedHost(name: effectiveName, host: trimmedHost, port: Int(portValue), username: username,
                               sortOrder: HostStore.nextSortOrder(context), bonjourName: bonjourName)
             context.insert(saved)
-            if !password.isEmpty { try passwords.setPassword(password, for: saved.id) }
+            if !password.isEmpty, persistPassword { try passwords.setPassword(password, for: saved.id) }
         }
         try context.save()
         Log.hosts.info("\(isEditing ? "updated" : "saved") host \(saved.id.uuidString)")

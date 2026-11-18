@@ -129,16 +129,50 @@ struct ConnectSheet: View {
         }
     }
 
+    /// Edit mode's "Save". A password left as typed (not yet verified) is
+    /// tested with a connect before it's written to the Keychain, so a
+    /// mistyped password never overwrites a working one — the old stored
+    /// password is kept until a connect with the new one succeeds. Other
+    /// field edits (name, address, username) save immediately either way.
     private func save() {
-        do {
-            try editor.save(existing: existing, context: context, passwords: connector.passwords)
-            dismiss()
-        } catch {
-            Log.hosts.error("save host failed: \(error)")
-            saveError = "Couldn't save this Mac."
+        guard let existing else { return }
+        saveError = nil
+        if editor.passwordChanged, !editor.password.isEmpty, editor.canConnect {
+            let editor = editor, connector = connector, context = context
+            Task {
+                let r = await connector.connect(host: editor.trimmedHost, port: editor.portValue ?? 5900,
+                                                username: editor.username, password: editor.password)
+                do {
+                    try editor.save(existing: existing, context: context, passwords: connector.passwords,
+                                    persistPassword: r.connected)
+                } catch {
+                    Log.hosts.error("save host failed: \(error)")
+                    saveError = "Couldn't save this Mac."
+                    return
+                }
+                if r.connected {
+                    connector.markConnected(existing, resolvedAddress: r.resolvedAddress, username: editor.username,
+                                            rememberPassword: nil, context: context)
+                    dismiss()
+                } else {
+                    saveError = connector.error ?? "Couldn't connect with that password. The old password was kept."
+                }
+            }
+        } else {
+            do {
+                try editor.save(existing: existing, context: context, passwords: connector.passwords)
+                dismiss()
+            } catch {
+                Log.hosts.error("save host failed: \(error)")
+                saveError = "Couldn't save this Mac."
+            }
         }
     }
 
+    /// "+" / discovered mode's "Connect". The host (and, if typed, its
+    /// password) is saved to Hosts only after the connect actually succeeds —
+    /// a mistyped password must never land in the Keychain, and a failed
+    /// attempt leaves no host entry behind at all.
     private func connect() {
         guard let port = editor.portValue else { return }
         saveError = nil
@@ -156,17 +190,16 @@ struct ConnectSheet: View {
                     return
                 }
             }
-            var saved: SavedHost?
+            let r = await connector.connect(host: editor.trimmedHost, port: editor.portValue ?? port,
+                                            username: editor.username, password: editor.password)
+            guard r.connected else { return }
             do {
-                saved = try editor.save(context: context, passwords: connector.passwords)
+                if let saved = try editor.save(context: context, passwords: connector.passwords) {
+                    connector.markConnected(saved, resolvedAddress: r.resolvedAddress, rememberPassword: nil, context: context)
+                }
             } catch {
                 Log.hosts.error("save host failed: \(error)")
                 saveError = "Couldn't save this Mac."
-            }
-            let r = await connector.connect(host: editor.trimmedHost, port: editor.portValue ?? port,
-                                            username: editor.username, password: editor.password)
-            if r.connected, let saved {
-                connector.markConnected(saved, resolvedAddress: r.resolvedAddress, rememberPassword: nil, context: context)
             }
         }
     }

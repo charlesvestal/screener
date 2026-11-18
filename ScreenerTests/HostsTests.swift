@@ -210,6 +210,38 @@ final class HostEditorModelTests: XCTestCase {
         XCTAssertNil(try passwords.password(for: h.id))
     }
 
+    func testPersistPasswordFalseSavesHostButNotAnUnverifiedPassword() throws {
+        // The "+" flow: Connect saves the host only after it succeeds, and a
+        // failed attempt (persistPassword: false) must leave no password in
+        // the store — a mistyped password is never persisted (password save fix).
+        let e = HostEditorModel()
+        e.host = "1.2.3.4"; e.username = "u"; e.password = "mistyped"
+        let saved = try XCTUnwrap(try e.save(context: context, passwords: passwords, persistPassword: false))
+        XCTAssertNil(try passwords.password(for: saved.id))
+        XCTAssertEqual(try context.fetch(FetchDescriptor<SavedHost>()).count, 1)   // the host itself still exists
+    }
+
+    func testEditKeepsOldPasswordUntilAVerifiedConnect() throws {
+        let h = SavedHost(name: "Studio", host: "10.0.0.2", username: "alex")
+        context.insert(h)
+        try passwords.setPassword("old", for: h.id)
+        let e = HostEditorModel(editing: h, passwords: passwords)
+        XCTAssertFalse(e.passwordChanged)
+        e.password = "mistyped"
+        XCTAssertTrue(e.passwordChanged)
+
+        // A failed connect (persistPassword: false) keeps the old password,
+        // but still saves other field edits made alongside it.
+        e.name = "Studio Mac"
+        try e.save(existing: h, context: context, passwords: passwords, persistPassword: false)
+        XCTAssertEqual(try passwords.password(for: h.id), "old")
+        XCTAssertEqual(h.name, "Studio Mac")
+
+        // A verified connect (persistPassword: true) commits the new one.
+        try e.save(existing: h, context: context, passwords: passwords, persistPassword: true)
+        XCTAssertEqual(try passwords.password(for: h.id), "mistyped")
+    }
+
     func testDiscoveredHostSavesBonjourName() throws {
         let d = DiscoveredHost(name: "Alex’s MacBook Pro",
                                endpoint: .service(name: "Alex’s MacBook Pro", type: "_rfb._tcp", domain: "local.", interface: nil))
