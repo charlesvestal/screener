@@ -214,6 +214,13 @@ final class ModifierKeyPathsTests: XCTestCase {
         XCTAssertEqual(got, wrapped([cmd], 0x77) + wrapped([shift, cmd], 0x7a))
     }
 
+    func testKeyCommandsAreOnlyClaimedWithAController() {
+        let r = make()
+        XCTAssertGreaterThan(r.view.keyCommands?.count ?? 0, 1)
+        r.view.input = nil
+        XCTAssertEqual(r.view.keyCommands?.map(\.input), ["m"])          // just the menu toggle
+    }
+
     func testForwardedChordsDoNotShadowTheMenuShortcutOrPlainKeys() {
         for c in RemoteInputView.forwardedChords {
             XCTAssertFalse(c.flags.isEmpty, c.input)

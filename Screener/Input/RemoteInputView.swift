@@ -356,7 +356,8 @@ final class RemoteInputView: UIView, UIPointerInteractionDelegate, UIGestureReco
         let toggle = UIKeyCommand(title: "Show/Hide Control Menu", action: #selector(toggleControlMenu(_:)),
                                   input: "m", modifierFlags: [.command, .alternate])
         toggle.wantsPriorityOverSystemBehavior = true
-        return [toggle] + Self.forwardedKeyCommands
+        // Claim chords from iPadOS only while there is a Mac to send them to.
+        return input == nil ? [toggle] : [toggle] + Self.forwardedKeyCommands
     }
 
     /// A hardware chord claimed from iPadOS and forwarded to the Mac.
