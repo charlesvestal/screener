@@ -105,6 +105,64 @@ private final class Sender {
     }
 }
 
+// MARK: - streams with real reference picture sets (reference recovery)
+
+/// An SPS/PPS/slice set whose RPS the assembler's HEVCReferenceTracker can
+/// follow: log2_max_poc_lsb 8 and three SPS RPS sets — 0: {-4} (the tile's
+/// previous picture), 1: {-1} (the previous picture: another tile), 2: {-4, -8}.
+private enum RPSStream {
+    static let sps: Data = {
+        var w = BitWriter()
+        w.put(0, 4); w.put(0, 3); w.put(1, 1)
+        w.put(0, 2); w.put(0, 1); w.put(1, 5); w.put(0x6000_0000, 32); w.put(0, 48); w.put(93, 8)
+        w.ue(0); w.ue(1); w.ue(64); w.ue(64); w.put(0, 1)  // sps id, 4:2:0, 64x64, no conformance window
+        w.ue(0); w.ue(0); w.ue(4)                          // bit depths, log2_max_poc_lsb_minus4 = 4
+        w.put(1, 1); w.ue(1); w.ue(0); w.ue(0)             // sub-layer ordering
+        w.ue(0); w.ue(1); w.ue(0); w.ue(1); w.ue(0); w.ue(0)
+        w.put(0, 1); w.put(0, 1); w.put(0, 1); w.put(0, 1) // scaling, amp, sao, pcm
+        w.ue(3)
+        w.ue(1); w.ue(0); w.ue(3); w.put(1, 1)             // set 0: {-4}
+        w.put(0, 1); w.ue(1); w.ue(0); w.ue(0); w.put(1, 1) // set 1: {-1}
+        w.put(0, 1); w.ue(2); w.ue(0); w.ue(3); w.put(1, 1); w.ue(3); w.put(1, 1)  // set 2: {-4, -8}
+        w.put(0, 1); w.put(0, 1); w.put(0, 1); w.put(0, 1) // long-term, tmvp, strong intra, vui
+        var nal = Data([0x42, 0x01]); nal.append(w.bytesWithEmulationPrevention())
+        return nal
+    }()
+    static let pps: Data = {
+        var w = BitWriter()
+        w.ue(0); w.ue(0); w.put(0, 1); w.put(0, 1); w.put(0, 3); w.put(0, 9)
+        var nal = Data([0x44, 0x01]); nal.append(w.bytesWithEmulationPrevention())
+        return nal
+    }()
+
+    /// The first slice of a picture: IDR (type 19) or a P slice with POC
+    /// `poc` (mod 256) using SPS RPS set `set`.
+    static func slice(idr: Bool = false, poc: Int = 0, set: Int = 0) -> Data {
+        var w = BitWriter()
+        w.put(1, 1)                                         // first_slice_segment_in_pic_flag
+        if idr { w.put(0, 1) }                              // no_output_of_prior_pics_flag
+        w.ue(0)                                             // pps id
+        w.ue(idr ? 2 : 1)                                   // slice_type I / P
+        if !idr {
+            w.put(UInt64(poc & 0xFF), 8)
+            w.put(1, 1); w.put(UInt64(set), 2)               // RPS from the SPS, 2-bit index
+        }
+        w.put(0x5A5A_5A5A, 32)                              // stand-in slice data
+        var nal = Data([(idr ? 19 : 1) << 1, 0x01]); nal.append(w.bytesWithEmulationPrevention())
+        return nal
+    }
+}
+
+private extension Sender {
+    /// One picture carrying `nal` as an FU-free single NAL (with parameter sets first when `params`).
+    func picture(tile: Int, ts: UInt32, don: UInt16, nal: Data, params: Bool = false) -> [MediaPacket] {
+        var payloads: [Data] = []
+        if params { payloads.append(Self.apPayload(don: don, [Self.vps, RPSStream.sps, RPSStream.pps])) }
+        payloads.append(Self.singlePayload(nal, don: don))
+        return payloads.enumerated().map { i, p in packet(tile: tile, ts: ts, marker: i == payloads.count - 1, p) }
+    }
+}
+
 private extension AssemblerOutput {
     var au: AccessUnit? { if case .accessUnit(let a) = self { a } else { nil } }
     var keyframeSSRC: UInt32? { if case .needKeyframe(let s) = self { s } else { nil } }
@@ -805,6 +863,104 @@ final class HEVCAssemblerTests: XCTestCase {
         XCTAssertEqual(feedTiles(a, s, ts: 3000, [(2, 6), (1, 5)]).compactMap(\.au).map(\.don), [5, 6])
     }
 
+    // MARK: - reference recovery
+
+    /// IDR (POC 0) on tile 0, then frames of four tiles: POC 4f + tile.
+    /// `sets[tile]` picks each tile's RPS (default: its own previous picture).
+    private func rpsWarm(_ config: HEVCAssembler.Config = .init()) -> (HEVCAssembler, Sender) {
+        let a = HEVCAssembler(tileSSRCs: ssrcs, config: config)
+        let s = Sender(ssrcs)
+        var out = feed(a, s.picture(tile: 0, ts: 1000, don: 0, nal: RPSStream.slice(idr: true), params: true))
+        // Tiles 1–3 of frame 0 reference the picture before them (POC 0 for tile 1, ...).
+        for t in 1...3 { out += feed(a, s.picture(tile: t, ts: 1000, don: UInt16(t), nal: RPSStream.slice(poc: t, set: 1))) }
+        XCTAssertEqual(out.compactMap(\.au).count, 4)
+        XCTAssertTrue(out.compactMap(\.keyframeSSRC).isEmpty)
+        return (a, s)
+    }
+
+    /// Frame `f` (≥ 1): tile t's picture is POC 4f + t, DON 4f + t.
+    private func rpsFrame(_ a: HEVCAssembler, _ s: Sender, frame f: Int, tiles: [Int] = [0, 1, 2, 3],
+                          sets: [Int: Int] = [:]) -> [AssemblerOutput] {
+        tiles.flatMap { t in
+            feed(a, s.picture(tile: t, ts: UInt32(1000 + 400 * f), don: UInt16(4 * f + t),
+                              nal: RPSStream.slice(poc: 4 * f + t, set: sets[t] ?? 0)))
+        }
+    }
+
+    func testReferenceTrackerParsesTheSyntheticStream() throws {
+        let p = try XCTUnwrap(HEVCRPSParameters(sps: RPSStream.sps, pps: RPSStream.pps))
+        XCTAssertEqual(p.log2MaxPOCLsb, 8)
+        XCTAssertEqual(p.shortTermSets.map { $0.negative.map(\.delta) }, [[-4], [-1], [-4, -8]])
+        let r = try XCTUnwrap(HEVCPictureRefs(slice: RPSStream.slice(poc: 9, set: 2), params: p))
+        XCTAssertEqual(r.pocLsb, 9)
+        XCTAssertEqual(r.usedDeltas, [-4, -8])
+        XCTAssertNil(HEVCRPSParameters(sps: Sender.sps, pps: Sender.pps), "a truncated SPS gives no opinion")
+    }
+
+    /// A lost picture that no later picture references costs nothing: the
+    /// tile's next picture decodes, so no keyframe is requested.
+    func testALossThatBreaksNothingNeedsNoKeyframe() {
+        let (a, s) = rpsWarm()
+        _ = rpsFrame(a, s, frame: 1)
+        _ = rpsFrame(a, s, frame: 2, tiles: [0, 1])
+        s.lose(tile: 2)                                                   // POC 10 lost
+        _ = rpsFrame(a, s, frame: 2, tiles: [3])
+        // Frame 3: tile 2 predicts from tile 1's picture (POC 13), not from the lost 10.
+        let out = rpsFrame(a, s, frame: 3, sets: [2: 1])
+        XCTAssertEqual(out.compactMap(\.au).map(\.don), [11, 12, 13, 14, 15], "11 waited behind the hole")
+        XCTAssertTrue(out.compactMap(\.keyframeSSRC).isEmpty, "no keyframe for a loss nothing depends on")
+        XCTAssertEqual(a.stats.lossesRecoveredByReferences, 1)
+        XCTAssertTrue(a.tilesAwaitingIDR.isEmpty)
+        XCTAssertTrue(a.tick(now: s.now.advanced(by: .seconds(1))).compactMap(\.keyframeSSRC).isEmpty)
+    }
+
+    /// A picture that needs the lost one is dropped — on any tile — and a
+    /// keyframe is requested at once; the IDR restores everything.
+    func testABrokenReferenceDropsThePictureOnEveryTileAndAsksForAKeyframe() {
+        let (a, s) = rpsWarm()
+        _ = rpsFrame(a, s, frame: 1)
+        _ = rpsFrame(a, s, frame: 2, tiles: [0, 1])
+        s.lose(tile: 2)                                                   // POC 10 lost
+        _ = rpsFrame(a, s, frame: 2, tiles: [3])
+        // Tile 2 references 10 (lost); tile 3 references tile 2's 14 (broken).
+        let out = rpsFrame(a, s, frame: 3, sets: [3: 1])
+        XCTAssertEqual(out.compactMap(\.au).map(\.don), [11, 12, 13])
+        XCTAssertEqual(Set(out.compactMap(\.keyframeSSRC)), [ssrcs[0], ssrcs[2], ssrcs[3]])
+        XCTAssertEqual(a.stats.brokenPictures, 2)
+        XCTAssertEqual(a.tilesAwaitingIDR, [2, 3])
+        let idr = feed(a, s.picture(tile: 0, ts: 3000, don: 16, nal: RPSStream.slice(idr: true)))
+        XCTAssertEqual(idr.compactMap(\.au).map(\.isIDR), [true])
+        XCTAssertTrue(a.tilesAwaitingIDR.isEmpty)
+    }
+
+    /// A tile that lost a picture and then gets nothing decodable asks for a
+    /// keyframe after `lossRecoveryWait`.
+    func testALossWithNoRecoveringPictureAsksForAKeyframeAfterTheWait() {
+        let (a, s) = rpsWarm()
+        _ = rpsFrame(a, s, frame: 1)
+        s.lose(tile: 2)                                                   // POC 10 lost
+        let out = rpsFrame(a, s, frame: 2, tiles: [0, 1, 3])
+        XCTAssertTrue(out.compactMap(\.keyframeSSRC).isEmpty)
+        _ = a.tick(now: s.now.advanced(by: .milliseconds(100)))           // DON hole expires: tile 2 waits
+        XCTAssertEqual(a.tilesAwaitingIDR, [2])
+        XCTAssertTrue(a.tick(now: s.now.advanced(by: .milliseconds(200))).compactMap(\.keyframeSSRC).isEmpty)
+        let late = a.tick(now: s.now.advanced(by: .milliseconds(500)))
+        XCTAssertEqual(Set(late.compactMap(\.keyframeSSRC)), [ssrcs[0], ssrcs[2]])
+    }
+
+    /// With reference recovery off, every loss asks for a keyframe and holds the tile for the IDR.
+    func testReferenceRecoveryOffKeepsIRAPGating() {
+        var c = HEVCAssembler.Config(); c.referenceRecovery = false
+        let (a, s) = rpsWarm(c)
+        _ = rpsFrame(a, s, frame: 1)
+        _ = rpsFrame(a, s, frame: 2, tiles: [0, 1])
+        s.lose(tile: 2)
+        _ = rpsFrame(a, s, frame: 2, tiles: [3])
+        let out = rpsFrame(a, s, frame: 3, sets: [2: 1])
+        XCTAssertFalse(out.compactMap(\.keyframeSSRC).isEmpty)
+        XCTAssertEqual(out.compactMap(\.au).map(\.don), [11, 12, 13, 15])
+    }
+
     // MARK: - replay of a real capture (local only)
 
     /// Replays a DEBUG capture (VideoCaptureFile) through the assembler and
@@ -819,7 +975,9 @@ final class HEVCAssemblerTests: XCTestCase {
         let records = try VideoCaptureFile.read(URL(fileURLWithPath: path))
         let base = ContinuousClock.now
         let group = Array(Set(records.map(\.ssrc))).sorted()
-        let a = HEVCAssembler(tileSSRCs: group)
+        var config = HEVCAssembler.Config()
+        config.referenceRecovery = ProcessInfo.processInfo.environment["SCREENER_REF_RECOVERY"] != "0"
+        let a = HEVCAssembler(tileSSRCs: group, config: config)
         var aus: [AccessUnit] = [], keyframes = 0, params: [Data] = [], notHEVC = false
         for r in records {
             for o in a.ingest(r.packet(base: base)) {

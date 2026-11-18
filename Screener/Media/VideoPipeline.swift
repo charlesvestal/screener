@@ -23,16 +23,19 @@
 //     under (late callbacks after a reset are dropped);
 //   * the ticker also commits a picture whose strips stopped coming
 //     (VideoFrameStore.flushStaged; strips are presented per picture);
-//   * LTR acks (session._on_frame_published → _send_ltr_ack): for every
-//     decoded tile-0 picture, its DON goes to `hooks.ackLTR` (MediaTransport
-//     sends it only when it changed). OFF by default, as on the reference's
-//     macOS path: vtdecode.py:93-96 leaves last_clean_donl all-None, so the
-//     reference's VideoToolbox decoder never acks (only its libav path does,
-//     hevc.py:448). Opt in with the environment variable SCREENER_LTR_ACK=1
-//     (devicectl: DEVICECTL_CHILD_SCREENER_LTR_ACK=1) for an A/B test;
-//     SCREENER_FB_ACKALL=1 acks every tile's picture as the native viewer
-//     does (one APP per marker). Both stay off: on 2026-11-18 the per-tile
-//     acks did not raise the bitrate and coincided with decode stalls;
+//   * LTR acks (session._on_frame_published → _send_ltr_ack): APP name 5
+//     carrying the RTP TIMESTAMP of a decoded picture (AVConference logs
+//     "Received APP_LTRP_ACK timestamp=%u" and matches it against the frames
+//     it sent; the reference sent the DON, which matches nothing). OFF by
+//     default: SCREENER_LTR_ACK=1 acks the newest tile-0 picture,
+//     SCREENER_FB_ACKALL=1 every tile's picture as the native viewer does
+//     (one APP per marker). On 2026-11-18 (simulator, induced loss) the host
+//     answered every FIR/PLI with an IDR with or without them — no LTR-based
+//     repair was seen — and the bitrate was the same;
+//   * loss recovery: HEVCAssembler's reference recovery (HEVCReferenceTracker)
+//     releases every picture whose references were decoded and asks for a
+//     keyframe only for a broken picture or a tile left without a decodable
+//     one; SCREENER_REF_RECOVERY=0 goes back to IRAP-only gating;
 //   * every 2 s: `video fps=… decode_ms=… tiles=[…] kbps=… au_avg=[…]
 //     au_max=[…] idr=… partial=… shown=… merged=… skips=… fills=… wait_ms=…
 //     ooo=… hold_ms=… pace_skips=… drawn=… age_ms=… rx_gap_max_ms=…
@@ -52,8 +55,8 @@ actor VideoPipeline {
         var requestKeyframe: @Sendable (UInt32) async -> Void
         var notePublished: @Sendable () async -> Void
         var onNotHEVC: @Sendable () async -> Void
-        /// Receives the DON of each decoded tile-0 picture when LTR acks are on.
-        var ackLTR: (@Sendable (UInt16) async -> Void)? = nil
+        /// LTR acks: (RTP timestamp of a decoded picture, ack every picture).
+        var ackLTR: (@Sendable (UInt32, Bool) async -> Void)? = nil
     }
 
     /// Which decoded pictures are acknowledged (APP name 5 + DON on P+1).
@@ -74,6 +77,17 @@ actor VideoPipeline {
     }
 
     static let ltrAckMode = LTRAckMode.fromEnvironment()
+
+    /// SCREENER_REF_RECOVERY=0: IRAP-only loss recovery (the reference's),
+    /// for A/B; SCREENER_LOSS_WAIT_MS: HEVCAssembler.Config.lossRecoveryWait.
+    static let assemblerConfig: HEVCAssembler.Config = {
+        let env = ProcessInfo.processInfo.environment
+        var c = HEVCAssembler.Config()
+        if env["SCREENER_REF_RECOVERY"] == "0" { c.referenceRecovery = false }
+        if let ms = env["SCREENER_LOSS_WAIT_MS"].flatMap(Int.init), ms > 0 { c.lossRecoveryWait = .milliseconds(ms) }
+        Log.video.info("video: loss recovery \(c.referenceRecovery ? "by references (keyframe after \(c.lossRecoveryWait) without a decodable picture)" : "IRAP-only")")
+        return c
+    }()
 
     nonisolated let store: VideoFrameStore
     private let hooks: Hooks
@@ -99,20 +113,21 @@ actor VideoPipeline {
         let epoch = store.currentEpoch
         let ackLTR = ltrAcks != .off ? hooks.ackLTR : nil
         let ackAll = ltrAcks == .allTiles
-        let lastDON = LatestDON()
-        if ackLTR != nil { Log.video.info("video: LTR acks ON (\(ackAll ? "every tile" : "tile-0") DON per decoded picture)") }
+        let lastTS = LatestTimestamp()
+        if ackLTR != nil { Log.video.info("video: LTR acks ON (RTP timestamp of \(ackAll ? "every tile" : "each tile-0") picture decoded)") }
         self.decoder = VideoDecoder { event in
             switch event {
             case .frame(let f):
                 store.publish(f, epoch: epoch)
                 if throttle.shouldNotify() { Task { await hooks.notePublished() } }
-                // Tasks may run out of order: each sends the newest DON at that moment.
-                if ackAll, let ackLTR {
-                    let don = f.don
-                    Task { await ackLTR(don) }
-                } else if f.tile == 0, let ackLTR {
-                    lastDON.set(f.don)
-                    Task { if let don = lastDON.get() { await ackLTR(don) } }
+                // Tasks may run out of order: each sends the newest timestamp at that moment.
+                if let ts = f.rtpTimestamp, let ackLTR {
+                    if ackAll {
+                        Task { await ackLTR(ts, true) }
+                    } else if f.tile == 0 {
+                        lastTS.set(ts)
+                        Task { if let ts = lastTS.get() { await ackLTR(ts, false) } }
+                    }
                 }
             case .error(let tile, let don, let status, let irap):
                 store.noteError()
@@ -161,7 +176,7 @@ actor VideoPipeline {
                     a.resetForNewGroup(tileSSRCs: group)
                 }
             } else {
-                assembler = HEVCAssembler(tileSSRCs: group)
+                assembler = HEVCAssembler(tileSSRCs: group, config: Self.assemblerConfig)
             }
             store.configure(tileCount: group.count)
         }
@@ -207,6 +222,18 @@ actor VideoPipeline {
                     await decodeFailed(tile: au.tile, don: au.don, status: status, isIRAP: au.isIDR)
                 }
             case .needKeyframe(let ssrc):
+                #if DEBUG
+                if let ms = Int(ProcessInfo.processInfo.environment["SCREENER_FIR_DELAY_MS"] ?? ""), ms > 0 {
+                    // Experiment: give the host `ms` to recover on its own (LTR) first.
+                    Task { [weak self] in
+                        try? await Task.sleep(for: .milliseconds(ms))
+                        guard let self, await self.stillWaiting() else { return }
+                        Log.video.info("video: FIR after \(ms) ms delay (ssrc \(String(format: "%08x", ssrc)))")
+                        await self.hooks.requestKeyframe(ssrc)
+                    }
+                    continue
+                }
+                #endif
                 await hooks.requestKeyframe(ssrc)
             case .notHEVC:
                 Log.video.error("video: the server chose H.264 (no HEVC parameter sets); Screener decodes HEVC only")
@@ -214,6 +241,8 @@ actor VideoPipeline {
             }
         }
     }
+
+    private func stillWaiting() -> Bool { !(assembler?.tilesAwaitingIDR.isEmpty ?? true) }
 
     /// A frame failed (from the output handler, or a synchronous submit error).
     func decodeFailed(tile: Int, don: UInt16, status: OSStatus, isIRAP: Bool) async {
@@ -321,12 +350,12 @@ private final class PublishThrottle: @unchecked Sendable {   // state behind `lo
     }
 }
 
-/// The newest decoded tile-0 DON (VideoToolbox thread → ack tasks).
-private final class LatestDON: @unchecked Sendable {   // `value` behind `lock`
+/// The newest decoded tile-0 RTP timestamp (VideoToolbox thread → ack tasks).
+private final class LatestTimestamp: @unchecked Sendable {   // `value` behind `lock`
     private let lock = NSLock()
-    private var value: UInt16?
-    func set(_ v: UInt16) { lock.withLock { value = v } }
-    func get() -> UInt16? { lock.withLock { value } }
+    private var value: UInt32?
+    func set(_ v: UInt32) { lock.withLock { value = v } }
+    func get() -> UInt32? { lock.withLock { value } }
 }
 
 private final class WeakBox<T: AnyObject>: @unchecked Sendable {   // set once, before use

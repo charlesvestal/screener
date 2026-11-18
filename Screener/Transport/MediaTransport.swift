@@ -641,22 +641,36 @@ actor MediaTransport {
         if let last = lastKeyframeRequest[ssrc], now - last < tuning.keyframeMinInterval { return false }
         lastKeyframeRequest[ssrc] = now
         let seq = UInt8(truncatingIfNeeded: tick)
-        let compound = RTCP.compoundWithRR(senderSSRC: sender,
-                                           payload: RTCP.fir(senderSSRC: sender, targetSSRC: ssrc, seq: seq)
-                                               + RTCP.pli(senderSSRC: sender, mediaSSRC: ssrc)
-                                               + RTCP.firLegacy(targetSSRC: ssrc))
+        var payload = Data()
+        let mode = Self.keyframeRequestMode
+        if mode.contains("fir") { payload += RTCP.fir(senderSSRC: sender, targetSSRC: ssrc, seq: seq) }
+        if mode.contains("pli") { payload += RTCP.pli(senderSSRC: sender, mediaSSRC: ssrc) }
+        if mode.contains("legacy") { payload += RTCP.firLegacy(targetSSRC: ssrc) }
+        let compound = RTCP.compoundWithRR(senderSSRC: sender, payload: payload)
         guard let wire = try? enc.protect(compound) else { return false }
         channel.send(wire)
         counters.keyframeRequestsSent += 1
         return true
     }
 
-    /// session._send_ltr_ack: APP LTR ack carrying the DONL, on the video port.
-    func sendLTRAck(donl: UInt32) {
-        guard donl != lastLTRAcked, let sender = activation?.ourVideoSSRC, let enc = rtcpEncryptor,
-              let channel = channels[.video],
-              let wire = try? enc.protect(RTCP.appLTR(senderSSRC: sender, ltrID: donl)) else { return }
-        lastLTRAcked = donl
+    /// SCREENER_KF_MODE (experiments): which messages a keyframe request
+    /// carries, e.g. "pli" or "fir+legacy"; default all three (reference).
+    static let keyframeRequestMode: String =
+        ProcessInfo.processInfo.environment["SCREENER_KF_MODE"] ?? "fir+pli+legacy"
+
+    /// APP name 5 "LTRP ACK" on the video port. The u32 is the RTP
+    /// TIMESTAMP of a decoded picture: AVConference's
+    /// VideoReceiver_ProcessRtcpLTRAck logs it as "Received APP_LTRP_ACK
+    /// timestamp=%u" and VideoTransmitter_ACKLTRFrame matches it against the
+    /// timestamps of the frames it sent (macOS 27 build). The reference
+    /// (session._send_ltr_ack) sent the DONL instead, which matches nothing.
+    /// `everyPicture` (native: one per tile picture) skips the
+    /// unchanged-value filter.
+    func sendLTRAck(timestamp: UInt32, everyPicture: Bool = false) {
+        guard everyPicture || timestamp != lastLTRAcked, let sender = activation?.ourVideoSSRC,
+              let enc = rtcpEncryptor, let channel = channels[.video],
+              let wire = try? enc.protect(RTCP.appLTR(senderSSRC: sender, ltrID: timestamp)) else { return }
+        lastLTRAcked = timestamp
         channel.send(wire)
         counters.ltrAcksSent += 1
     }
@@ -681,6 +695,9 @@ actor MediaTransport {
             handleRTCP(flow, data)
             return
         }
+        #if DEBUG
+        if flow == .video, dropTest.shouldDrop(now: clock.now, active: groupLocked) { return }
+        #endif
         let decryptor = flow == .video ? videoDecryptor : audioDecryptor
         guard let decryptor, let out = decryptor.decrypt(data) else {
             counters.authFailures += 1
@@ -728,6 +745,9 @@ actor MediaTransport {
     }
 
     private var burstLockScheduled = false
+    #if DEBUG
+    private var dropTest = DropTest.fromEnvironment()
+    #endif
 
     private func emitVideo(_ p: MediaPacket) {
         guard case .dropped = videoOut.yield(p) else { return }
@@ -1053,3 +1073,42 @@ private final class DropCounter: @unchecked Sendable {
     func increment() { lock.lock(); n += 1; lock.unlock() }
     var value: Int { lock.lock(); defer { lock.unlock() }; return n }
 }
+
+#if DEBUG
+/// SCREENER_DROP_TEST="<everyMs>:<count>" (DEBUG): once the SSRC group is
+/// locked, drop `count` consecutive video datagrams every `everyMs` — a
+/// repeatable loss burst for loss-recovery experiments.
+struct DropTest {
+    var every: Duration?
+    var count = 0
+    private var next: ContinuousClock.Instant?
+    private var remaining = 0
+    private(set) var dropped = 0
+
+    static func fromEnvironment(_ env: [String: String] = ProcessInfo.processInfo.environment) -> DropTest {
+        var t = DropTest()
+        if let v = env["SCREENER_DROP_TEST"] {
+            let parts = v.split(separator: ":").compactMap { Int($0) }
+            if parts.count == 2, parts[0] > 0, parts[1] > 0 {
+                t.every = .milliseconds(parts[0]); t.count = parts[1]
+                Log.media.info("DROP TEST: \(parts[1]) video datagrams every \(parts[0]) ms")
+            }
+        }
+        return t
+    }
+
+    mutating func shouldDrop(now: ContinuousClock.Instant, active: Bool) -> Bool {
+        guard let every, active else { return false }
+        if remaining > 0 { remaining -= 1; dropped += 1; return true }
+        guard let n = next else { next = now + every; return false }
+        if now >= n {
+            next = now + every
+            remaining = count - 1
+            dropped += 1
+            Log.media.info("DROP TEST: burst #\(dropped / max(1, count) + 1)")
+            return true
+        }
+        return false
+    }
+}
+#endif

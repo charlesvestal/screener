@@ -152,6 +152,15 @@ final class HEVCAssembler {
         /// Times DON ordering may come back on an IRAP after a run of late
         /// DONs switched it off.
         var donOrderingRestarts = 2
+        /// Reference-based recovery (HEVCReferenceTracker): after a loss,
+        /// release every picture whose used references were all decoded —
+        /// on any tile — and drop only the ones that need a lost picture.
+        /// A keyframe is requested when such a broken picture shows up, or
+        /// when a tile that lost a picture got no decodable one within
+        /// `lossRecoveryWait`. Off: IRAP-only gating (the reference), with a
+        /// keyframe request on every loss.
+        var referenceRecovery = true
+        var lossRecoveryWait: Duration = .milliseconds(300)
     }
 
     struct Stats: Equatable, Sendable {
@@ -175,6 +184,12 @@ final class HEVCAssembler {
         /// Decoder errors for pictures before the last IRAP (ignored).
         var staleDecodeErrors = 0
         var keyframeRequests = 0
+        /// Pictures released on a waiting tile because their references were all decoded.
+        var referenceRecoveries = 0
+        /// Pictures dropped because a used reference was lost or broken.
+        var brokenPictures = 0
+        /// Losses that needed no keyframe (the tile recovered by references).
+        var lossesRecoveredByReferences = 0
         var parameterSetUpdates = 0
         var rejectedParameterSets = 0
         var donOrdering = true
@@ -222,7 +237,19 @@ final class HEVCAssembler {
     /// loss or error. Only an IRAP at or after it in decoding order clears
     /// it, so a late IRAP cannot lift a gate set by a later loss. nil: no
     /// position known; any IRAP clears it.
-    private struct Gate { var don: UInt16? }
+    private struct Gate {
+        var don: UInt16?
+        /// Only an IRAP clears it (cold start, new parameter sets, decode
+        /// errors); otherwise a decodable picture of the tile does too.
+        var irapOnly = true
+        /// When the loss gate was set (reference recovery's keyframe timer).
+        var since: ContinuousClock.Instant?
+        /// A keyframe was requested for it.
+        var requested = false
+    }
+    private var refs = HEVCReferenceTracker()
+    /// The tracker saw every picture fed since the last IRAP.
+    private var refsTrusted = false
     private var gates: [Int: Gate] = [:]
     private var everHadIDR = false
     /// A decode error widened the gate to every tile until an IRAP after it.
@@ -260,6 +287,8 @@ final class HEVCAssembler {
         donOrderingStops = 0
         raslSkipTiles = []
         gates = Dictionary(uniqueKeysWithValues: unique.indices.map { ($0, Gate(don: nil)) })
+        refs = HEVCReferenceTracker()
+        refsTrusted = false
         keyframeTargets = []
         dropsSinceRequest = 0
         requestedSinceWait = false
@@ -339,6 +368,14 @@ final class HEVCAssembler {
         var out: [AssemblerOutput] = []
         for e in entries { enqueue(e, out: &out) }
         drain(out: &out)
+        // Reference recovery: a tile that lost a picture and got nothing
+        // decodable since needs a keyframe after all.
+        let overdue = gates.filter { !$0.value.irapOnly && !$0.value.requested
+            && $0.value.since.map { now - $0 >= config.lossRecoveryWait } ?? false }.keys
+        if !overdue.isEmpty {
+            for t in overdue { gates[t]?.requested = true }
+            requestKeyframes(for: Set(overdue), out: &out)
+        }
         return out
     }
 
@@ -357,7 +394,9 @@ final class HEVCAssembler {
         stats.decodeErrors += 1
         let at = don ?? expectedDON
         escalation = Gate(don: escalation == nil ? at : Self.later(escalation?.don, at))
-        setGate(Set(tileSSRCs.indices), don: at)
+        setGate(Set(tileSSRCs.indices), don: at, irapOnly: true)
+        refs.invalidate()
+        refsTrusted = false
         var out: [AssemblerOutput] = []
         requestKeyframes(for: tile.flatMap { tileSSRCs.indices.contains($0) ? [$0] : nil }, out: &out)
         return out
@@ -815,11 +854,13 @@ final class HEVCAssembler {
         if let ps = e.parameterSets {
             stats.parameterSetUpdates += 1
             out.append(ps)
+            if case .parameterSets(_, let sps, let pps) = ps { refs.setParameters(sps: sps, pps: pps.first) }
+            refsTrusted = false
             // A changed set means a rebuilt decoder with an empty DPB. Its IRAP
             // normally follows at once, so wait like a cold start (grace before
             // the first request) instead of asking for another one now.
             if everHadIDR {
-                setGate(Set(tileSSRCs.indices), don: e.donFirst ?? expectedDON)
+                setGate(Set(tileSSRCs.indices), don: e.donFirst ?? expectedDON, irapOnly: true)
                 keyframeTargets = []
                 requestedSinceWait = false
                 dropsSinceRequest = 0
@@ -831,11 +872,46 @@ final class HEVCAssembler {
         case .noPicture, .lost:
             break
         case .picture(let au):
+            let cls = config.referenceRecovery && parameterSets != nil ? au.nalUnits.first.flatMap { refs.classify($0) } : nil
             if au.isIDR, parameterSets != nil {
+                if let cls, case .decodable(let poc) = cls.verdict {
+                    refs.commit(poc: poc, irap: true)
+                    refsTrusted = true
+                } else {
+                    refsTrusted = false
+                }
                 irap(au, pictureDON: e.pictureDON ?? au.don, out: &out)
+            } else if let cls, referencesUsable(tile: au.tile) {
+                switch cls.verdict {
+                case .decodable(let poc):
+                    if let g = gates.removeValue(forKey: au.tile) {
+                        stats.referenceRecoveries += 1
+                        if !g.requested { stats.lossesRecoveredByReferences += 1 }
+                        if gates.isEmpty { endWait() }
+                    }
+                    refs.commit(poc: poc, irap: cls.refs.isIRAP)
+                    if raslSkipTiles.contains(au.tile), au.isRASL {
+                        stats.droppedRASL += 1
+                    } else {
+                        stats.accessUnits += 1
+                        out.append(.accessUnit(au))
+                    }
+                case .broken:
+                    // Needs a picture the decoder never got: only a keyframe helps.
+                    stats.brokenPictures += 1
+                    if gates[au.tile] == nil {
+                        setGate([au.tile], don: e.pictureDON ?? au.don, irapOnly: false)
+                    }
+                    gates[au.tile]?.requested = true
+                    stats.droppedWaitingForIDR += 1
+                    dropsSinceRequest += 1
+                    let before = keyframeTargets.count
+                    requestKeyframes(for: [au.tile], out: &out)
+                    if keyframeTargets.count == before, dropsSinceRequest >= config.keyframeRetryAfterDrops {
+                        rerequestKeyframes(out: &out)
+                    }
+                }
             } else if gates[au.tile] != nil || parameterSets == nil {
-                // LTR hook: with LTR acknowledgements, a picture referencing
-                // only acknowledged (known-good) frames may pass here.
                 stats.droppedWaitingForIDR += 1
                 dropsSinceRequest += 1
                 if keyframeTargets.isEmpty, let base = tileSSRCs.first { keyframeTargets = [base] }
@@ -846,6 +922,12 @@ final class HEVCAssembler {
             } else if raslSkipTiles.contains(au.tile), au.isRASL {
                 stats.droppedRASL += 1
             } else {
+                // Fed without a verdict: the tracker no longer knows the DPB.
+                if let cls, case .decodable(let poc) = cls.verdict, refsTrusted {
+                    refs.commit(poc: poc, irap: false)
+                } else {
+                    refsTrusted = false
+                }
                 stats.accessUnits += 1
                 out.append(.accessUnit(au))
             }
@@ -873,11 +955,7 @@ final class HEVCAssembler {
         everHadIDR = true
         for t in cleared { gates[t] = nil }
         if let g = escalation, clears(g) { escalation = nil }
-        if gates.isEmpty {
-            keyframeTargets = []
-            requestedSinceWait = false
-            dropsSinceRequest = 0
-        }
+        if gates.isEmpty { endWait() }
         if lastIRAPDON.map({ !Self.precedes(pictureDON, $0) }) ?? true { lastIRAPDON = pictureDON }
         lateDONStreak = 0
         if !stats.donOrdering, donOrderingStops <= config.donOrderingRestarts {
@@ -896,25 +974,62 @@ final class HEVCAssembler {
     }
 
     /// Loss seen on `tiles` (nil = unknown tile, e.g. a DON hole): ask for a
-    /// keyframe now. The gate follows at the decoding position.
+    /// keyframe now — unless reference recovery may make it unnecessary
+    /// (then a broken picture or the `lossRecoveryWait` timer asks). The
+    /// gate follows at the decoding position.
     private func reportLoss(tiles: Set<Int>?, out: inout [AssemblerOutput]) {
         stats.lossEvents += 1
         // Before the first IRAP every tile already waits, and the cold-start
         // grace paces requests: a burst that begins mid-AU is not news.
-        guard everHadIDR else { return }
+        guard everHadIDR, !referencesActive else { return }
         requestKeyframes(for: tiles, out: &out)
     }
 
-    /// Holds `tiles` (widened by the scope) until an IRAP at or after `don`.
+    /// Holds `tiles` (widened by the scope) until an IRAP at or after `don`
+    /// (or, with reference recovery, a decodable picture of the tile).
     private func gate(tiles: Set<Int>?, don: UInt16?, out: inout [AssemblerOutput]) {
         guard everHadIDR else { return }
-        setGate(scopeTiles(tiles), don: don)
+        if referencesActive {
+            let now = clock ?? .now
+            for t in tiles ?? Set(tileSSRCs.indices) where tileSSRCs.indices.contains(t) {
+                if gates[t] == nil { gates[t] = Gate(don: don, irapOnly: false, since: now) }
+                else { gates[t]!.don = Self.later(gates[t]!.don, don) }
+            }
+            return
+        }
+        setGate(scopeTiles(tiles), don: don, irapOnly: true)
         requestKeyframes(for: tiles, out: &out)      // no-op if already asked this wait
     }
 
+    /// Reference recovery applies: on, the tracker has followed every
+    /// picture since an IRAP, and no decode error is pending.
+    private var referencesActive: Bool {
+        config.referenceRecovery && refsTrusted && escalation == nil && refs.params != nil
+    }
+
+    private func referencesUsable(tile: Int) -> Bool {
+        referencesActive && everHadIDR && gates[tile]?.irapOnly != true
+    }
+
     /// Adds gates; a tile already gated keeps the later of the two DONs.
-    private func setGate(_ tiles: Set<Int>, don: UInt16?) {
-        for t in tiles { gates[t] = Gate(don: gates[t] == nil ? don : Self.later(gates[t]?.don, don)) }
+    private func setGate(_ tiles: Set<Int>, don: UInt16?, irapOnly: Bool) {
+        let now = clock ?? .now
+        for t in tiles {
+            if var g = gates[t] {
+                g.don = Self.later(g.don, don)
+                g.irapOnly = g.irapOnly || irapOnly
+                gates[t] = g
+            } else {
+                gates[t] = Gate(don: don, irapOnly: irapOnly, since: now)
+            }
+        }
+    }
+
+    /// Nothing waits any more: the keyframe request state starts over.
+    private func endWait() {
+        keyframeTargets = []
+        requestedSinceWait = false
+        dropsSinceRequest = 0
     }
 
     private func scopeTiles(_ tiles: Set<Int>?) -> Set<Int> {
@@ -1005,6 +1120,9 @@ struct HEVCBitReader {
     }
 
     mutating func skip(_ n: Int) { position += n }
+
+    /// Reads went past the end of the data (the fields read are bogus).
+    var isPastEnd: Bool { position > bytes.count * 8 }
 
     /// ue(v), bounded at 31 leading zeros.
     mutating func ue() -> UInt32 {
