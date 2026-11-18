@@ -12,6 +12,8 @@ struct SessionView: View {
     @State private var keyboardVisible = false
     @State private var menu = ControlMenuModel()
     @State private var menuExpanded = false
+    /// Touch feedback: GPU ripples / cursor halo (renderer) and the HUD overlay.
+    @State private var feedback = FeedbackCenter()
     @AppStorage(TouchInputMode.defaultsKey) private var touchModeRaw = TouchInputMode.default.rawValue
     @AppStorage(DisplayMode.defaultsKey) private var displayModeRaw = DisplayMode.default.rawValue
 
@@ -20,7 +22,8 @@ struct SessionView: View {
             Color.black.ignoresSafeArea()
             RemoteScreenView(model: model, store: model.frames, cursor: model.cursor, input: model.input,
                              menu: menu, keyboardVisible: $keyboardVisible, menuExpanded: $menuExpanded,
-                             touchMode: TouchInputMode(rawValue: touchModeRaw) ?? .default)
+                             touchMode: TouchInputMode(rawValue: touchModeRaw) ?? .default, feedback: feedback)
+                .overlay { FeedbackOverlayView(center: feedback) }
                 .ignoresSafeArea()
             if model.isReconnecting || !model.hasFirstFrame {
                 VStack(spacing: 12) {
@@ -77,6 +80,7 @@ struct RemoteScreenView: UIViewRepresentable {
     @Binding var keyboardVisible: Bool
     @Binding var menuExpanded: Bool
     let touchMode: TouchInputMode
+    let feedback: FeedbackCenter
 
     final class Coordinator {
         var renderer: MetalRenderer?
@@ -125,10 +129,13 @@ struct RemoteScreenView: UIViewRepresentable {
         view.remoteInput.viewport = view.viewport
         if let renderer = MetalRenderer(store: store, cursor: cursor) {
             renderer.viewport = view.viewport
+            renderer.feedback = feedback
             renderer.attach(to: view.video)
             context.coordinator.renderer = renderer
         }
         view.remoteInput.cursor = cursor
+        view.remoteInput.feedback = feedback
+        feedback.onMinimapJump = { [weak view] in view?.remoteInput.jumpViewport(toContentUnit: $0) }
         // Rotation / Stage Manager resize → in-band dynamic resolution (DisplayResizer).
         view.onSizeChange = { [weak model] size, scale in model?.viewSizeChanged(points: size, scale: scale) }
         // Before any teardown (disconnect, background, failure) the
@@ -162,6 +169,7 @@ struct RemoteScreenView: UIViewRepresentable {
         view.video.delegate = nil
         view.remoteInput.input = nil
         view.remoteInput.cursor = nil
+        view.remoteInput.feedback = nil
         view.remoteInput.modifiers = nil
         view.remoteInput.controlMenu = nil
         view.remoteInput.onPointerMoved = nil

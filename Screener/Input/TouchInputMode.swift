@@ -29,6 +29,12 @@
 // waits `tapDragWindow` for a second one (reset) before right-clicking.
 // Four or more fingers are left to the system.
 //
+// Feedback cues (`onCue`, TouchCue): alongside its actions the interpreter
+// reports what a gesture MEANT — a click (and how many), a drag starting, the
+// drag lock engaging/releasing, a trackpad finger landing, a direct-mode long
+// press arming / firing / being abandoned — for the visual feedback
+// (RemoteInputView → FeedbackSink). Cues never change the actions.
+//
 // Nothing stays pressed: every button-down has its button-up on lift, on a
 // cancelled touch (system gesture), on `cancel()` (mode switch, menu open,
 // focus loss, teardown). The drag lock is the one deliberate hold; it too
@@ -107,6 +113,23 @@ enum TouchAction: Equatable {
     case haptic(TouchHaptic)
 }
 
+/// What a gesture meant, for visual feedback (never sent to the Mac).
+enum TouchCue: Equatable {
+    /// Trackpad mode: a finger landed (not Pencil).
+    case fingerDown
+    /// `count` clicks of `button` were sent (2: a double click).
+    case click(button: Int, count: Int)
+    /// A gesture pressed the left button to drag.
+    case dragBegan
+    /// The three-finger drag lock engaged (true) or released (false).
+    case dragLock(Bool)
+    /// Direct mode: a touch at `at` will be a long press after `duration`
+    /// if it stays still.
+    case longPressArmed(at: CGPoint, duration: TimeInterval)
+    case longPressFired
+    case longPressCancelled
+}
+
 @MainActor
 final class TouchInterpreter {
     enum Tuning {
@@ -159,6 +182,10 @@ final class TouchInterpreter {
     var isZoomed: () -> Bool = { false }
 
     private let perform: (TouchAction) -> Void
+    /// Feedback cues (TouchCue).
+    var onCue: ((TouchCue) -> Void)?
+    /// A long press is armed (its cue was sent; fired / cancelled is owed).
+    private var longPressArmed = false
     private let schedule: KeyRepeater.Schedule
 
     private var fingers: [Int: Finger] = [:]
@@ -273,6 +300,7 @@ final class TouchInterpreter {
             phase = .dragging
             buttonDown = true
             perform(.button(InputController.Button.left, down: true))
+            onCue?(.dragBegan)
             perform(.moveTo(f.last))
             lastCentroid = f.last
         case .twoPending:
@@ -307,8 +335,11 @@ final class TouchInterpreter {
             guard distance(c, startCentroid) > Tuning.slop else { return }
             phase = .threeDrag
             perform(.haptic(.medium))
-            if !dragLocked { perform(.button(InputController.Button.left, down: true)) }
-            dragLocked = true
+            if !dragLocked {
+                perform(.button(InputController.Button.left, down: true))
+                dragLocked = true
+                onCue?(.dragLock(true))
+            }
             perform(.moveBy(sub(c, startCentroid)))
             lastCentroid = c
         case .threeDrag:
@@ -392,6 +423,7 @@ final class TouchInterpreter {
         if dragLocked {
             dragLocked = false
             perform(.button(InputController.Button.left, down: false))
+            onCue?(.dragLock(false))
         }
         // Fingers still down stay out of the next gesture.
         ignoredFingers.formUnion(fingers.keys)
@@ -411,6 +443,7 @@ final class TouchInterpreter {
         lastCentroid = p
         phase = .pending
         if effectiveMode == .trackpad {
+            onCue?(.fingerDown)
             if let cancelClick = pendingClick {
                 // A second touch inside the tap's window: a double tap or a tap-drag.
                 cancelClick()
@@ -421,6 +454,8 @@ final class TouchInterpreter {
         } else {
             flushPendingClicks()
             timer = schedule(Tuning.longPress) { [weak self] in self?.longPressFired() }
+            longPressArmed = true
+            onCue?(.longPressArmed(at: p, duration: Tuning.longPress))
         }
     }
 
@@ -429,6 +464,7 @@ final class TouchInterpreter {
             dragLocked = false
             perform(.button(InputController.Button.left, down: false))
             perform(.haptic(.light))
+            onCue?(.dragLock(false))
             return
         }
         guard quick else { return }
@@ -439,6 +475,7 @@ final class TouchInterpreter {
             perform(.button(InputController.Button.left, down: false))
             perform(.button(InputController.Button.left, down: true))
             perform(.button(InputController.Button.left, down: false))
+            onCue?(.click(button: InputController.Button.left, count: 2))
             return
         }
         pendingClick = schedule(Tuning.tapDragWindow) { [weak self] in
@@ -486,6 +523,10 @@ final class TouchInterpreter {
 
     private func longPressFired() {
         timer = nil
+        if longPressArmed {
+            longPressArmed = false
+            onCue?(phase == .pending ? .longPressFired : .longPressCancelled)
+        }
         guard phase == .pending, let f = fingers.values.first else { return }
         flushPendingRightClick()
         phase = .longPressed
@@ -499,6 +540,7 @@ final class TouchInterpreter {
         if dragLocked { return }                     // already held by the lock
         buttonDown = true
         perform(.button(InputController.Button.left, down: true))
+        onCue?(.dragBegan)
     }
 
     private func releaseGestureButton() {
@@ -511,6 +553,7 @@ final class TouchInterpreter {
         if let haptic { perform(.haptic(haptic)) }
         perform(.button(button, down: true))
         perform(.button(button, down: false))
+        onCue?(.click(button: button, count: 1))
     }
 
     /// A gesture that is not a click came in while one was waiting: send it now.
@@ -553,6 +596,10 @@ final class TouchInterpreter {
     private func cancelTimer() {
         timer?()
         timer = nil
+        if longPressArmed {
+            longPressArmed = false
+            onCue?(.longPressCancelled)
+        }
     }
 
     // MARK: geometry

@@ -34,6 +34,11 @@
 //   pointer never triggers one). Pencil hover moves the cursor through the
 //   hover recognizer; a Pencil double-tap / squeeze is a right click at the
 //   cursor (UIPencilInteraction, unless the user set it to do nothing).
+// Visual feedback (`feedback`, a FeedbackSink — UI/Feedback): touch clicks,
+//   drags, the drag lock, trackpad finger-downs, direct-mode long presses
+//   (TouchInterpreter's TouchCues), touch cursor moves, zooms and touch
+//   scrolls / momentum are reported as FeedbackEvents (cursor points in
+//   BASE, unzoomed view coordinates). Hardware pointer input reports none.
 // Zoom: every view point is mapped through the viewport's inverse before the
 //   aspect-fit mapping (InputController.hostPoint), the system pointer is
 //   hidden over the zoomed picture's on-screen rect, and a trackpad pinch
@@ -183,6 +188,8 @@ final class RemoteInputView: UIView, UIPointerInteractionDelegate, UIGestureReco
     /// The pointer moved to a point in window coordinates (nil: it left /
     /// the host cursor was hidden). Used to keep the menu pill out of its way.
     var onPointerMoved: ((CGPoint?) -> Void)?
+    /// Visual touch feedback (ripples, halo, HUDs).
+    weak var feedback: FeedbackSink?
 
     /// Reference counts of held modifier keysyms, and their press order.
     private var modifierHolds: [UInt32: Int] = [:]
@@ -212,6 +219,7 @@ final class RemoteInputView: UIView, UIPointerInteractionDelegate, UIGestureReco
         let t = TouchInterpreter(schedule: schedule) { [weak self] in self?.perform($0) }
         t.mode = touchMode
         t.isZoomed = { [weak self] in self?.viewport.value.isZoomed ?? false }
+        t.onCue = { [weak self] in self?.handleCue($0) }
         return t
     }()
     private var inertia: ScrollInertia?
@@ -568,6 +576,12 @@ final class RemoteInputView: UIView, UIPointerInteractionDelegate, UIGestureReco
         onPointerMoved?(convert(viewport.value.toScreen(base, viewSize: size), to: nil))
     }
 
+    /// The cursor's unzoomed (BASE) view point, if it has a position.
+    var cursorBasePoint: CGPoint? {
+        guard let input, let host = lastHost else { return nil }
+        return input.baseViewPoint(forHostX: CGFloat(host.x), y: CGFloat(host.y), viewSize: bounds.size)
+    }
+
     /// Where the cursor is drawn (view points), if it has a position.
     var cursorViewPoint: CGPoint? {
         guard let input, let host = lastHost,
@@ -732,6 +746,7 @@ final class RemoteInputView: UIView, UIPointerInteractionDelegate, UIGestureReco
     /// A finger scroll (or a momentum step) of `d` view points.
     private func scrollTouch(_ d: CGPoint) {
         guard let input else { return }
+        if d.y != 0 { feedback?.feedback(.scrolled(dy: d.y)) }
         let ticks = touchScroll.ticks(points: d.y, ticksPerPoint: input.scrollTicksPerPoint(
             viewSize: bounds.size, zoom: viewport.value.scale))
         scrollAtPointer(ticks, fallback: CGPoint(x: bounds.midX, y: bounds.midY))
@@ -743,7 +758,10 @@ final class RemoteInputView: UIView, UIPointerInteractionDelegate, UIGestureReco
     /// only, as the wire's scroll).
     func startInertia(_ velocity: CGPoint) {
         stopInertia()
-        guard input != nil, let run = ScrollInertia(velocity: CGPoint(x: 0, y: velocity.y)) else { return }
+        guard input != nil, let run = ScrollInertia(velocity: CGPoint(x: 0, y: velocity.y)) else {
+            feedback?.feedback(.scrollEnded)
+            return
+        }
         inertia = run
         let link = CADisplayLink(target: self, selector: #selector(inertiaTick(_:)))
         link.add(to: .main, forMode: .common)
@@ -751,9 +769,11 @@ final class RemoteInputView: UIView, UIPointerInteractionDelegate, UIGestureReco
     }
 
     func stopInertia() {
+        let wasCoasting = inertia != nil
         inertiaLink?.invalidate()
         inertiaLink = nil
         inertia = nil
+        if wasCoasting { feedback?.feedback(.scrollEnded) }
     }
 
     var isCoasting: Bool { inertia != nil }
@@ -788,6 +808,7 @@ final class RemoteInputView: UIView, UIPointerInteractionDelegate, UIGestureReco
             stopInertia()
         case .moveBy(let d):
             moveCursor(by: d)
+            if let p = cursorBasePoint { feedback?.feedback(.cursorMoved(to: p)) }
         case .moveTo(let p):
             movePointer(to: p, coalescable: true, clampToPicture: true)
         case .button(let b, let down):
@@ -801,6 +822,7 @@ final class RemoteInputView: UIView, UIPointerInteractionDelegate, UIGestureReco
         case .resetZoom:
             viewport.update { $0.reset() }
             pointerInteraction?.invalidate()
+            feedback?.feedback(.zoomChanged(scale: viewport.value.scale))
         case .haptic(let h):
             let g = h == .light ? lightImpact : mediumImpact
             g.impactOccurred()
@@ -835,6 +857,44 @@ final class RemoteInputView: UIView, UIPointerInteractionDelegate, UIGestureReco
             $0.zoom(by: factor, around: center, viewSize: size, content: fit)
         }
         pointerInteraction?.invalidate()
+        feedback?.feedback(.zoomChanged(scale: viewport.value.scale))
+    }
+
+    /// Centres the zoomed viewport on `u` (unit coordinates of the fitted
+    /// picture: the minimap).
+    func jumpViewport(toContentUnit u: CGPoint) {
+        guard let input, viewport.value.isZoomed else { return }
+        let size = bounds.size, fit = input.fittedRect(in: size)
+        let base = CGPoint(x: fit.minX + u.x * fit.width, y: fit.minY + u.y * fit.height)
+        viewport.update { $0.center(on: base, viewSize: size, content: fit) }
+        pointerInteraction?.invalidate()
+    }
+
+    /// A gesture's meaning (TouchInterpreter) → a FeedbackEvent at the cursor.
+    func handleCue(_ cue: TouchCue) {
+        guard let feedback else { return }
+        switch cue {
+        case .fingerDown:
+            feedback.feedback(.fingerDown)
+        case .click(let button, let count):
+            guard let p = cursorBasePoint else { return }
+            if button == InputController.Button.right {
+                feedback.feedback(.rightClick(at: p))
+            } else {
+                feedback.feedback(count >= 2 ? .doubleClick(at: p) : .click(at: p))
+            }
+        case .dragBegan:
+            guard let p = cursorBasePoint else { return }
+            feedback.feedback(.dragBegan(at: p))
+        case .dragLock(let on):
+            feedback.feedback(.dragLock(active: on, at: cursorBasePoint))
+        case .longPressArmed(let p, let duration):
+            feedback.feedback(.longPressBegan(at: p, duration: duration))
+        case .longPressFired:
+            feedback.feedback(.longPressEnded(fired: true))
+        case .longPressCancelled:
+            feedback.feedback(.longPressEnded(fired: false))
+        }
     }
 
     @objc private func trackpadPinch(_ g: UIPinchGestureRecognizer) {

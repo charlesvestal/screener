@@ -48,6 +48,28 @@
 // the drawn cursor stays on the pointer's host pixel at any zoom. The cursor
 // sprite scales with the picture. A viewport change redraws like a cursor
 // change.
+//
+// Touch feedback (FeedbackCenter, UI/Feedback; never touches the decoded
+// frame or input mapping):
+// - Ripples: while any is visible the composite (strips only) is drawn into
+//   an offscreen `scene` texture, then one full-screen pass (`rippleFragment`)
+//   samples it displaced around each ripple (≤ 8, a uniform array) onto the
+//   drawable; the cursor is drawn after, undistorted. Otherwise the strips go
+//   straight to the drawable as before. Ripple centres are BASE view points
+//   mapped through the viewport (they stay on their spot of the picture) and
+//   scaled to pixels by `pixelsPerPoint`. The scene texture is freed after
+//   `sceneIdle` without ripples.
+// - Cursor halo / trail: the sprite drawn at haloScale (about its hotspot)
+//   over a soft additive glow, after a few fading ghost sprites.
+// - Frames: an effect change asks for a redraw (onChange → coalescer); while
+//   anything animates the view runs its display link (as pacing does) and a
+//   redraw is forced even without a new picture; one more frame is drawn
+//   after the last effect ends, so none is left on screen; then it pauses.
+// - Minimap: while zoomed the visible region is published to the center on
+//   every draw, and a 256-px-wide thumbnail of the picture (strips only,
+//   unzoomed) is rendered into a shared texture at most every
+//   `thumbnailInterval` (4 Hz) when the picture changed, read back on
+//   completion and published as a CGImage.
 import CoreVideo
 import Metal
 import MetalKit
@@ -121,6 +143,25 @@ final class MetalRenderer: NSObject, MTKViewDelegate {
     private let queue: MTLCommandQueue
     private let pipeline: MTLRenderPipelineState
     private let cursorPipeline: MTLRenderPipelineState
+    private let ripplePipeline: MTLRenderPipelineState
+    private let glowPipeline: MTLRenderPipelineState
+    /// Touch feedback effects (nil: none).
+    var feedback: FeedbackCenter?
+    /// Drawable pixels per view point (set from the view on every draw).
+    var pixelsPerPoint: CGFloat = 2
+    private var sceneTexture: MTLTexture?
+    private var lastRippleAt: Double = 0
+    private var lastFeedbackRevision: Int?
+    /// The last presented frame carried an effect (one clean frame is owed).
+    private var effectsOnScreen = false
+    private var thumbTexture: MTLTexture?
+    private var lastThumbAt: Double = -.infinity
+    private var thumbVersion: Int?
+    private var thumbRetryPending = false
+    static let thumbnailInterval = 0.25
+    static let thumbnailWidth = 256
+    /// The scene texture is released after this long without ripples.
+    static let sceneIdle = 3.0
     private let cursor: RemoteCursor?
     private var cursorTexture: MTLTexture?
     private var cursorTextureSerial: Int?
@@ -175,6 +216,13 @@ final class MetalRenderer: NSObject, MTKViewDelegate {
             att.destinationRGBBlendFactor = .oneMinusSourceAlpha
             att.destinationAlphaBlendFactor = .oneMinusSourceAlpha
             cursorPipeline = try device.makeRenderPipelineState(descriptor: cdesc)
+            cdesc.fragmentFunction = library.makeFunction(name: "glowFragment")
+            glowPipeline = try device.makeRenderPipelineState(descriptor: cdesc)
+            let rdesc = MTLRenderPipelineDescriptor()
+            rdesc.vertexFunction = library.makeFunction(name: "postVertex")
+            rdesc.fragmentFunction = library.makeFunction(name: "rippleFragment")
+            rdesc.colorAttachments[0].pixelFormat = Self.colorPixelFormat
+            ripplePipeline = try device.makeRenderPipelineState(descriptor: rdesc)
         } catch {
             Log.video.error("Metal: pipeline creation failed: \(error)")
             return nil
@@ -214,6 +262,7 @@ final class MetalRenderer: NSObject, MTKViewDelegate {
         store.setOnChange(owner: self) { coalescer.signal() }
         cursor?.onChange = { coalescer.signal() }
         viewport?.onChange = { coalescer.signal() }
+        feedback?.onChange = { coalescer.signal() }
         view.setNeedsDisplay()
     }
 
@@ -222,6 +271,8 @@ final class MetalRenderer: NSObject, MTKViewDelegate {
         store.clearOnChange(owner: self)
         cursor?.onChange = nil
         viewport?.onChange = nil
+        feedback?.onChange = nil
+        feedback?.setMinimap(nil)
         coalescer = nil
     }
 
@@ -254,12 +305,18 @@ final class MetalRenderer: NSObject, MTKViewDelegate {
         let resized = size != lastDrawableSize
         let cursorChanged = cursor.map { $0.revision != lastCursorRevision } ?? false
             || viewport.map { $0.revision != lastViewportRevision } ?? false
-        guard let snap = store.snapshot(ifNewerThan: resized || cursorChanged ? nil : lastVersion) else { return }
+        if view.bounds.width > 0 { pixelsPerPoint = size.width / view.bounds.width }
+        let fxForce = feedback.map {
+            $0.revision != lastFeedbackRevision || effectsOnScreen || $0.needsFrames(at: $0.now())
+        } ?? false
+        guard let snap = store.snapshot(ifNewerThan: resized || cursorChanged || fxForce ? nil : lastVersion)
+        else { return }
         guard let ref = snap.frames[0] ?? snap.frames.first?.value else {
             // Nothing drawable (new session, reconnecting): keep the last
             // picture on the layer and don't grab a drawable for this version.
             lastVersion = snap.version
             lastCursorRevision = cursor?.revision
+            lastFeedbackRevision = feedback?.revision
             lastDrawableSize = size
             return
         }
@@ -279,6 +336,7 @@ final class MetalRenderer: NSObject, MTKViewDelegate {
         guard encode(snap, into: pass, size: size, commandBuffer: cmd) else {
             lastVersion = snap.version
             lastCursorRevision = cursor?.revision
+            lastFeedbackRevision = feedback?.revision
             lastViewportRevision = viewport?.revision
             lastDrawableSize = size
             return
@@ -289,33 +347,53 @@ final class MetalRenderer: NSObject, MTKViewDelegate {
         CVMetalTextureCacheFlush(textureCache, 0)
         lastVersion = snap.version
         lastCursorRevision = cursor?.revision
+        lastFeedbackRevision = feedback?.revision
         lastViewportRevision = viewport?.revision
         lastDrawableSize = size
         framesDrawn += 1
         if framesDrawn == 1 { onFirstDraw?() }
     }
 
-    /// Runs the view's display link while paced pictures are queued, and
-    /// returns to on-demand drawing `pacingIdle` after the queue empties.
+    /// Runs the view's display link while paced pictures are queued (back
+    /// to on-demand drawing `pacingIdle` after the queue empties) or while a
+    /// feedback effect animates (or one last clean frame is owed).
     private func updateDisplayLink(_ view: MTKView) {
-        guard pacing != nil else { return }
-        let now = ContinuousClock.now
-        if store.nextDue != nil {
-            lastQueued = now
-            if view.isPaused { view.enableSetNeedsDisplay = false; view.isPaused = false }
-        } else if !view.isPaused, lastQueued.map({ now - $0 >= Self.pacingIdle }) ?? true {
+        var want = false
+        if let feedback {
+            let t = feedback.now()
+            want = feedback.needsFrames(at: t) || (effectsOnScreen && feedback.gpuState(at: t).isEmpty)
+        }
+        if pacing != nil {
+            let now = ContinuousClock.now
+            if store.nextDue != nil {
+                lastQueued = now
+                want = true
+            } else if !view.isPaused, let q = lastQueued, now - q < Self.pacingIdle {
+                want = true
+            }
+        }
+        if want, view.isPaused {
+            view.enableSetNeedsDisplay = false
+            view.isPaused = false
+        } else if !want, !view.isPaused {
             view.isPaused = true
             view.enableSetNeedsDisplay = true
         }
     }
 
-    /// Encodes the composite of `snap` into `pass` (target `size` pixels).
-    /// Returns false when nothing could be drawn.
-    @discardableResult
-    func encode(_ snap: VideoFrameStore.Snapshot, into pass: MTLRenderPassDescriptor, size: CGSize,
-                commandBuffer cmd: MTLCommandBuffer) -> Bool {
-        guard size.width > 0, size.height > 0,
-              let ref = snap.frames[0] ?? snap.frames.sorted(by: { $0.key < $1.key }).first?.value else { return false }
+    /// One strip ready to draw: its textures and uniforms (dstRect is
+    /// filled per target).
+    private struct PreparedStrip {
+        var strip: CompositeLayout.Strip
+        var luma: MTLTexture
+        var chroma: MTLTexture
+        var uniforms: StripUniforms
+    }
+
+    /// Wraps the tiles of `snap` as textures; nil when nothing is drawable.
+    private func prepare(_ snap: VideoFrameStore.Snapshot, keep: inout [CVMetalTexture])
+        -> (layout: CompositeLayout, strips: [PreparedStrip])? {
+        guard let ref = snap.frames[0] ?? snap.frames.sorted(by: { $0.key < $1.key }).first?.value else { return nil }
         let decoded = CGSize(width: CVPixelBufferGetWidth(ref), height: CVPixelBufferGetHeight(ref))
         let layout = CompositeLayout.make(canvas: snap.canvas, tileCount: snap.tileCount, decoded: decoded)
         if layout != lastLayout {
@@ -329,11 +407,7 @@ final class MetalRenderer: NSObject, MTKViewDelegate {
                     + "\(Int(decoded.width))x\(Int(decoded.height)); drawn directly")
             }
         }
-        guard let enc = cmd.makeRenderCommandEncoder(descriptor: pass) else { return false }
-        enc.setRenderPipelineState(pipeline)
-        let zoom = viewport?.value ?? .identity
-        var keep: [CVMetalTexture] = []
-        var drew = false
+        var out: [PreparedStrip] = []
         for strip in layout.strips {
             guard let buffer = snap.frames[strip.tile] else { continue }   // never arrived: stays black
             let type = CVPixelBufferGetPixelFormatType(buffer)
@@ -354,21 +428,70 @@ final class MetalRenderer: NSObject, MTKViewDelegate {
                 lastColorDescription = colorDescription
                 Log.video.info("M4 render colour: \(colorDescription)")
             }
-            let r = zoom.toScreen(layout.viewRect(of: strip, in: size), viewSize: size)
-            var u = StripUniforms(
-                dstRect: SIMD4(Float(r.minX / size.width * 2 - 1), Float(1 - r.minY / size.height * 2),
-                               Float(r.maxX / size.width * 2 - 1), Float(1 - r.maxY / size.height * 2)),
+            let u = StripUniforms(
+                dstRect: .zero,
                 texExtent: SIMD2(Float(strip.textureExtent.width), Float(strip.textureExtent.height)),
                 range: fmt.range, coeffs: matrix.coefficients)
+            out.append(PreparedStrip(strip: strip, luma: lt, chroma: ct, uniforms: u))
+        }
+        return (layout, out)
+    }
+
+    /// Draws `strips` aspect-fitted into a `size` target through `zoom`.
+    private func drawStrips(_ enc: MTLRenderCommandEncoder, _ strips: [PreparedStrip], layout: CompositeLayout,
+                            size: CGSize, zoom: Viewport) {
+        enc.setRenderPipelineState(pipeline)
+        for p in strips {
+            let r = zoom.toScreen(layout.viewRect(of: p.strip, in: size), viewSize: size)
+            var u = p.uniforms
+            u.dstRect = SIMD4(Float(r.minX / size.width * 2 - 1), Float(1 - r.minY / size.height * 2),
+                              Float(r.maxX / size.width * 2 - 1), Float(1 - r.maxY / size.height * 2))
             enc.setVertexBytes(&u, length: MemoryLayout<StripUniforms>.stride, index: 0)
             enc.setFragmentBytes(&u, length: MemoryLayout<StripUniforms>.stride, index: 0)
-            enc.setFragmentTexture(lt, index: 0)
-            enc.setFragmentTexture(ct, index: 1)
+            enc.setFragmentTexture(p.luma, index: 0)
+            enc.setFragmentTexture(p.chroma, index: 1)
             enc.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4)
-            drew = true
         }
-        if drew { drawCursor(enc, canvas: layout.canvas, size: size, viewport: zoom) }
+    }
+
+    /// Encodes the composite of `snap` into `pass` (target `size` pixels),
+    /// with the feedback effects of this instant. Returns false when
+    /// nothing could be drawn.
+    @discardableResult
+    func encode(_ snap: VideoFrameStore.Snapshot, into pass: MTLRenderPassDescriptor, size: CGSize,
+                commandBuffer cmd: MTLCommandBuffer) -> Bool {
+        guard size.width > 0, size.height > 0 else { return false }
+        var keep: [CVMetalTexture] = []
+        guard let (layout, strips) = prepare(snap, keep: &keep) else { return false }
+        let zoom = viewport?.value ?? .identity
+        let fxNow = feedback?.now() ?? 0
+        let fx = feedback?.gpuState(at: fxNow) ?? FeedbackCenter.GPUState()
+        let drew = !strips.isEmpty
+        let scene = fx.ripples.isEmpty ? nil : sceneTarget(size)
+        if let scene {
+            // Ripples: the picture into the scene texture, then displaced onto the target.
+            lastRippleAt = fxNow
+            let sp = MTLRenderPassDescriptor()
+            sp.colorAttachments[0].texture = scene
+            sp.colorAttachments[0].loadAction = .clear
+            sp.colorAttachments[0].clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 1)
+            sp.colorAttachments[0].storeAction = .store
+            guard let senc = cmd.makeRenderCommandEncoder(descriptor: sp) else { return false }
+            drawStrips(senc, strips, layout: layout, size: size, zoom: zoom)
+            senc.endEncoding()
+        } else if sceneTexture != nil, fxNow - lastRippleAt > Self.sceneIdle {
+            sceneTexture = nil
+        }
+        guard let enc = cmd.makeRenderCommandEncoder(descriptor: pass) else { return false }
+        if let scene {
+            drawRipples(enc, scene: scene, ripples: fx.ripples, size: size, zoom: zoom)
+        } else {
+            drawStrips(enc, strips, layout: layout, size: size, zoom: zoom)
+        }
+        if drew { drawCursor(enc, canvas: layout.canvas, size: size, viewport: zoom, fx: fx) }
         enc.endEncoding()
+        effectsOnScreen = drew && !fx.isEmpty
+        if drew { updateMinimap(snap: snap, layout: layout, strips: strips, size: size, zoom: zoom, cmd: cmd) }
         // The CVMetalTextures (and through them the pixel buffers) must live
         // until the GPU is done with them.
         let held = TextureHold(keep)
@@ -376,7 +499,128 @@ final class MetalRenderer: NSObject, MTKViewDelegate {
         return drew
     }
 
-    private func drawCursor(_ enc: MTLRenderCommandEncoder, canvas: CGSize, size: CGSize, viewport: Viewport) {
+    /// The offscreen target the picture is drawn into under ripples.
+    private func sceneTarget(_ size: CGSize) -> MTLTexture? {
+        let w = Int(size.width), h = Int(size.height)
+        if let t = sceneTexture, t.width == w, t.height == h { return t }
+        let desc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: Self.colorPixelFormat, width: w, height: h,
+                                                            mipmapped: false)
+        desc.usage = [.renderTarget, .shaderRead]
+        desc.storageMode = .private
+        sceneTexture = device.makeTexture(descriptor: desc)
+        return sceneTexture
+    }
+
+    /// Ripple uniforms: [size.x, size.y, count, 0] then per ripple
+    /// [cx, cy, radius, amplitude] [width, highlight, 0, 0] [tint.rgb, 0]
+    /// (pixels). Shaders.metal `rippleFragment`.
+    static func rippleUniforms(_ ripples: [RippleSample], size: CGSize, pixelsPerPoint k: CGFloat,
+                               zoom: Viewport) -> [SIMD4<Float>] {
+        let list = ripples.prefix(RippleField.maxCount)
+        var u: [SIMD4<Float>] = [SIMD4(Float(size.width), Float(size.height), Float(list.count), 0)]
+        for r in list {
+            let c = zoom.toScreen(CGPoint(x: r.center.x * k, y: r.center.y * k), viewSize: size)
+            u.append(SIMD4(Float(c.x), Float(c.y), Float(r.radius * k), Float(r.amplitude * k)))
+            u.append(SIMD4(Float(max(1, r.width * k)), Float(r.highlight), 0, 0))
+            u.append(SIMD4(r.tint, 0))
+        }
+        while u.count < 1 + 3 * RippleField.maxCount { u.append(.zero) }
+        return u
+    }
+
+    private func drawRipples(_ enc: MTLRenderCommandEncoder, scene: MTLTexture, ripples: [RippleSample],
+                             size: CGSize, zoom: Viewport) {
+        var u = Self.rippleUniforms(ripples, size: size, pixelsPerPoint: pixelsPerPoint, zoom: zoom)
+        enc.setRenderPipelineState(ripplePipeline)
+        enc.setFragmentTexture(scene, index: 0)
+        enc.setFragmentBytes(&u, length: MemoryLayout<SIMD4<Float>>.stride * u.count, index: 0)
+        enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
+    }
+
+    // MARK: minimap
+
+    /// While zoomed: publishes the visible region and, at most every
+    /// `thumbnailInterval` when the picture changed, renders a thumbnail.
+    private func updateMinimap(snap: VideoFrameStore.Snapshot, layout: CompositeLayout, strips: [PreparedStrip],
+                               size: CGSize, zoom: Viewport, cmd: MTLCommandBuffer) {
+        guard let feedback else { return }
+        guard zoom.isZoomed, layout.canvas.width > 0, layout.canvas.height > 0 else {
+            feedback.setMinimap(nil)
+            thumbVersion = nil
+            thumbTexture = nil
+            return
+        }
+        let content = MinimapGeometry.unitContent(CompositeLayout.aspectFit(layout.canvas, in: size), viewSize: size)
+        feedback.setMinimap(.init(aspect: layout.canvas.width / layout.canvas.height,
+                                  viewport: MinimapGeometry.viewportRect(visible: zoom.visibleUnitRect,
+                                                                         content: content)))
+        guard snap.version != thumbVersion || feedback.thumbnail == nil else { return }
+        let now = feedback.now()
+        let wait = Self.thumbnailInterval - (now - lastThumbAt)
+        guard wait <= 0 else {
+            // Too soon: come back for it (a static picture draws nothing more).
+            if !thumbRetryPending {
+                thumbRetryPending = true
+                DispatchQueue.main.asyncAfter(deadline: .now() + wait) { [weak self] in
+                    MainActor.assumeIsolated {
+                        guard let self else { return }
+                        self.thumbRetryPending = false
+                        self.coalescer?.signal()
+                        self.lastFeedbackRevision = nil          // force a redraw of the same picture
+                    }
+                }
+            }
+            return
+        }
+        let w = Self.thumbnailWidth
+        let h = max(1, Int((CGFloat(w) * layout.canvas.height / layout.canvas.width).rounded()))
+        if thumbTexture?.width != w || thumbTexture?.height != h {
+            let desc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: Self.colorPixelFormat, width: w, height: h,
+                                                                mipmapped: false)
+            desc.usage = [.renderTarget]
+            desc.storageMode = .shared
+            thumbTexture = device.makeTexture(descriptor: desc)
+        }
+        guard let tex = thumbTexture else { return }
+        let tp = MTLRenderPassDescriptor()
+        tp.colorAttachments[0].texture = tex
+        tp.colorAttachments[0].loadAction = .clear
+        tp.colorAttachments[0].clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 1)
+        tp.colorAttachments[0].storeAction = .store
+        guard let enc = cmd.makeRenderCommandEncoder(descriptor: tp) else { return }
+        drawStrips(enc, strips, layout: layout, size: CGSize(width: w, height: h), zoom: .identity)
+        enc.endEncoding()
+        thumbVersion = snap.version
+        lastThumbAt = now
+        let box = TextureBox(tex)
+        cmd.addCompletedHandler { [weak feedback] _ in
+            let image = Self.cgImage(box.texture)
+            let sendable = ImageBox(image)
+            DispatchQueue.main.async {
+                MainActor.assumeIsolated { feedback?.setThumbnail(sendable.image) }
+            }
+        }
+    }
+
+    /// A BGRA8 shared texture → CGImage (sRGB).
+    nonisolated static func cgImage(_ tex: MTLTexture) -> CGImage? {
+        let w = tex.width, h = tex.height, row = w * 4
+        var bytes = [UInt8](repeating: 0, count: row * h)
+        bytes.withUnsafeMutableBytes { raw in
+            tex.getBytes(raw.baseAddress!, bytesPerRow: row, from: MTLRegionMake2D(0, 0, w, h), mipmapLevel: 0)
+        }
+        guard let provider = CGDataProvider(data: Data(bytes) as CFData) else { return nil }
+        return CGImage(width: w, height: h, bitsPerComponent: 8, bitsPerPixel: 32, bytesPerRow: row,
+                       space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                       bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.noneSkipFirst.rawValue
+                                                | CGBitmapInfo.byteOrder32Little.rawValue),
+                       provider: provider, decode: nil, shouldInterpolate: true, intent: .defaultIntent)
+    }
+
+    // MARK: cursor
+
+    private func drawCursor(_ enc: MTLRenderCommandEncoder, canvas: CGSize, size: CGSize, viewport: Viewport,
+                            fx: FeedbackCenter.GPUState) {
         guard let cursor, let img = cursor.image, let pos = cursor.position, img.width > 0, img.height > 0
         else { return }
         let host = cursor.hostSize.width > 0 && cursor.hostSize.height > 0 ? cursor.hostSize : canvas
@@ -386,15 +630,39 @@ final class MetalRenderer: NSObject, MTKViewDelegate {
         let d = scl * cursor.pointScale
         let p = viewport.toScreen(CGPoint(x: fit.minX + pos.x * fit.width / host.width,
                                           y: fit.minY + pos.y * fit.height / host.height), viewSize: size)
-        let px = p.x, py = p.y
-        let x0 = px - CGFloat(img.hotspot.x) * d, y0 = py - CGFloat(img.hotspot.y) * d
-        let x1 = x0 + CGFloat(img.width) * d, y1 = y0 + CGFloat(img.height) * d
-        var rect = SIMD4<Float>(Float(x0 / size.width * 2 - 1), Float(1 - y0 / size.height * 2),
-                                Float(x1 / size.width * 2 - 1), Float(1 - y1 / size.height * 2))
+        func ndc(_ x0: CGFloat, _ y0: CGFloat, _ x1: CGFloat, _ y1: CGFloat) -> SIMD4<Float> {
+            SIMD4(Float(x0 / size.width * 2 - 1), Float(1 - y0 / size.height * 2),
+                  Float(x1 / size.width * 2 - 1), Float(1 - y1 / size.height * 2))
+        }
+        /// The sprite with its hotspot at `at`, scaled by `s`, at `alpha`.
+        func sprite(at a: CGPoint, scale s: CGFloat, alpha: Float) {
+            var alpha = alpha
+            let x0 = a.x - CGFloat(img.hotspot.x) * d * s, y0 = a.y - CGFloat(img.hotspot.y) * d * s
+            var rect = ndc(x0, y0, x0 + CGFloat(img.width) * d * s, y0 + CGFloat(img.height) * d * s)
+            enc.setVertexBytes(&rect, length: MemoryLayout<SIMD4<Float>>.stride, index: 0)
+            enc.setFragmentBytes(&alpha, length: MemoryLayout<Float>.stride, index: 0)
+            enc.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4)
+        }
+        if fx.haloGlow > 0 {
+            // Soft glow centred between the hotspot and the sprite's middle.
+            let mid = CGPoint(x: p.x + (CGFloat(img.width) / 2 - CGFloat(img.hotspot.x)) * d * 0.5,
+                              y: p.y + (CGFloat(img.height) / 2 - CGFloat(img.hotspot.y)) * d * 0.5)
+            let r = 30 * pixelsPerPoint * (0.8 + 0.4 * fx.haloGlow)
+            var rect = ndc(mid.x - r, mid.y - r, mid.x + r, mid.y + r)
+            var color = SIMD4<Float>(0.75, 0.88, 1, 0.45 * Float(fx.haloGlow))
+            enc.setRenderPipelineState(glowPipeline)
+            enc.setVertexBytes(&rect, length: MemoryLayout<SIMD4<Float>>.stride, index: 0)
+            enc.setFragmentBytes(&color, length: MemoryLayout<SIMD4<Float>>.stride, index: 0)
+            enc.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4)
+        }
         enc.setRenderPipelineState(cursorPipeline)
-        enc.setVertexBytes(&rect, length: MemoryLayout<SIMD4<Float>>.stride, index: 0)
         enc.setFragmentTexture(tex, index: 0)
-        enc.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4)
+        let k = pixelsPerPoint
+        for g in fx.ghosts {
+            sprite(at: viewport.toScreen(CGPoint(x: g.point.x * k, y: g.point.y * k), viewSize: size),
+                   scale: 1, alpha: g.alpha)
+        }
+        sprite(at: p, scale: fx.haloScale, alpha: 1)
     }
 
     private func cursorTexture(for img: CursorImage) -> MTLTexture? {
@@ -445,6 +713,18 @@ final class RedrawCoalescer: @unchecked Sendable {   // `pending` behind `lock`
             MainActor.assumeIsolated { fire() }
         }
     }
+}
+
+/// Carries a texture into a completion handler (read only after the GPU is done).
+private final class TextureBox: @unchecked Sendable {
+    let texture: MTLTexture
+    init(_ texture: MTLTexture) { self.texture = texture }
+}
+
+/// Carries a CGImage to the main actor (immutable).
+private final class ImageBox: @unchecked Sendable {
+    let image: CGImage?
+    init(_ image: CGImage?) { self.image = image }
 }
 
 /// Keeps CVMetalTextures alive until a command buffer completes (read-only).

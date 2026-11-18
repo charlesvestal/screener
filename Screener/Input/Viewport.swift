@@ -92,6 +92,14 @@ struct Viewport: Equatable, Sendable {
         clamp(viewSize: viewSize, content: content)
     }
 
+    /// Pans so `base` (an unzoomed view point) is centred, within the clamp.
+    mutating func center(on base: CGPoint, viewSize: CGSize, content: CGRect) {
+        guard isZoomed, viewSize.width > 0, viewSize.height > 0 else { return }
+        let span = 1 / scale
+        origin = CGPoint(x: base.x / viewSize.width - span / 2, y: base.y / viewSize.height - span / 2)
+        clamp(viewSize: viewSize, content: content)
+    }
+
     mutating func reset() {
         scale = Self.minScale
         origin = .zero

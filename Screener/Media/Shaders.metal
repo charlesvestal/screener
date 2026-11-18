@@ -64,7 +64,62 @@ vertex VOut cursorVertex(uint vid [[vertex_id]], constant CursorUniforms &u [[bu
     return o;
 }
 
-fragment float4 cursorFragment(VOut in [[stage_in]], texture2d<float> tex [[texture(0)]]) {
+// `alpha` fades the whole sprite (motion-trail ghosts; 1 for the cursor).
+fragment float4 cursorFragment(VOut in [[stage_in]], texture2d<float> tex [[texture(0)]],
+                               constant float &alpha [[buffer(0)]]) {
     constexpr sampler s(filter::linear, address::clamp_to_edge);
-    return tex.sample(s, in.uv);
+    return tex.sample(s, in.uv) * alpha;
+}
+
+// Cursor halo glow: a soft disc filling the quad (cursorVertex), premultiplied
+// (same blend as the cursor). color.a is the centre opacity.
+fragment float4 glowFragment(VOut in [[stage_in]], constant float4 &color [[buffer(0)]]) {
+    float d = length(in.uv * 2.0 - 1.0);
+    float a = color.a * pow(saturate(1.0 - d), 2.0);
+    return float4(color.rgb * a, a);
+}
+
+// Touch ripples (MetalRenderer, RippleField): a full-screen pass over the
+// picture drawn into an offscreen `scene` texture. Each ripple is a ring of
+// radius R and half-width W around C (pixels): with x = (|p − C| − R) / W the
+// picture is sampled displaced along the radius by A·x·e^(−x²) (normalised
+// so the peak is A: content just outside the ring is pushed outward, just
+// inside pulled in — a refracting wave), and the crest gets a screen-blended
+// highlight H·e^(−2x²) in the ripple's tint. Reduce Motion ripples have A = 0
+// (highlight only). Uniforms (float4s): [w, h, count, 0], then per ripple
+// [Cx, Cy, R, A] [W, H, 0, 0] [tint.rgb, 0].
+struct PostOut {
+    float4 position [[position]];
+};
+
+vertex PostOut postVertex(uint vid [[vertex_id]]) {
+    // One triangle covering the target.
+    float2 p = float2((vid == 1) ? 3.0 : -1.0, (vid == 2) ? -3.0 : 1.0);
+    PostOut o;
+    o.position = float4(p, 0.0, 1.0);
+    return o;
+}
+
+fragment float4 rippleFragment(PostOut in [[stage_in]], texture2d<float> scene [[texture(0)]],
+                               constant float4 *u [[buffer(0)]]) {
+    constexpr sampler s(filter::linear, address::clamp_to_edge);
+    float2 size = u[0].xy;
+    int n = min(int(u[0].z), 8);
+    float2 p = in.position.xy;
+    float2 disp = float2(0.0);
+    float3 glow = float3(0.0);
+    for (int i = 0; i < n; i++) {
+        float4 a = u[1 + 3 * i], b = u[2 + 3 * i], c = u[3 + 3 * i];
+        float2 d = p - a.xy;
+        float r = length(d);
+        float x = (r - a.z) / b.x;
+        if (abs(x) > 3.5) continue;
+        float g = exp(-x * x);
+        float2 dir = r > 0.5 ? d / r : float2(0.0);
+        disp += dir * (a.w * 2.3316 * x * g);           // 1/max(x·e^(−x²)) = 2.3316
+        glow += c.rgb * (b.y * g * g);                   // a narrower crest
+    }
+    float3 rgb = scene.sample(s, (p - disp) / size).rgb;
+    rgb = 1.0 - (1.0 - rgb) * (1.0 - saturate(glow));   // screen blend
+    return float4(rgb, 1.0);
 }
