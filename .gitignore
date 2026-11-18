@@ -33,5 +33,7 @@ build-chop/
 build-qos/
 build-qos-dev/
 build-qos-ipad/
+build-hosts/
+build-hosts-dev/
 build-mods/
 build-mods-dev/
