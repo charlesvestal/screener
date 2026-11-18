@@ -176,7 +176,8 @@ final class SessionCoordinatorTests: XCTestCase {
         XCTAssertEqual(c.state, .failed(UserFacingError.lostMessage))
         XCTAssertNil(c.lastRequest, "credentials dropped: nothing will reconnect")
         XCTAssertNil(c.control)
-        XCTAssertTrue(rec.channels.allSatisfy(\.cancelled))
+        // The failure's teardown runs on the media-failure task, not `t`: wait for its close.
+        try await waitUntil("sockets closed") { rec.channels.allSatisfy(\.cancelled) }
     }
 
     /// The handshake fails while the UDP sends are still blocked (iOS Local

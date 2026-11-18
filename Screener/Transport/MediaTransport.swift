@@ -768,8 +768,8 @@ actor MediaTransport {
         guard case .dropped = audioOut.yield(p) else { return }
         streamDrops.audio += 1
         let n = streamDrops.audio
-        // Audio has no consumer yet (Task 16): log the first drop and every 1000th.
-        if n == 1 || n % 1000 == 0 { Log.media.error("audio stream consumer lagging: \(n) packets dropped") }
+        // The audio consumer (AudioPlayer, Task 16) drops while muted, so this only fires on real lag.
+        if n <= 5 || n % 1000 == 0 { Log.media.error("audio stream consumer lagging: \(n) packets dropped") }
     }
 
     private func scheduleBurstLock() {

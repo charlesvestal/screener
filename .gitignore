@@ -37,5 +37,7 @@ build-hosts/
 build-hosts-dev/
 build-mods/
 build-mods-dev/
+build-audio/
+build-audio-dev/
 build-touch/
 build-touch-dev/

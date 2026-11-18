@@ -229,6 +229,7 @@ private struct ControlPanel: View {
     @AppStorage(PacingConfig.defaultsKey) private var smoothPlayback = false
     @AppStorage(TouchInputMode.defaultsKey) private var touchModeRaw = TouchInputMode.default.rawValue
     private var touchMode: TouchInputMode { TouchInputMode(rawValue: touchModeRaw) ?? .default }
+    @AppStorage(AudioPlayer.mutedDefaultsKey) private var audioMuted = false
 
     var body: some View {
         ViewThatFits(in: .vertical) {
@@ -321,7 +322,10 @@ private struct ControlPanel: View {
             .disabled(!controls.inputAvailable || !menu.canTypePassword)
             tile("Get Clipboard", "doc.on.clipboard", hint: "Coming soon") {}.disabled(true)
             tile("Send Clipboard", "clipboard", hint: "Coming soon") {}.disabled(true)
-            tile("Mute", "speaker.slash", hint: "Coming soon") {}.disabled(true)
+            tile("Mute", audioMuted ? "speaker.slash.fill" : "speaker.wave.2", selected: audioMuted,
+                 hint: "Silences the Mac's sound on this iPad.") { audioMuted.toggle() }
+                .accessibilityValue(audioMuted ? "On" : "Off")
+                .accessibilityAddTraits(.isToggle)
             tile("Display", "display", hint: "Coming soon") {}.disabled(true)
             tile(touchMode.title, touchMode == .trackpad ? "rectangle.and.hand.point.up.left" : "hand.point.up.left",
                  hint: "Input mode for your fingers. Trackpad: drag to move the pointer, tap to click. "

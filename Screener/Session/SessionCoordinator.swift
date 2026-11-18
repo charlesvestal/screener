@@ -20,6 +20,11 @@
 // the assembler's 20 ms tick are wired inside it. A stream that turns out to
 // be H.264 fails the session ("server chose H.264").
 //
+// Audio (Task 16): one AudioPlayer per session consumes MediaTransport.audio
+// on a detached task (decode off the main thread), subscribed before open().
+// Teardown cancels the consumer and stops the player (engine + audio session)
+// before the sockets close.
+//
 // Input (Task 15): once the stream has started, an InputController sends
 // pointer / key input on the control channel (0x10 pointer events under the
 // record layer's content key). Control events feed it and the host cursor:
@@ -162,6 +167,8 @@ final class SessionCoordinator {
     private var mediaFailureTask: Task<Void, Never>?
     private var pendingTeardown: Task<Void, Never>?
     private var videoTask: Task<Void, Never>?
+    private var audioTask: Task<Void, Never>?
+    private var audioPlayer: AudioPlayer?
     private var firstFrameTask: Task<Void, Never>?
     private var mediaConsumers: [MediaConsumer] = []
     /// `generation` as of the last `startVideo`, readable from the frame
@@ -365,6 +372,7 @@ final class SessionCoordinator {
                                    tuning: seams.mediaTuning, channelFactory: seams.channelFactory)
         self.media = media
         startVideo(media, gen)
+        startAudio(media)
         for consume in mediaConsumers { consume(media) }
         watchFailures(media, gen)
         do {
@@ -470,6 +478,8 @@ final class SessionCoordinator {
         statsTask?.cancel(); statsTask = nil
         mediaFailureTask?.cancel(); mediaFailureTask = nil
         videoTask?.cancel(); videoTask = nil
+        audioTask?.cancel(); audioTask = nil
+        audioPlayer?.stop(); audioPlayer = nil
         // Never leave a key or pointer button held on the Mac: release
         // everything on the UI layer at once, synchronously (before `input`
         // itself is cleared below), so the Mac sees the releases as soon as
@@ -607,6 +617,17 @@ final class SessionCoordinator {
         #endif
         videoTask?.cancel()
         videoTask = Task.detached { await pipeline.run(media.video, tap: makeTap?()) }
+    }
+
+    /// The single consumer of `media.audio` for this session (see the header).
+    private func startAudio(_ media: MediaTransport) {
+        audioTask?.cancel()
+        audioPlayer?.stop()
+        let player = AudioPlayer()
+        audioPlayer = player
+        audioTask = Task.detached {
+            for await packet in media.audio { player.handle(packet) }
+        }
     }
 
     static let notHEVCMessage = "The Mac sent H.264 video (server chose H.264); Screener needs HEVC. "
