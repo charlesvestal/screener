@@ -455,7 +455,7 @@ final class SessionCoordinator {
         serverAddress = ip
         Log.app.info("connecting to \(private: host) as \(private: ip)")
         fallbackPolicy.reset()
-        let framebufferOnly = lastRequest?.framebufferOnly
+        let framebufferOnly = lastRequest?.framebufferOnly ?? (Self.forceTCP == "connect" ? .forced : nil)
 
         // 2) UDP first, consumers attached before any packet can arrive.
         let media = MediaTransport(config: .init(host: ip, controlPort: port, localAddress: localAddress),
@@ -563,6 +563,9 @@ final class SessionCoordinator {
                 state = .connected(canvasWidth: params.canvas.width, canvasHeight: params.canvas.height)
                 stage = stage.advanced(by: .streamStarted)
                 startFirstFrameDeadline(gen, media)
+                if Self.forceTCP == "inplace" {
+                    _ = await enterFallback(gen, session, params, reason: .forced, closeMedia: false)
+                }
                 return
             case .failed(let error):
                 return await fail(gen, error)
@@ -859,6 +862,15 @@ final class SessionCoordinator {
     // MARK: TCP-only fallback (Task 19)
 
     static let framebufferBrokenMessage = "The picture stream from the Mac broke. Reconnect to continue."
+
+    /// DEBUG live testing (ExperimentEnv; Release ignores it):
+    /// SCREENER_FORCE_TCP=connect connects without a media offer;
+    /// =inplace falls back on the same connection once HP video started.
+    static let forceTCP: String? = {
+        let v = ExperimentEnv.current["SCREENER_FORCE_TCP"]
+        if let v { Log.app.info("TCP fallback forced: SCREENER_FORCE_TCP=\(v)") }
+        return v
+    }()
 
     /// Switches session `gen` (control `session`) to the framebuffer path:
     /// stops HP video, resets the frame store, starts a FramebufferPipeline

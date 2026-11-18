@@ -22,12 +22,15 @@ struct MediaFallbackPolicy: Sendable, Equatable {
         case noVideo(packets: Int)
         case negotiationFailed
         case decoderFailures(Int)
+        /// SCREENER_FORCE_TCP (DEBUG live testing).
+        case forced
 
         var description: String {
             switch self {
             case .noVideo(let n): "no authenticated video (\(n) packet(s)) after the media answer"
             case .negotiationFailed: "media negotiation failed"
-            case .decoderFailures(let n): "\(n) decoder failures in a row"
+            case .decoderFailures(let n): "\(n) decoder failures within the window"
+            case .forced: "forced by SCREENER_FORCE_TCP"
             }
         }
     }
