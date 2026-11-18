@@ -84,6 +84,8 @@ struct SessionControls {
     var getClipboard: (() -> Void)? = nil
     /// "Send Clipboard": send the iPad's text to the Mac; false if there was none.
     var sendClipboard: (() -> Bool)? = nil
+    /// "?": reopens the gesture coach (GestureCoach).
+    var openCoach: (() -> Void)? = nil
     /// "Switch Mac": the saved Macs to switch to (nil: no tile).
     var switchMac: MacSwitcher? = nil
 }
@@ -366,6 +368,13 @@ private struct ControlPanel: View {
                     + "Touch: the pointer goes where you touch. Tap to switch.") {
                 touchModeRaw = (touchMode == .trackpad ? TouchInputMode.direct : .trackpad).rawValue
             }
+            tile("Find Cursor", "scope",
+                 hint: "Closes the menu, centres the view on the Mac's pointer and enlarges it briefly. "
+                    + "Shaking the pointer does the same.") {
+                expanded = false
+                menu.findCursor()
+            }
+            .disabled(!controls.inputAvailable)
             tile("Stats", showStats ? "chart.bar.fill" : "chart.bar", selected: showStats,
                  hint: "Shows frame rate, bitrate, decode time and loss over the session.") { showStats.toggle() }
                 .accessibilityValue(showStats ? "On" : "Off")
@@ -381,6 +390,10 @@ private struct ControlPanel: View {
             }
             .buttonStyle(.plain)
             .accessibilityLabel("Share Log")
+            tile("Gesture Help", "questionmark.circle", hint: "Shows the gesture coach again.") {
+                controls.openCoach?()
+            }
+            .disabled(controls.openCoach == nil)
             if let switcher = controls.switchMac {
                 SwitchMacTile(switcher: switcher) { expanded = false }
             }

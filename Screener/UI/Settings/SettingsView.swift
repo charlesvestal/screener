@@ -14,8 +14,13 @@ struct SettingsView: View {
     @AppStorage(AudioPlayer.mutedDefaultsKey) private var audioMuted = false
     @AppStorage(ScreenerSettings.scrollSpeedKey) private var scrollSpeed = ScreenerSettings.scrollSpeedDefault
     @AppStorage(ScreenerSettings.keepAwakeKey) private var keepAwake = ScreenerSettings.keepAwakeDefault
+    @AppStorage(TapClickDelay.defaultsKey) private var tapDelayRaw = TapClickDelay.default.rawValue
+    @AppStorage(ScrollDirection.defaultsKey) private var scrollDirectionRaw = ScrollDirection.default.rawValue
+    @AppStorage(InputPreferences.longPressRightClickKey) private var longPressRightClick =
+        InputPreferences.longPressRightClickDefault
     @AppStorage(ResumeOnLaunch.enabledKey) private var reconnectOnLaunch = ResumeOnLaunch.enabledDefault
     @State private var showAcknowledgements = false
+    @State private var showHelp = false
 
     private var displayMode: DisplayMode { DisplayMode(rawValue: displayModeRaw) ?? .default }
 
@@ -49,11 +54,26 @@ struct SettingsView: View {
                         }
                         .accessibilityValue(String(format: "%.1f times", scrollSpeed))
                     }
+                    Picker("Scroll Direction", selection: $scrollDirectionRaw) {
+                        ForEach(ScrollDirection.allCases, id: \.self) { d in
+                            Text(d.title).tag(d.rawValue)
+                        }
+                    }
+                    Picker("Tap to Click Delay", selection: $tapDelayRaw) {
+                        ForEach(TapClickDelay.allCases, id: \.self) { d in
+                            Text(d.title).tag(d.rawValue)
+                        }
+                    }
+                    Toggle("Long-Press to Right-Click", isOn: $longPressRightClick)
                     Toggle("Visual Feedback", isOn: $visualFeedback)
                 } header: {
                     Text("Input")
                 } footer: {
                     Text("Trackpad: drag to move the pointer, tap to click. Touch: the pointer goes where you touch. "
+                         + "Scroll Direction: Natural follows the iPad; Reversed flips every scroll. "
+                         + "Tap to Click Delay is how long a tap waits for a double tap or tap-and-drag: Fast "
+                         + "clicks sooner, Relaxed gives more time. Long-Press to Right-Click: in Trackpad mode, "
+                         + "hold one finger still to right-click. Shake the pointer to find it. "
                          + "Visual Feedback shows where touches and clicks land.")
                 }
 
@@ -88,6 +108,7 @@ struct SettingsView: View {
                 }
 
                 Section {
+                    Button("Help") { showHelp = true }
                     Button("Acknowledgements") { showAcknowledgements = true }
                     ShareLogButton()
                 } footer: {
@@ -101,6 +122,7 @@ struct SettingsView: View {
                 ToolbarItem(placement: .confirmationAction) { Button("Done") { dismiss() } }
             }
             .sheet(isPresented: $showAcknowledgements) { AcknowledgementsView() }
+            .sheet(isPresented: $showHelp) { HelpView() }
         }
     }
 }

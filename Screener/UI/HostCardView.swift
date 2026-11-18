@@ -156,6 +156,7 @@ struct ConnectionStageIndicator: View {
 struct HostsEmptyState: View {
     var onAdd: () -> Void
     @AppStorage("feedback.visual") private var visualFeedback = true
+    @State private var showHelp = false
 
     var body: some View {
         VStack(spacing: 28) {
@@ -177,9 +178,12 @@ struct HostsEmptyState: View {
                 Label("Add a Mac by Address", systemImage: "plus")
             }
             .buttonStyle(.glassProminent)
+            Button("Need Help?") { showHelp = true }
+                .buttonStyle(.borderless)
         }
         .padding(24)
         .frame(maxWidth: .infinity)
+        .sheet(isPresented: $showHelp) { HelpView() }
     }
 
     private var illustration: some View {

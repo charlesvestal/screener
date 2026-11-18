@@ -19,6 +19,10 @@ struct SessionView: View {
     @State private var menuExpanded = false
     /// Touch feedback: GPU ripples / cursor halo (renderer) and the HUD overlay.
     @State private var feedback = FeedbackCenter()
+    /// First-run gesture coach (GestureCoach): shown once on the first
+    /// session to reach a picture, and reopenable from the "?" menu tile.
+    @AppStorage(GestureCoach.seenKey) private var coachSeen = false
+    @State private var showCoach = false
     @AppStorage(TouchInputMode.defaultsKey) private var touchModeRaw = TouchInputMode.default.rawValue
     @AppStorage(DisplayMode.defaultsKey) private var displayModeRaw = DisplayMode.default.rawValue
     @Environment(\.scenePhase) private var scenePhase
@@ -41,7 +45,11 @@ struct SessionView: View {
                                                        disconnect: { Task { await model.disconnect() } },
                                                        getClipboard: { model.clipboard.fetchFromMac() },
                                                        sendClipboard: { model.clipboard.sendToMac() },
+                                                       openCoach: { showCoach = true },
                                                        switchMac: switchMac))
+            if showCoach {
+                GestureCoachOverlay { showCoach = false }
+            }
             // App-switcher / Home Screen privacy (L5): cover only while the
             // scene is actually `.background` — the phase in which iOS keeps
             // a snapshot of it. NOT on every non-`.active` phase: Split View,
@@ -64,6 +72,11 @@ struct SessionView: View {
         }
         .onChange(of: displayModeRaw, initial: true) { _, raw in
             model.setDisplayMode(DisplayMode(rawValue: raw) ?? .default)
+        }
+        .onChange(of: model.hasFirstFrame) { _, has in
+            guard has, !coachSeen else { return }
+            coachSeen = true
+            showCoach = true
         }
         // Toasts, the stats overlay, Keep Screen Awake (UI/Toast/SessionPolish.swift).
         .sessionPolish(model, savedFor: savedFor)

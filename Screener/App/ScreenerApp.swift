@@ -25,7 +25,18 @@ struct ScreenerApp: App {
     var body: some Scene {
         WindowGroup {
             #if DEBUG
-            if UserDefaults.standard.bool(forKey: "previewControlMenu") {
+            if UserDefaults.standard.bool(forKey: "previewCoach") {
+                // Screenshot harness (GestureCoach): the overlay alone, over a
+                // stand-in desktop, no Mac needed.
+                ZStack {
+                    LinearGradient(colors: [.indigo, .teal], startPoint: .topLeading, endPoint: .bottomTrailing)
+                        .ignoresSafeArea()
+                    GestureCoachOverlay(onDismiss: {})
+                }
+            } else if UserDefaults.standard.bool(forKey: "previewHelp") {
+                // Screenshot harness (HelpView): no Mac, no session needed.
+                HelpView()
+            } else if UserDefaults.standard.bool(forKey: "previewControlMenu") {
                 FloatingMenuPreview()
             } else {
                 HostListView()
