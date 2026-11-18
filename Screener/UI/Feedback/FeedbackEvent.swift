@@ -15,7 +15,8 @@
 // Settings (read, never written here; the Settings screen owns the toggle):
 // - "feedback.visual" (Bool, default true): off disables the decorative
 //   effects — GPU ripples, cursor halo and trail, the scroll pill. The
-//   informational ones (long-press progress, zoom pill, minimap) stay.
+//   informational ones (long-press progress, zoom pill, minimap) and the
+//   cursor locate (shake / Find Cursor) stay.
 // - Reduce Motion: no refraction, no expanding rings, no trail, no halo
 //   scale-up — ripples become short in-place fades.
 import CoreGraphics
@@ -50,6 +51,10 @@ enum FeedbackEvent: Equatable, Sendable {
     case scrolled(dy: CGFloat)
     /// The touch scroll and its momentum are over.
     case scrollEnded
+    /// Shake to locate / Find Cursor: enlarge the drawn cursor for at least
+    /// `hold` more seconds (CursorEffects.locate). Functional: shown even
+    /// with visual feedback off; Reduce Motion drops the bounce only.
+    case locateCursor(hold: TimeInterval)
 }
 
 /// Receives FeedbackEvents (main actor).

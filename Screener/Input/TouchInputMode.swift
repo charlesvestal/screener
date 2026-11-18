@@ -8,12 +8,18 @@
 // Trackpad mode (the default for fingers; like Screens):
 //   - one-finger drag: moves the cursor relatively; finger speed sets the
 //     gain (TrackpadAcceleration, 1.0 → 2.5)
-//   - tap: left click at the cursor. The click waits `tapDragWindow` for a
-//     second touch, so a tap-and-drag never reaches the Mac as a click
-//     followed by a press (= a double-click drag: word selection, window zoom)
+//   - tap: left click at the cursor. The click waits `tapDelay` (Settings →
+//     Tap to Click: 0.15 / 0.25 / 0.35 s) for a second touch, so a tap-and-drag
+//     never reaches the Mac as a click followed by a press (= a double-click
+//     drag: word selection, window zoom)
 //   - double-tap: a double click (both clicks sent at the second tap)
 //   - double-tap-and-hold (second touch within the window, then held still
 //     `tapMaxDuration` or moved): left-button drag until it lifts
+//   - long press (`longPressRightClick`, Settings, default on): one finger
+//     held still for `Tuning.longPress` is a right click (medium haptic) the
+//     moment it fires; moving after it moves the cursor, lifting does
+//     nothing more. Not armed for the second touch of a double tap (that is
+//     double-tap-and-hold = drag) nor under the drag lock
 //   - two-finger tap: right click; two-finger drag: scroll (momentum after)
 //   - three-finger drag: drag lock — the button goes down and stays down
 //     after the fingers lift; one-finger drags keep dragging; a tap releases
@@ -26,7 +32,7 @@
 //     the fingers
 // Both modes: pinch zooms around the fingers (Viewport, 1×–4×) and pans with
 // them; a two-finger double-tap resets to fit. While zoomed, a two-finger tap
-// waits `tapDragWindow` for a second one (reset) before right-clicking.
+// waits `tapDelay` for a second one (reset) before right-clicking.
 // Four or more fingers are left to the system.
 //
 // Feedback cues (`onCue`, TouchCue): alongside its actions the interpreter
@@ -141,10 +147,9 @@ final class TouchInterpreter {
         static let pinchSlop: CGFloat = 16
         /// A tap is shorter than this.
         static let tapMaxDuration: TimeInterval = 0.3
-        /// Trackpad: a tap's click waits this long for a tap-drag / double tap;
-        /// zoomed: a two-finger tap waits this long for a double tap.
+        /// The default `tapDelay` (TapClickDelay.normal).
         static let tapDragWindow: TimeInterval = 0.25
-        /// Direct: long press.
+        /// Direct: long press; trackpad: long-press right click.
         static let longPress: TimeInterval = 0.5
         /// Scroll release velocity is measured over this much recent motion.
         static let velocityWindow: TimeInterval = 0.1
@@ -182,6 +187,12 @@ final class TouchInterpreter {
     }
     /// Whether the viewport is zoomed (two-finger taps wait for a double tap).
     var isZoomed: () -> Bool = { false }
+    /// Trackpad: a tap's click waits this long for a tap-drag / double tap;
+    /// zoomed: a two-finger tap waits this long for a double tap
+    /// (Settings → Tap to Click, TapClickDelay).
+    var tapDelay: TimeInterval = Tuning.tapDragWindow
+    /// Trackpad: a still one-finger long press is a right click (Settings).
+    var longPressRightClick = false
 
     private let perform: (TouchAction) -> Void
     /// Feedback cues (TouchCue).
@@ -452,6 +463,8 @@ final class TouchInterpreter {
                 pendingClick = nil
                 owedClick = true
                 timer = schedule(Tuning.tapMaxDuration) { [weak self] in self?.holdBecameDrag() }
+            } else if longPressRightClick, !dragLocked {
+                timer = schedule(Tuning.longPress) { [weak self] in self?.trackpadLongPressFired() }
             }
         } else {
             flushPendingClicks()
@@ -480,7 +493,7 @@ final class TouchInterpreter {
             onCue?(.click(button: InputController.Button.left, count: 2))
             return
         }
-        pendingClick = schedule(Tuning.tapDragWindow) { [weak self] in
+        pendingClick = schedule(tapDelay) { [weak self] in
             guard let self else { return }
             self.pendingClick = nil
             self.click(InputController.Button.left, haptic: .light)
@@ -498,7 +511,7 @@ final class TouchInterpreter {
         }
         if isZoomed() {
             pendingRightClickAt = at
-            pendingRightClick = schedule(Tuning.tapDragWindow) { [weak self] in
+            pendingRightClick = schedule(tapDelay) { [weak self] in
                 guard let self else { return }
                 self.pendingRightClick = nil
                 self.rightClick(at: self.pendingRightClickAt ?? at)
@@ -521,6 +534,17 @@ final class TouchInterpreter {
         owedClick = false
         flushPendingRightClick()
         startDrag()
+    }
+
+    /// Trackpad: one finger held still for `Tuning.longPress` — a right
+    /// click now; the rest of the touch only moves the cursor.
+    private func trackpadLongPressFired() {
+        timer = nil
+        guard phase == .pending, effectiveMode == .trackpad, !owedClick, !dragLocked, fingers.count == 1
+        else { return }
+        flushPendingRightClick()
+        phase = .moving
+        click(InputController.Button.right, haptic: .medium)
     }
 
     private func longPressFired() {

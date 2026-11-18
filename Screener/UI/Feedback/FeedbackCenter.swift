@@ -40,6 +40,7 @@ final class FeedbackCenter: FeedbackSink {
     /// What the renderer draws on top of / into the picture at an instant.
     struct GPUState {
         var ripples: [RippleSample] = []
+        /// The cursor sprite's scale: the halo or a locate (CursorEffects.cursorScale).
         var haloScale: CGFloat = 1
         /// 0…1 strength of the soft glow under the cursor.
         var haloGlow: CGFloat = 0
@@ -95,9 +96,9 @@ final class FeedbackCenter: FeedbackSink {
     func feedback(_ event: FeedbackEvent) {
         let t = now()
         let visual = visualEnabled(), reduced = reduceMotion()
-        if !visual, !ripples.isEmpty || cursorFX != CursorEffects() {
+        if !visual, !ripples.isEmpty || cursorFX.hasDecorations {
             ripples.removeAll()
-            cursorFX.removeAll()
+            cursorFX.removeDecorations()
             changed()
         }
         switch event {
@@ -153,6 +154,9 @@ final class FeedbackCenter: FeedbackSink {
             if scrollTimer == nil { armScrollTimer(Self.scrollPillLinger) }
         case .scrollEnded:
             break               // the pill fades scrollPillLinger after the last step
+        case .locateCursor(let hold):
+            cursorFX.locate(now: t, hold: hold, reduceMotion: reduced)    // functional: not gated on `visual`
+            changed()
         }
     }
 
@@ -195,7 +199,7 @@ final class FeedbackCenter: FeedbackSink {
         cursorFX.prune(at: now)
         guard !ripples.isEmpty || cursorFX != CursorEffects() else { return GPUState() }
         let env = cursorFX.haloEnvelope(at: now)
-        return GPUState(ripples: ripples.samples(at: now), haloScale: cursorFX.haloScale(at: now),
+        return GPUState(ripples: ripples.samples(at: now), haloScale: cursorFX.cursorScale(at: now),
                         haloGlow: env, ghosts: cursorFX.visibleGhosts(at: now))
     }
 

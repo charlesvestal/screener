@@ -4,7 +4,8 @@
 // Keys owned elsewhere are referenced, not redefined: smooth playback
 // (PacingConfig), touch mode (TouchInputMode), display mode (DisplayMode),
 // Auto Clipboard (ClipboardSyncMode "clipboard.syncMode"), mute
-// (AudioPlayer "audio.muted").
+// (AudioPlayer "audio.muted"), tap-to-click delay / scroll direction /
+// long-press right click (InputPreferences.swift).
 import Foundation
 
 enum ScreenerSettings {

@@ -37,6 +37,8 @@ final class ControlMenuModel {
     @ObservationIgnored weak var sink: (any RemoteKeySink)?
     /// The session's password (in memory only); nil/empty disables Type Password.
     @ObservationIgnored var password: () -> String? = { nil }
+    /// Find Cursor: shows, centres and enlarges the remote cursor (RemoteInputView).
+    @ObservationIgnored var onFindCursor: (() -> Void)?
 
     /// ⌘ is being held for the app switcher.
     private(set) var appSwitcherActive = false
@@ -151,6 +153,10 @@ final class ControlMenuModel {
         let over = point.map { pillRestingFrame.insetBy(dx: -16, dy: -16).contains($0) } ?? false
         if over != pointerOverPill { pointerOverPill = over }
     }
+
+    // MARK: Find Cursor
+
+    func findCursor() { onFindCursor?() }
 
     // MARK: Type Password
 

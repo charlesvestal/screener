@@ -23,7 +23,9 @@
 //     the reference's wheel curve (WheelScroll). Vertical only, as the
 //     reference. Settings → Scroll speed (InputController.scrollSpeed)
 //     scales wheel, touch (+ momentum) and pointer-lock scrolls, not the
-//     hardware trackpad's continuous one.
+//     hardware trackpad's continuous one. Settings → Scroll direction
+//     (InputPreferences) flips every scroll path's ticks when Reversed
+//     (`scrollAtPointer`, the one place all four go through).
 // Touch (fingers and Pencil, Task 22): raw `.direct` / `.pencil` touches go
 //   to TouchInterpreter (TouchInputMode.swift: the gestures of trackpad mode
 //   — the default — and direct mode), whose TouchActions are performed here
@@ -41,6 +43,16 @@
 //   (TouchInterpreter's TouchCues), touch cursor moves, zooms and touch
 //   scrolls / momentum are reported as FeedbackEvents (cursor points in
 //   BASE, unzoomed view coordinates). Hardware pointer input reports none.
+// Input preferences (InputPreferences: tap-to-click delay, scroll direction,
+//   long-press right click): read from UserDefaults when a session's input
+//   arrives and again on every UserDefaults change (live), applied to the
+//   TouchInterpreter and the scroll paths.
+// Locating the cursor: every relative pointer motion (trackpad-mode moves,
+//   pointer-lock mouse moves, hardware pointer hover / drag deltas) feeds a
+//   ShakeDetector; a shake asks the feedback sink to enlarge the drawn cursor
+//   (FeedbackEvent.locateCursor, held while the shake goes on). `findCursor`
+//   (the menu's Find Cursor) re-shows the cursor, centres a zoomed viewport
+//   on it and enlarges it too.
 // Zoom: every view point is mapped through the viewport's inverse before the
 //   aspect-fit mapping (InputController.hostPoint), the system pointer is
 //   hidden over the zoomed picture's on-screen rect, and a trackpad pinch
@@ -149,7 +161,10 @@ final class RemoteInputView: UIView, UIPointerInteractionDelegate, UIGestureReco
             buttons = 0
             lastHost = nil
             cursorHost = nil
+            lastPointerLocation = nil
+            shake.reset()
             stopInertia()
+            if input != nil { reloadPreferences() }     // session start
             updatePointerLock()
         }
     }
@@ -182,7 +197,10 @@ final class RemoteInputView: UIView, UIPointerInteractionDelegate, UIGestureReco
     /// The floating menu's model: the keyboard accessory row's keys go
     /// through it (shared sticky modifiers, fn layer, repeat).
     weak var controlMenu: ControlMenuModel? {
-        didSet { keyboardAccessory.menu = controlMenu }
+        didSet {
+            keyboardAccessory.menu = controlMenu
+            controlMenu?.onFindCursor = { [weak self] in self?.findCursor() }
+        }
     }
     /// Everything held was released on the wire (focus loss, teardown, a
     /// controller switch): holders such as the menu forget their holds.
@@ -192,6 +210,15 @@ final class RemoteInputView: UIView, UIPointerInteractionDelegate, UIGestureReco
     var onPointerMoved: ((CGPoint?) -> Void)?
     /// Visual touch feedback (ripples, halo, HUDs).
     weak var feedback: FeedbackSink?
+    /// Settings → Input (tap delay, scroll direction, long-press right click).
+    var preferences = InputPreferences() {
+        didSet {
+            touchInterpreter.tapDelay = preferences.tapDelay.seconds
+            touchInterpreter.longPressRightClick = preferences.longPressRightClick
+        }
+    }
+    /// Where `preferences` are read from (injected by tests).
+    var defaults: UserDefaults = .standard
 
     /// Reference counts of held modifier keysyms, and their press order.
     private var modifierHolds: [UInt32: Int] = [:]
@@ -217,9 +244,11 @@ final class RemoteInputView: UIView, UIPointerInteractionDelegate, UIGestureReco
     /// The cursor in host pixels, fractional (relative moves accumulate).
     private var cursorHost: CGPoint?
     private let schedule: KeyRepeater.Schedule
-    private lazy var touchInterpreter: TouchInterpreter = {
+    private(set) lazy var touchInterpreter: TouchInterpreter = {
         let t = TouchInterpreter(schedule: schedule) { [weak self] in self?.perform($0) }
         t.mode = touchMode
+        t.tapDelay = preferences.tapDelay.seconds
+        t.longPressRightClick = preferences.longPressRightClick
         t.isZoomed = { [weak self] in self?.viewport.value.isZoomed ?? false }
         t.onCue = { [weak self] in self?.handleCue($0) }
         return t
@@ -227,6 +256,9 @@ final class RemoteInputView: UIView, UIPointerInteractionDelegate, UIGestureReco
     private var inertia: ScrollInertia?
     private var inertiaLink: CADisplayLink?
     private var lastLayoutSize = CGSize.zero
+    private var shake = ShakeDetector()
+    /// The last hardware pointer location (view points) for hover deltas.
+    private var lastPointerLocation: CGPoint?
     private var trackpadPinchScale: CGFloat = 1
     private var pointerLocked = false
     private var lastLockedMove: TimeInterval?
@@ -265,6 +297,9 @@ final class RemoteInputView: UIView, UIPointerInteractionDelegate, UIGestureReco
         nc.addObserver(self, selector: #selector(miceChanged(_:)), name: .GCMouseDidDisconnect, object: nil)
         nc.addObserver(self, selector: #selector(pointerLockChanged(_:)),
                        name: UIPointerLockState.didChangeNotification, object: nil)
+        nc.addObserver(self, selector: #selector(defaultsChanged(_:)),
+                       name: UserDefaults.didChangeNotification, object: nil)
+        preferences = InputPreferences.load(defaults)
     }
 
     required init?(coder: NSCoder) { fatalError("init(coder:) is not used") }
@@ -517,6 +552,18 @@ final class RemoteInputView: UIView, UIPointerInteractionDelegate, UIGestureReco
         releaseAll()
     }
 
+    /// Any UserDefaults change (posted on the writer's thread): re-read the
+    /// input preferences on the main actor.
+    @objc nonisolated private func defaultsChanged(_ note: Notification) {
+        DispatchQueue.main.async { [weak self] in self?.reloadPreferences() }
+    }
+
+    /// Re-reads Settings → Input (cheap: three keys); applied only on a change.
+    func reloadPreferences() {
+        let p = InputPreferences.load(defaults)
+        if p != preferences { preferences = p }
+    }
+
     @objc private func sceneWillDeactivate(_ note: Notification) {
         guard let scene = note.object as? UIScene, scene === window?.windowScene else { return }
         releaseAll()
@@ -563,6 +610,7 @@ final class RemoteInputView: UIView, UIPointerInteractionDelegate, UIGestureReco
     /// a zoomed viewport pans to keep it inside its 10% margins.
     func moveCursor(by delta: CGPoint) {
         guard let input else { return }
+        if delta != .zero { noteCursorMotion(delta) }
         let size = bounds.size
         let k = input.hostPixelsPerPoint(viewSize: size, zoom: viewport.value.scale)
         let w = CGFloat(input.serverWidth), h = CGFloat(input.serverHeight)
@@ -576,6 +624,40 @@ final class RemoteInputView: UIView, UIPointerInteractionDelegate, UIGestureReco
         let fit = input.fittedRect(in: size)
         viewport.update { $0.follow(base, viewSize: size, content: fit) }
         onPointerMoved?(convert(viewport.value.toScreen(base, viewSize: size), to: nil))
+    }
+
+    // MARK: locating the cursor
+
+    /// A relative pointer motion of `d` view points: a shake enlarges the cursor.
+    func noteCursorMotion(_ d: CGPoint) {
+        guard shake.add(d, at: now()) else { return }
+        feedback?.feedback(.locateCursor(hold: CursorEffects.locateHold))
+    }
+
+    /// A hardware pointer at `p` (hover / drag): its delta feeds the shake detector.
+    func noteHardwarePointer(at p: CGPoint) {
+        if let last = lastPointerLocation { noteCursorMotion(CGPoint(x: p.x - last.x, y: p.y - last.y)) }
+        lastPointerLocation = p
+    }
+
+    /// Find Cursor (the floating menu): shows the cursor where it is (placing
+    /// it mid-screen if it never had a position), centres a zoomed viewport
+    /// on it and enlarges it. Works with visual feedback off.
+    func findCursor() {
+        guard let input else { return }
+        if let host = lastHost {
+            cursor?.move(toHostX: host.x, y: host.y, hostWidth: input.serverWidth, hostHeight: input.serverHeight)
+        } else {
+            moveCursor(by: .zero)
+        }
+        guard let base = cursorBasePoint else { return }
+        let size = bounds.size, fit = input.fittedRect(in: size)
+        if viewport.value.isZoomed {
+            viewport.update { $0.center(on: base, viewSize: size, content: fit) }
+            pointerInteraction?.invalidate()
+        }
+        onPointerMoved?(convert(viewport.value.toScreen(base, viewSize: size), to: nil))
+        feedback?.feedback(.locateCursor(hold: CursorEffects.findHold))
     }
 
     /// The cursor's unzoomed (BASE) view point, if it has a position.
@@ -602,8 +684,12 @@ final class RemoteInputView: UIView, UIPointerInteractionDelegate, UIGestureReco
         guard !pointerLocked else { return }
         switch g.state {
         case .began, .changed:
-            movePointer(to: g.location(in: self), coalescable: true)
+            let p = g.location(in: self)
+            if g.state == .began { lastPointerLocation = nil }
+            noteHardwarePointer(at: p)
+            movePointer(to: p, coalescable: true)
         case .ended, .cancelled, .failed:
+            lastPointerLocation = nil
             if buttons == 0 {
                 cursor?.hide()
                 onPointerMoved?(nil)
@@ -674,6 +760,7 @@ final class RemoteInputView: UIView, UIPointerInteractionDelegate, UIGestureReco
         let m = Self.mask(event?.buttonMask ?? [])
         let changed = m != 0 && m != buttons
         if changed { buttons = m }
+        noteHardwarePointer(at: t.location(in: self))
         movePointer(to: t.location(in: self), coalescable: !changed)
     }
 
@@ -719,35 +806,49 @@ final class RemoteInputView: UIView, UIPointerInteractionDelegate, UIGestureReco
         return CGPoint(x: t.x - prev.x, y: t.y - prev.y)
     }
 
+    /// Every scroll path ends here: `dy` host ticks (< 0 = up) at the
+    /// pointer, flipped when Settings → Scroll direction is Reversed.
     private func scrollAtPointer(_ dy: Int, fallback: CGPoint) {
         guard dy != 0, let input else { return }
         if lastHost == nil { movePointer(to: fallback, coalescable: false) }
         guard let host = lastHost else { return }
-        input.scroll(x: host.x, y: host.y, dy: dy)
+        input.scroll(x: host.x, y: host.y, dy: dy * preferences.scrollDirection.sign)
     }
 
     @objc private func trackpadScroll(_ g: UIPanGestureRecognizer) {
-        guard let input else { return }
+        guard input != nil else { return }
         if g.state == .began { stopInertia() }
         let d = delta(g)
         guard !pointerLocked else { return }          // GCMouse has the scroll
+        continuousScroll(d, at: g.location(in: self))
+    }
+
+    /// A hardware trackpad's continuous scroll of `d` view points (1:1).
+    func continuousScroll(_ d: CGPoint, at point: CGPoint) {
+        guard let input else { return }
         let ticks = trackpadScroll.ticks(points: d.y, ticksPerPoint: input.scrollTicksPerPoint(
             viewSize: bounds.size, zoom: viewport.value.scale))
-        scrollAtPointer(ticks, fallback: g.location(in: self))
+        scrollAtPointer(ticks, fallback: point)
     }
 
     @objc private func wheelScroll(_ g: UIPanGestureRecognizer) {
         if g.state == .began { stopInertia() }
         let d = delta(g)
-        guard d.y != 0, !pointerLocked else { return }
+        guard !pointerLocked else { return }
+        wheelScrolled(d, at: g.location(in: self))
+    }
+
+    /// A mouse wheel's discrete scroll of `d` view points (the wheel curve).
+    func wheelScrolled(_ d: CGPoint, at point: CGPoint) {
+        guard d.y != 0 else { return }
         let speed = input?.scrollSpeed ?? 1
         let ticks = wheel.ticks(wheelDelta: d.y / Tuning.pointsPerWheelNotch * speed,
-                                atMilliseconds: ProcessInfo.processInfo.systemUptime * 1000)
-        scrollAtPointer(ticks, fallback: g.location(in: self))
+                                atMilliseconds: now() * 1000)
+        scrollAtPointer(ticks, fallback: point)
     }
 
     /// A finger scroll (or a momentum step) of `d` view points.
-    private func scrollTouch(_ d: CGPoint) {
+    func scrollTouch(_ d: CGPoint) {
         guard let input else { return }
         if d.y != 0 { feedback?.feedback(.scrolled(dy: d.y)) }
         let ticks = touchScroll.ticks(points: d.y, ticksPerPoint: input.scrollSpeed * input.scrollTicksPerPoint(
@@ -1019,8 +1120,14 @@ final class RemoteInputView: UIView, UIPointerInteractionDelegate, UIGestureReco
     }
 
     private func lockedScrolled(dy: CGFloat) {
-        guard pointerLocked, let input, dy != 0 else { return }
+        guard pointerLocked else { return }
         stopInertia()
+        lockedScroll(dy: dy)
+    }
+
+    /// A pointer-lock (GCMouse) scroll of `dy` units.
+    func lockedScroll(dy: CGFloat) {
+        guard let input, dy != 0 else { return }
         let ticks = lockedScroll.ticks(points: dy * Tuning.lockedScrollPoints * input.scrollSpeed,
                                        ticksPerPoint: input.scrollTicksPerPoint(
             viewSize: bounds.size, zoom: viewport.value.scale))
