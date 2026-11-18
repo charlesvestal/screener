@@ -84,6 +84,8 @@ struct SessionControls {
     var getClipboard: (() -> Void)? = nil
     /// "Send Clipboard": send the iPad's text to the Mac; false if there was none.
     var sendClipboard: (() -> Bool)? = nil
+    /// "Switch Mac": the saved Macs to switch to (nil: no tile).
+    var switchMac: MacSwitcher? = nil
 }
 
 struct FloatingMenuView: View {
@@ -379,6 +381,9 @@ private struct ControlPanel: View {
             }
             .buttonStyle(.plain)
             .accessibilityLabel("Share Log")
+            if let switcher = controls.switchMac {
+                SwitchMacTile(switcher: switcher) { expanded = false }
+            }
             tile("Disconnect", "xmark.circle.fill", destructive: true) { controls.disconnect() }
         }
     }
@@ -442,7 +447,7 @@ private struct ControlPanel: View {
     }
 }
 
-private struct TileLabel: View {
+struct TileLabel: View {
     let title: String
     let image: String
     let selected: Bool

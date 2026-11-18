@@ -65,6 +65,7 @@ struct ConnectSheet: View {
                         Toggle("Save to Hosts", isOn: $editor.saveToHosts)
                     }
                 } else {
+                    SessionOverridesSection(overrides: $editor.overrides, macName: editor.effectiveName)
                     Section {
                         Toggle("Allow legacy (less secure) sign-in", isOn: $editor.allowLegacyAuth)
                     } header: {

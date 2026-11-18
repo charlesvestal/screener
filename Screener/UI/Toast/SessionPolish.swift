@@ -1,7 +1,9 @@
 // The session view's small extras, hosted by one modifier so SessionView
 // stays as it is (`.sessionPolish(model)`):
 //   - toasts (ToastCenter) for clipboard transfers, Mute, Display mode,
-//     Touch mode, and a resumed session ("Reconnected");
+//     Touch mode, Auto Clipboard, Smooth Playback, and a resumed session
+//     ("Reconnected"). On a saved Mac the setting toasts say "Saved for
+//     <name>": menu changes are remembered for that Mac (HostSessionSettings);
 //   - the stats overlay (the menu's Stats tile) and LiveStatsModel in the
 //     environment for the menu's quality badge;
 //   - Keep Screen Awake: the idle timer is off while a session is up
@@ -10,14 +12,18 @@ import SwiftUI
 import UIKit
 
 extension View {
-    func sessionPolish(_ model: SessionCoordinator) -> some View {
-        modifier(SessionPolish(model: model))
+    /// `savedFor`: the saved Mac menu changes are remembered for (nil: none).
+    func sessionPolish(_ model: SessionCoordinator, savedFor: String? = nil) -> some View {
+        modifier(SessionPolish(model: model, savedFor: savedFor))
     }
 }
 
 private struct SessionPolish: ViewModifier {
     let model: SessionCoordinator
+    let savedFor: String?
     @State private var toasts = ToastCenter()
+    @AppStorage(ClipboardSyncMode.defaultsKey) private var clipboardModeRaw = ClipboardSyncMode.default.rawValue
+    @AppStorage(PacingConfig.defaultsKey) private var smoothPlayback = false
     @AppStorage(AudioPlayer.mutedDefaultsKey) private var audioMuted = false
     @AppStorage(TouchInputMode.defaultsKey) private var touchModeRaw = TouchInputMode.default.rawValue
     @AppStorage(DisplayMode.defaultsKey) private var displayModeRaw = DisplayMode.default.rawValue
@@ -57,19 +63,36 @@ private struct SessionPolish: ViewModifier {
                 toasts.clear()
                 UIApplication.shared.isIdleTimerDisabled = false
             }
+            // Only while the session is up: the defaults are put back as it
+            // ends (HostSettingsOverlay), which is not the user's change.
             .onChange(of: audioMuted) { _, muted in
+                guard model.isSessionActive else { return }
                 toasts.show(muted ? "Muted" : "Unmuted",
-                            systemImage: muted ? "speaker.slash.fill" : "speaker.wave.2.fill", key: "audio")
+                            systemImage: muted ? "speaker.slash.fill" : "speaker.wave.2.fill", key: "audio",
+                            detail: savedDetail)
             }
             .onChange(of: touchModeRaw) { _, raw in
+                guard model.isSessionActive else { return }
                 let mode = TouchInputMode(rawValue: raw) ?? .default
                 toasts.show(SessionToasts.touchMode(mode),
                             systemImage: mode == .trackpad ? "rectangle.and.hand.point.up.left" : "hand.point.up.left",
-                            key: "touchMode")
+                            key: "touchMode", detail: savedDetail)
             }
             .onChange(of: displayModeRaw) { _, raw in
+                guard model.isSessionActive else { return }
                 toasts.show(SessionToasts.display(DisplayMode(rawValue: raw) ?? .default), systemImage: "display",
-                            key: "display")
+                            key: "display", detail: savedDetail)
+            }
+            .onChange(of: clipboardModeRaw) { _, raw in
+                guard model.isSessionActive else { return }
+                let auto = (ClipboardSyncMode(rawValue: raw) ?? .default) == .automatic
+                toasts.show(SessionToasts.autoClipboard(auto), systemImage: "arrow.left.arrow.right.circle",
+                            key: "clipboardMode", detail: savedDetail)
+            }
+            .onChange(of: smoothPlayback) { _, on in
+                guard model.isSessionActive else { return }
+                toasts.show(SessionToasts.smoothPlayback(on), systemImage: "waveform.path",
+                            key: "smoothPlayback", detail: savedDetail)
             }
             .onChange(of: model.isReconnecting) { was, now in
                 guard was, !now, model.hasFirstFrame, case .connected = model.state else { return }
@@ -81,8 +104,17 @@ private struct SessionPolish: ViewModifier {
     }
 }
 
+private extension SessionPolish {
+    var savedDetail: String? { savedFor.map(SessionToasts.savedFor) }
+}
+
 /// Toast texts.
 enum SessionToasts {
+    static func savedFor(_ name: String) -> String { "Saved for \(name)" }
+    static func autoClipboard(_ on: Bool) -> String { on ? "Auto Clipboard on" : "Auto Clipboard off" }
+    static func smoothPlayback(_ on: Bool) -> String {
+        on ? "Smooth Playback on (next connection)" : "Smooth Playback off (next connection)"
+    }
     static let sentToMac = "Copied to Mac ↗"
     static let fromMac = "Clipboard from Mac"
     static let reconnected = "Reconnected"

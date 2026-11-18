@@ -11,6 +11,12 @@ import UIKit
 /// it shows the connection stages, then zooms into the full-screen session
 /// (and the session shrinks back into it on disconnect). Pull to refresh
 /// restarts Bonjour discovery.
+///
+/// Per-Mac session settings (HostSessionSettings.swift): menu changes during
+/// a saved Mac's session are saved on it; the defaults come back when it
+/// ends. "Reconnect to Last Mac on Launch" (ResumeOnLaunch.swift) runs here
+/// once per process. The menu's "Switch Mac" (MacSwitcher) ends the session,
+/// shrinks it back into its card, and connects to the other Mac from its card.
 struct HostListView: View {
     @State private var model: SessionCoordinator
     @State private var connector: HostConnector
@@ -27,6 +33,14 @@ struct HostListView: View {
     @State private var connectingHostID: UUID?
     @Namespace private var zoomNamespace
     @AppStorage("feedback.visual") private var visualFeedback = true
+    // The per-Mac session settings' live keys (captured into the session's Mac).
+    @AppStorage(DisplayMode.defaultsKey) private var displayModeRaw = DisplayMode.default.rawValue
+    @AppStorage(TouchInputMode.defaultsKey) private var touchModeRaw = TouchInputMode.default.rawValue
+    @AppStorage(AudioPlayer.mutedDefaultsKey) private var audioMuted = false
+    @AppStorage(ClipboardSyncMode.defaultsKey) private var clipboardModeRaw = ClipboardSyncMode.default.rawValue
+    @AppStorage(PacingConfig.defaultsKey) private var smoothPlayback = false
+    /// "Reconnect to Last Mac on Launch" countdown.
+    @State private var resumer = LaunchResumer()
     @Query private var savedHosts: [SavedHost]
     @Environment(\.modelContext) private var context
     @Environment(\.scenePhase) private var scenePhase
@@ -68,10 +82,12 @@ struct HostListView: View {
                 }
                 .sheet(item: $sheet) { sheet in sheetView(sheet) }
                 .onChange(of: sheet?.id) { _, id in
+                    if id != nil { resumer.cancel() }
                     // A connect from a sheet other than a card's password prompt has no card.
                     if let id, !id.hasPrefix("password-") { zoomSource = nil; connectingHostID = nil }
                 }
                 .sheet(isPresented: $showSettings) { SettingsView() }
+                .onChange(of: showSettings) { _, shown in if shown { resumer.cancel() } }
                 .confirmationDialog("Delete \(pendingDelete?.name ?? "this Mac")?",
                                     isPresented: Binding(get: { pendingDelete != nil },
                                                          set: { if !$0 { pendingDelete = nil } }),
@@ -106,7 +122,7 @@ struct HostListView: View {
         .fullScreenCover(isPresented: Binding(
             get: { model.isSessionActive },
             set: { shown in if !shown, model.isSessionActive { Task { await model.disconnect() } } })) {
-            SessionView(model: model)
+            SessionView(model: model, switchMac: macSwitcher, savedFor: connector.sessionHostName)
                 // Every touch belongs to the Mac: no swipe/pinch-to-dismiss.
                 .interactiveDismissDisabled()
                 .modifier(SessionZoom(sourceID: zoomSource, namespace: zoomNamespace))
@@ -127,6 +143,7 @@ struct HostListView: View {
         .onChange(of: scenePhase) { _, phase in
             switch phase {
             case .background:
+                resumer.cancel()
                 let token = BackgroundTask.begin("close session")
                 browser.stop()
                 Task {
@@ -143,8 +160,15 @@ struct HostListView: View {
         // Browse only while the list is what's on screen.
         .onChange(of: model.isSessionActive) { _, active in
             if active { browser.stop() } else { browser.start() }
+            // The session is over: its Mac's settings give way to the defaults.
+            if !active { connector.sessionEnded() }
+        }
+        // A control-menu change during a saved Mac's session is saved on it.
+        .onChange(of: [displayModeRaw, touchModeRaw, clipboardModeRaw, "\(audioMuted)", "\(smoothPlayback)"]) {
+            connector.captureSessionSettings(context: context)
         }
         .onAppear { if !model.isSessionActive { browser.start() } }
+        .task { startResumeOnLaunch() }
         #if DEBUG
         .task { await DebugLaunch.runIfRequested(model) }
         .task { await DemoHosts.seed(context: context, thumbnails: thumbnails, browser: browser) }
@@ -256,7 +280,16 @@ struct HostListView: View {
 
     /// Connecting / failure status for a connect started from a card.
     @ViewBuilder private var statusBanner: some View {
-        if connector.isResolving || (model.state == .connecting && !model.isSessionActive) {
+        if let pending = resumer.pending {
+            HStack(spacing: 12) {
+                ProgressView()
+                Text("Connecting to \(pending.name)…")
+                Spacer()
+                Button("Cancel") { resumer.cancel() }
+            }
+            .padding()
+            .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 12))
+        } else if connector.isResolving || (model.state == .connecting && !model.isSessionActive) {
             HStack(spacing: 12) {
                 ProgressView()
                 Text(connector.isResolving ? "Looking up the Mac…" : model.stage.title)
@@ -324,15 +357,11 @@ struct HostListView: View {
 
     /// Connects with the stored password, or asks for one.
     private func open(_ host: SavedHost) {
+        resumer.cancel()
         guard !connector.isBusy else { return }
         connectingHostID = host.id
         zoomSource = visualFeedback ? host.id : nil
-        let stored: String?
-        do { stored = try connector.passwords.password(for: host.id) } catch {
-            Log.hosts.error("keychain read failed for \(host.id.uuidString): \(error)")
-            stored = nil
-        }
-        if let stored, !stored.isEmpty, !host.username.isEmpty {
+        if let stored = connector.storedPassword(for: host), !host.username.isEmpty {
             connect(host, username: nil, password: stored, remember: false)
         } else {
             sheet = .password(host)
@@ -344,6 +373,68 @@ struct HostListView: View {
         Task {
             await connector.connect(saved: host, username: username, password: password, remember: remember,
                                     service: service, context: context)
+        }
+    }
+
+    // MARK: - Switching Macs / resume on launch
+
+    /// The menu's "Switch Mac" list: every saved Mac, the session's marked.
+    private var macSwitcher: MacSwitcher? {
+        let current = connector.activeHostID
+        let macs = HostStore.ordered(savedHosts)
+        guard macs.contains(where: { $0.id != current }) else { return nil }
+        let options = macs.map { h in
+            MacSwitchOption(id: h.id, name: h.name, address: h.displayAddress,
+                            reachability: HostReachability.of(h, discovered: browser.hosts, isBrowsing: browser.isBrowsing),
+                            isCurrent: h.id == current)
+        }
+        return MacSwitcher(macs: options, select: { switchMac(to: $0) }, listShown: { shown in
+            if shown { browser.start() } else if model.isSessionActive { browser.stop() }
+        })
+    }
+
+    /// Ends this session (keys released, TCP close awaited), lets the session
+    /// view shrink back into its card, then connects to `id` from its card —
+    /// with its stored password, or asking for one.
+    private func switchMac(to id: UUID) {
+        guard let host = savedHosts.first(where: { $0.id == id }), id != connector.activeHostID else { return }
+        resumer.cancel()
+        let service = HostMatcher.discovered(for: host, in: browser.hosts)
+        let showCard = {
+            connectingHostID = host.id
+            zoomSource = visualFeedback ? host.id : nil
+        }
+        Task {
+            let outcome = await connector.switchSession(to: host, service: service, context: context) {
+                try? await Task.sleep(for: Self.coverDismissal)
+                showCard()
+            }
+            if outcome == .needsPassword {
+                try? await Task.sleep(for: Self.coverDismissal)
+                showCard()
+                sheet = .password(host)
+            }
+        }
+    }
+
+    /// Long enough for the session view's dismissal (zoom back into its card).
+    private static let coverDismissal: Duration = .milliseconds(500)
+
+    /// Cold launch, setting on, last Mac's password stored: connect after a
+    /// cancellable countdown (the banner).
+    private func startResumeOnLaunch() {
+        let cold = LaunchGate.shared.claim()
+        #if DEBUG
+        if UserDefaults.standard.string(forKey: "autoConnect") != nil || DemoHosts.mode != nil { return }
+        #endif
+        guard let host = ResumeOnLaunch.candidate(enabled: ResumeOnLaunch.isEnabled(), coldLaunch: cold,
+                                                  hosts: savedHosts,
+                                                  hasStoredPassword: { connector.storedPassword(for: $0) != nil })
+        else { return }
+        resumer.start(host) { id in
+            guard sheet == nil, !showSettings, !connector.isBusy, !model.isSessionActive,
+                  let host = savedHosts.first(where: { $0.id == id }) else { return }
+            open(host)
         }
     }
 

@@ -23,6 +23,13 @@ struct Toast: Identifiable, Equatable, Sendable {
     var key: String
     var text: String
     var systemImage: String?
+    /// A second, quieter line ("Saved for Studio").
+    var detail: String? = nil
+}
+
+extension Toast {
+    /// What VoiceOver hears.
+    var spoken: String { detail.map { "\(text). \($0)" } ?? text }
 }
 
 @MainActor @Observable
@@ -45,13 +52,13 @@ final class ToastCenter {
         self.schedule = schedule
     }
 
-    func show(_ text: String, systemImage: String? = nil, key: String? = nil) {
+    func show(_ text: String, systemImage: String? = nil, key: String? = nil, detail: String? = nil) {
         let key = key ?? text
         nextID += 1
-        let toast = Toast(id: nextID, key: key, text: text, systemImage: systemImage)
+        let toast = Toast(id: nextID, key: key, text: text, systemImage: systemImage, detail: detail)
         if current?.key == key {
             current = toast
-            announce(text)
+            announce(toast.spoken)
             startTimer()
         } else if let i = queued.firstIndex(where: { $0.key == key }) {
             queued[i] = toast
@@ -84,7 +91,7 @@ final class ToastCenter {
 
     private func present(_ toast: Toast) {
         current = toast
-        announce(toast.text)
+        announce(toast.spoken)
         startTimer()
     }
 
@@ -135,8 +142,13 @@ private struct ToastCapsule: View {
                 Image(systemName: image).font(.system(size: 15, weight: .semibold))
                     .contentTransition(.symbolEffect(.replace))
             }
-            Text(toast.text).font(.subheadline.weight(.semibold))
-                .contentTransition(.opacity)
+            VStack(alignment: .leading, spacing: 1) {
+                Text(toast.text).font(.subheadline.weight(.semibold))
+                    .contentTransition(.opacity)
+                if let detail = toast.detail {
+                    Text(detail).font(.caption).foregroundStyle(.secondary)
+                }
+            }
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 10)

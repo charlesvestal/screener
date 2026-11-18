@@ -10,6 +10,11 @@
 // v2: `macModel` (the server's DeviceInfo 0x456 model identifier, e.g.
 // "Macmini9,1"; the card's icon). V1 stays declared, unchanged, so a v1
 // store is recognised and migrated (lightweight: one new optional column).
+//
+// v3: `smoothPlayback` (a per-Mac Smooth Playback override). The per-Mac
+// session overrides — displayMode, inputMode, audioEnabled, clipboardEnabled,
+// smoothPlayback — are nil for "use the default" (Settings); see
+// HostSessionSettings.swift.
 import Foundation
 import SwiftData
 
@@ -106,12 +111,66 @@ enum HostsSchemaV2: VersionedSchema {
     }
 }
 
-typealias SavedHost = HostsSchemaV2.SavedHost
+enum HostsSchemaV3: VersionedSchema {
+    static let versionIdentifier = Schema.Version(3, 0, 0)
+    static var models: [any PersistentModel.Type] { [SavedHost.self] }
+
+    @Model
+    final class SavedHost {
+        @Attribute(.unique) var id: UUID
+        var name: String
+        /// Host name or IPv4 literal (for a Bonjour host: the last resolved IPv4).
+        var host: String
+        var port: Int
+        var username: String
+        var lastConnected: Date?
+        /// Manual order among hosts never connected to (lower first).
+        var sortOrder: Int
+        var createdAt: Date
+        /// The Bonjour (_rfb._tcp) service name this host was saved from. While
+        /// that service is on the network, connecting re-resolves it, so a
+        /// changed DHCP address is followed.
+        var bonjourName: String?
+
+        // Per-Mac session overrides (nil: use the default). displayMode:
+        // DisplayMode raw value; inputMode: TouchInputMode raw value;
+        // audioEnabled false = muted; clipboardEnabled true = automatic.
+        var displayMode: String?
+        var inputMode: String?
+        var audioEnabled: Bool?
+        var clipboardEnabled: Bool?
+        var macAddress: String?
+        var pinnedKeySHA256: Data?
+        var allowLegacyAuth: Bool?
+
+        /// v2: the Mac's model identifier (DeviceInfo 0x456), e.g. "Macmini9,1".
+        var macModel: String?
+
+        /// v3: Smooth Playback override (nil: use the default).
+        var smoothPlayback: Bool?
+
+        init(id: UUID = UUID(), name: String, host: String, port: Int = 5900, username: String,
+             lastConnected: Date? = nil, sortOrder: Int = 0, createdAt: Date = .now, bonjourName: String? = nil) {
+            self.id = id
+            self.name = name
+            self.host = host
+            self.port = port
+            self.username = username
+            self.lastConnected = lastConnected
+            self.sortOrder = sortOrder
+            self.createdAt = createdAt
+            self.bonjourName = bonjourName
+        }
+    }
+}
+
+typealias SavedHost = HostsSchemaV3.SavedHost
 
 enum HostsMigrationPlan: SchemaMigrationPlan {
-    static var schemas: [any VersionedSchema.Type] { [HostsSchemaV1.self, HostsSchemaV2.self] }
+    static var schemas: [any VersionedSchema.Type] { [HostsSchemaV1.self, HostsSchemaV2.self, HostsSchemaV3.self] }
     static var stages: [MigrationStage] {
-        [.lightweight(fromVersion: HostsSchemaV1.self, toVersion: HostsSchemaV2.self)]
+        [.lightweight(fromVersion: HostsSchemaV1.self, toVersion: HostsSchemaV2.self),
+         .lightweight(fromVersion: HostsSchemaV2.self, toVersion: HostsSchemaV3.self)]
     }
 }
 
@@ -129,7 +188,7 @@ enum HostStore {
     /// The app's persistent container (Application Support/default.store).
     /// `url`: a store file elsewhere (tests).
     static func makeContainer(inMemory: Bool = false, url: URL? = nil) throws -> ModelContainer {
-        let schema = Schema(versionedSchema: HostsSchemaV2.self)
+        let schema = Schema(versionedSchema: HostsSchemaV3.self)
         if !inMemory, url == nil {
             // The default store lives in Application Support, which doesn't
             // exist on a fresh install (CoreData logs a wall of stat errors).
@@ -196,6 +255,7 @@ enum HostStore {
         copy.pinnedKeySHA256 = host.pinnedKeySHA256
         copy.allowLegacyAuth = host.allowLegacyAuth
         copy.macModel = host.macModel
+        copy.smoothPlayback = host.smoothPlayback
         context.insert(copy)
         if let pw = try passwords.password(for: host.id) {
             try passwords.setPassword(pw, for: copy.id)

@@ -26,6 +26,9 @@ final class HostEditorModel {
     /// Edit mode: "Allow legacy (less secure) sign-in" (SavedHost.allowLegacyAuth;
     /// off by default — see AuthPolicy / security review H1).
     var allowLegacyAuth = false
+    /// Edit mode: this Mac's session settings ("Use Default" = nil; see
+    /// HostSessionSettings.swift).
+    var overrides = SessionOverrides()
     /// Edit mode: the Mac's identity key is pinned (shown in the form).
     private(set) var hasPinnedIdentity = false
     /// The Bonjour service this host is tied to (see SavedHost.bonjourName).
@@ -55,6 +58,7 @@ final class HostEditorModel {
         password = (try? passwords.password(for: saved.id)) ?? ""
         originalPassword = password
         allowLegacyAuth = saved.allowLegacyAuth ?? false
+        overrides = saved.sessionOverrides
         hasPinnedIdentity = saved.pinnedKeySHA256 != nil
     }
 
@@ -106,6 +110,7 @@ final class HostEditorModel {
             saved.port = Int(portValue)
             saved.username = username
             saved.allowLegacyAuth = allowLegacyAuth
+            saved.sessionOverrides = overrides
             if password.isEmpty {
                 try passwords.deletePassword(for: saved.id)
             } else if persistPassword {

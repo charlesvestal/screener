@@ -14,6 +14,16 @@
 // "This Mac's identity changed" sheet; only "Trust New Key" re-pins). A
 // saved host's address is updated from a Bonjour lookup only when its pinned
 // key matched, so a spoofed service can't redirect the saved host.
+//
+// Per-Mac session settings (HostSessionSettings.swift): a saved host's
+// overrides are applied (`settings.begin`) before its connect and the
+// defaults restored when its session is over (`sessionEnded`) or the connect
+// fails; in-session menu changes are saved on it (`captureSessionSettings`).
+//
+// Switching Macs (`switchSession`): the current session is torn down first —
+// keys released, TCP close awaited (SessionCoordinator.disconnect) — and its
+// settings restored; only then does the other Mac connect, with its own
+// stored credentials (or the caller asks for them).
 import Foundation
 import Observation
 import SwiftData
@@ -33,10 +43,18 @@ final class HostConnector {
     /// The saved host of the current (or last) session: its card gets the
     /// session's last picture as a thumbnail and its model identifier.
     private(set) var activeHostID: UUID?
+    /// The saved Mac whose session settings are in effect ("Saved for <name>").
+    private(set) var sessionHostName: String?
+    @ObservationIgnored let settings: HostSettingsOverlay
+    /// A saved-host connect or a switch is running (the session going away
+    /// in between must not restore the defaults under it).
+    @ObservationIgnored private var inFlight = 0
 
-    init(model: SessionCoordinator, passwords: any PasswordStore = KeychainPasswordStore()) {
+    init(model: SessionCoordinator, passwords: any PasswordStore = KeychainPasswordStore(),
+         settingsDefaults: UserDefaults = .standard) {
         self.model = model
         self.passwords = passwords
+        self.settings = HostSettingsOverlay(defaults: settingsDefaults)
     }
 
     var isBusy: Bool { isResolving || model.isBusy }
@@ -91,6 +109,7 @@ final class HostConnector {
         generation += 1
         error = nil
         await model.disconnect()
+        endSessionSettings()
     }
 
     /// Connects to a saved host with `password`. `remember`: store the
@@ -98,10 +117,22 @@ final class HostConnector {
     func connect(saved: SavedHost, username: String? = nil, password: String, remember: Bool,
                  service: DiscoveredHost?, context: ModelContext) async {
         guard let port = saved.portValue else { error = "Invalid port \(saved.port)."; return }
+        guard !isBusy else { return }
+        inFlight += 1
+        defer { inFlight -= 1 }
         let user = username ?? saved.username
+        beginSessionSettings(saved)
+        let startGeneration = generation
         let result = await connect(host: saved.host, port: port, username: user, password: password, service: service,
                                    authPolicy: Self.authPolicy(for: saved), savedHostID: saved.id)
-        guard result.connected else { return }
+        guard result.connected else {
+            // Only this connect's own failure: after a cancel or a switch
+            // (generation moved on) the settings are no longer this one's.
+            if generation == startGeneration + 1, settings.hostID == saved.id, !model.isSessionActive {
+                endSessionSettings()
+            }
+            return
+        }
         markConnected(saved, resolvedAddress: result.resolvedAddress, username: user,
                       rememberPassword: remember ? password : nil, context: context)
     }
@@ -133,6 +164,7 @@ final class HostConnector {
                        rememberPassword: String?, context: ModelContext, now: Date = .now,
                        presentedKey: Data? = nil) {
         activeHostID = saved.id
+        beginSessionSettings(saved)
         saved.lastConnected = now
         if let m = model.deviceModel, !m.isEmpty { saved.macModel = m }
         let presented = presentedKey ?? model.serverKeySHA256
@@ -155,6 +187,80 @@ final class HostConnector {
             }
         }
         do { try context.save() } catch { Log.hosts.error("couldn't save host: \(error)") }
+    }
+
+    // MARK: per-Mac session settings
+
+    private func beginSessionSettings(_ saved: SavedHost) {
+        settings.begin(saved)
+        sessionHostName = settings.hostName
+    }
+
+    private func endSessionSettings() {
+        settings.end()
+        sessionHostName = nil
+    }
+
+    /// The session view went away: restore the defaults, unless a connect or
+    /// a switch is under way (it manages them) or a session is still up.
+    func sessionEnded() {
+        guard inFlight == 0, !model.isSessionActive, !isBusy else { return }
+        endSessionSettings()
+    }
+
+    /// The live settings changed (control menu): save what the user changed
+    /// on the Mac in session. Returns the fields saved.
+    @discardableResult
+    func captureSessionSettings(context: ModelContext) -> [SessionSettings.Field] {
+        guard let id = settings.hostID,
+              let host = try? context.fetch(FetchDescriptor<SavedHost>(predicate: #Predicate { $0.id == id })).first
+        else { return [] }
+        let fields = settings.captureChanges(into: host)
+        guard !fields.isEmpty else { return [] }
+        do { try context.save() } catch { Log.hosts.error("couldn't save the Mac's session settings: \(error)") }
+        Log.hosts.info("host \(id.uuidString): saved \(fields.map(\.rawValue).joined(separator: ", "))")
+        return fields
+    }
+
+    // MARK: switching Macs
+
+    /// The password stored for `saved` (nil: none, or the Keychain failed).
+    func storedPassword(for saved: SavedHost) -> String? {
+        do {
+            guard let pw = try passwords.password(for: saved.id), !pw.isEmpty else { return nil }
+            return pw
+        } catch {
+            Log.hosts.error("keychain read failed for \(saved.id.uuidString): \(error)")
+            return nil
+        }
+    }
+
+    enum SwitchOutcome: Equatable {
+        /// Connected to the new Mac (or tried: see `model.state` / `error`).
+        case connected, failed
+        /// No stored password (or username): ask for it, then `connect(saved:)`.
+        case needsPassword
+    }
+
+    /// Ends the current session cleanly (held keys released, TCP close
+    /// awaited, its settings restored), then connects to `saved` with its
+    /// own stored credentials. `beforeConnect` runs between the two (the UI
+    /// lets the old session view go away).
+    func switchSession(to saved: SavedHost, service: DiscoveredHost?, context: ModelContext,
+                       beforeConnect: @MainActor () async -> Void = {}) async -> SwitchOutcome {
+        inFlight += 1
+        defer { inFlight -= 1 }
+        Log.hosts.info("switching to host \(saved.id.uuidString)")
+        generation += 1
+        await model.disconnect()
+        endSessionSettings()
+        // activeHostID stays until the next connect starts: the old session's
+        // last picture (rendered just after teardown) still goes to its card.
+        guard let password = storedPassword(for: saved), !saved.username.isEmpty else { return .needsPassword }
+        await beforeConnect()
+        await connect(saved: saved, password: password, remember: false, service: service, context: context)
+        if case .connected = model.state { return .connected }
+        return .failed
     }
 
     /// The session reported the Mac's model (DeviceInfo 0x456): remember it

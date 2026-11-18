@@ -10,6 +10,10 @@ import UniformTypeIdentifiers
 /// ("Reconnecting…" over the last picture while a suspended session is resumed).
 struct SessionView: View {
     let model: SessionCoordinator
+    /// The menu's "Switch Mac" list (HostListView; nil: no tile).
+    var switchMac: MacSwitcher? = nil
+    /// The saved Mac menu changes are remembered for ("Saved for <name>").
+    var savedFor: String? = nil
     @State private var keyboardVisible = false
     @State private var menu = ControlMenuModel()
     @State private var menuExpanded = false
@@ -36,7 +40,8 @@ struct SessionView: View {
                              controls: SessionControls(inputAvailable: model.input != nil,
                                                        disconnect: { Task { await model.disconnect() } },
                                                        getClipboard: { model.clipboard.fetchFromMac() },
-                                                       sendClipboard: { model.clipboard.sendToMac() }))
+                                                       sendClipboard: { model.clipboard.sendToMac() },
+                                                       switchMac: switchMac))
             // App-switcher / Home Screen privacy (L5): cover only while the
             // scene is actually `.background` — the phase in which iOS keeps
             // a snapshot of it. NOT on every non-`.active` phase: Split View,
@@ -61,7 +66,7 @@ struct SessionView: View {
             model.setDisplayMode(DisplayMode(rawValue: raw) ?? .default)
         }
         // Toasts, the stats overlay, Keep Screen Awake (UI/Toast/SessionPolish.swift).
-        .sessionPolish(model)
+        .sessionPolish(model, savedFor: savedFor)
         .statusBarHidden(true)
         .persistentSystemOverlays(.hidden)
     }

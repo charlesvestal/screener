@@ -9,6 +9,9 @@ struct ScreenerApp: App {
 
     init() {
         Log.app.info("Screener launched")
+        // A session that never ended (crash / killed while suspended) may have
+        // left a saved Mac's session settings in place of the defaults.
+        HostSettingsOverlay.recoverAfterCrash()
         do {
             hosts = try HostStore.makeContainer()
         } catch {

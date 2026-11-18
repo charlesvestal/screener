@@ -14,6 +14,7 @@ struct SettingsView: View {
     @AppStorage(AudioPlayer.mutedDefaultsKey) private var audioMuted = false
     @AppStorage(ScreenerSettings.scrollSpeedKey) private var scrollSpeed = ScreenerSettings.scrollSpeedDefault
     @AppStorage(ScreenerSettings.keepAwakeKey) private var keepAwake = ScreenerSettings.keepAwakeDefault
+    @AppStorage(ResumeOnLaunch.enabledKey) private var reconnectOnLaunch = ResumeOnLaunch.enabledDefault
     @State private var showAcknowledgements = false
 
     private var displayMode: DisplayMode { DisplayMode(rawValue: displayModeRaw) ?? .default }
@@ -74,6 +75,7 @@ struct SettingsView: View {
                     Toggle("Auto Clipboard", isOn: autoClipboard)
                     Toggle("Mute Audio", isOn: $audioMuted)
                     Toggle("Keep Screen Awake", isOn: $keepAwake)
+                    Toggle("Reconnect to Last Mac on Launch", isOn: $reconnectOnLaunch)
                 } header: {
                     Text("Session")
                 } footer: {
@@ -81,14 +83,16 @@ struct SettingsView: View {
                          + "to allow pasting. Items a password manager marks as concealed or transient are never "
                          + "sent automatically, and text from the Mac stays on this iPad (not shared with your other "
                          + "devices via Universal Clipboard). Keep Screen Awake stops the iPad from locking while "
-                         + "connected.")
+                         + "connected. Reconnect to Last Mac on Launch connects to the Mac you used last when "
+                         + "Screener opens, if its password is saved (you can cancel it).")
                 }
 
                 Section {
                     Button("Acknowledgements") { showAcknowledgements = true }
                     ShareLogButton()
                 } footer: {
-                    Text("These defaults can also be changed from the control menu during a session.")
+                    Text("These are the defaults. Each saved Mac can override them (Edit Mac → Session), and "
+                         + "changes made from the control menu during a session are remembered for that Mac.")
                 }
             }
             .navigationTitle("Settings")
