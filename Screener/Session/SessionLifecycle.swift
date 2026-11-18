@@ -121,6 +121,47 @@ enum UserFacingError {
     }
 }
 
+/// The privacy cover shown over the remote screen so iOS's own snapshot
+/// machinery never persists a picture of the Mac's screen (the app switcher
+/// thumbnail, the Home Screen icon preview). A pure function of scene-phase
+/// transitions, so the policy is unit-tested without a live scene.
+///
+/// `.background` is the only phase in which UIKit captures and keeps a
+/// snapshot of the scene — so it's the only phase that needs covering.
+///
+/// `.inactive` deliberately does NOT cover: that was the bug in e0785df.
+/// The scene turns `.inactive` for a Split View sibling becoming key, a
+/// system banner ("Allow Paste"), Control Center, and other moments the
+/// user is still sitting right next to the Mac and working beside the
+/// session — covering there blanked the screen while they were using it.
+///
+/// Trade-off (documented, not verified live — no device runs for this fix):
+/// on iPadOS, a quick swipe-up *peek* at the app switcher, without actually
+/// switching away, can snapshot the scene while it is merely `.inactive` —
+/// the scene never reaches `.background` if the user lets go and returns to
+/// Screener. From scene-phase alone (and from
+/// `UIApplication.shared.applicationState`, which mirrors the same
+/// single-scene phase here, since Screener has one scene) that `.inactive`
+/// is indistinguishable from an ordinary Split View focus change, which must
+/// stay uncovered. We accept the small risk of one live frame in that one
+/// gesture rather than reintroduce blanking on every ordinary `.inactive`.
+struct PrivacyCoverPolicy: Equatable, Sendable {
+    /// Mirrors SwiftUI.ScenePhase's cases without requiring SwiftUI, so the
+    /// policy — and its tests — don't need to import SwiftUI or touch a
+    /// live scene.
+    enum Phase: Equatable, Sendable { case active, inactive, background }
+
+    private(set) var showCover = false
+
+    /// Call on every scene-phase change; returns the (also stored) new
+    /// `showCover` value.
+    @discardableResult
+    mutating func phaseChanged(to phase: Phase) -> Bool {
+        showCover = (phase == .background)
+        return showCover
+    }
+}
+
 /// Background / foreground and auto-reconnect decisions.
 struct LifecyclePolicy: Equatable, Sendable {
     enum SessionStatus: Equatable, Sendable { case none, connecting, connected }

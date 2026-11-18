@@ -88,6 +88,54 @@ final class UserFacingErrorTests: XCTestCase {
     }
 }
 
+final class PrivacyCoverPolicyTests: XCTestCase {
+    func testBackgroundShowsTheCover() {
+        var p = PrivacyCoverPolicy()
+        XCTAssertFalse(p.showCover)
+        XCTAssertTrue(p.phaseChanged(to: .background))
+        XCTAssertTrue(p.showCover)
+    }
+
+    /// The e0785df bug: every non-`.active` phase (including `.inactive`)
+    /// blanked the screen, hiding the session during Split View focus
+    /// changes and system banners. Only `.background` may cover now.
+    func testInactiveNeverShowsTheCover() {
+        var p = PrivacyCoverPolicy()
+        XCTAssertFalse(p.phaseChanged(to: .inactive))
+        XCTAssertFalse(p.showCover)
+
+        _ = p.phaseChanged(to: .background)
+        // Returning via .inactive (the normal foreground path) still hides it.
+        XCTAssertFalse(p.phaseChanged(to: .inactive))
+        XCTAssertFalse(p.showCover)
+    }
+
+    func testActiveAlwaysHidesTheCover() {
+        var p = PrivacyCoverPolicy()
+        _ = p.phaseChanged(to: .background)
+        XCTAssertFalse(p.phaseChanged(to: .active))
+        XCTAssertFalse(p.showCover)
+    }
+
+    /// background → inactive → active (the normal return-to-foreground
+    /// sequence): covered only for the middle (background) phase.
+    func testFullBackgroundAndForegroundCycle() {
+        var p = PrivacyCoverPolicy()
+        XCTAssertTrue(p.phaseChanged(to: .background))
+        XCTAssertFalse(p.phaseChanged(to: .inactive))
+        XCTAssertFalse(p.phaseChanged(to: .active))
+    }
+
+    /// active → inactive → active (Split View / system banner, no actual
+    /// backgrounding): never covered.
+    func testInactiveWithoutBackgroundingIsNeverCovered() {
+        var p = PrivacyCoverPolicy()
+        XCTAssertFalse(p.phaseChanged(to: .active))
+        XCTAssertFalse(p.phaseChanged(to: .inactive))
+        XCTAssertFalse(p.phaseChanged(to: .active))
+    }
+}
+
 final class LifecyclePolicyTests: XCTestCase {
     func testBackgroundWithASessionSuspendsAndActiveReconnects() {
         var p = LifecyclePolicy()

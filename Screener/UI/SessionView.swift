@@ -18,6 +18,9 @@ struct SessionView: View {
     @AppStorage(TouchInputMode.defaultsKey) private var touchModeRaw = TouchInputMode.default.rawValue
     @AppStorage(DisplayMode.defaultsKey) private var displayModeRaw = DisplayMode.default.rawValue
     @Environment(\.scenePhase) private var scenePhase
+    /// Pure policy (SessionLifecycle.swift): covers only on `.background`,
+    /// not on every `.inactive` (see its doc comment for the trade-off).
+    @State private var privacyCover = PrivacyCoverPolicy()
 
     var body: some View {
         ZStack {
@@ -34,11 +37,19 @@ struct SessionView: View {
                                                        disconnect: { Task { await model.disconnect() } },
                                                        getClipboard: { model.clipboard.fetchFromMac() },
                                                        sendClipboard: { model.clipboard.sendToMac() }))
-            // App-switcher privacy (L5): the snapshot iPadOS takes when the
-            // scene leaves the foreground must not show the Mac's screen.
-            if scenePhase != .active {
+            // App-switcher / Home Screen privacy (L5): cover only while the
+            // scene is actually `.background` — the phase in which iOS keeps
+            // a snapshot of it. NOT on every non-`.active` phase: Split View,
+            // system banners ("Allow Paste"), and Control Center turn the
+            // scene `.inactive` too, and blanking then hid the session while
+            // the user was working right beside the Mac (PrivacyCoverPolicy
+            // in SessionLifecycle.swift has the full reasoning + trade-off).
+            if privacyCover.showCover {
                 PrivacyCover().transition(.identity)
             }
+        }
+        .onChange(of: scenePhase, initial: true) { _, phase in
+            privacyCover.phaseChanged(to: PrivacyCoverPolicy.Phase(phase))
         }
         .onAppear {
             // Read on demand from the in-memory connect request (cleared on
@@ -56,7 +67,19 @@ struct SessionView: View {
     }
 }
 
-/// Covers the remote screen while the scene isn't active (app switcher snapshot).
+private extension PrivacyCoverPolicy.Phase {
+    init(_ phase: ScenePhase) {
+        switch phase {
+        case .active: self = .active
+        case .inactive: self = .inactive
+        case .background: self = .background
+        @unknown default: self = .inactive
+        }
+    }
+}
+
+/// Covers the remote screen while the scene is `.background` (app switcher /
+/// Home Screen snapshot) — see PrivacyCoverPolicy for why not `.inactive` too.
 private struct PrivacyCover: View {
     var body: some View {
         ZStack {

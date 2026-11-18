@@ -60,3 +60,7 @@ build-sec2/
 build-sec2-dev/
 build-ripple/
 build-ripple-dev/
+build-tint/
+build-tint-dev/
+build-cover/
+build-cover-dev/
