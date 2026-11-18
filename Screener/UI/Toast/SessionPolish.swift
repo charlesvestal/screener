@@ -94,6 +94,10 @@ private struct SessionPolish: ViewModifier {
                 toasts.show(SessionToasts.smoothPlayback(on), systemImage: "waveform.path",
                             key: "smoothPlayback", detail: savedDetail)
             }
+            .onChange(of: model.fallbackReason != nil) { _, fellBack in
+                guard fellBack else { return }
+                toasts.show(FallbackText.toast, systemImage: "tortoise.fill", key: "session")
+            }
             .onChange(of: model.isReconnecting) { was, now in
                 guard was, !now, model.hasFirstFrame, case .connected = model.state else { return }
                 toasts.show(SessionToasts.reconnected, systemImage: "checkmark.circle.fill", key: "session")

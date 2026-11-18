@@ -15,7 +15,8 @@
 // known and bounded:
 //   - the 0x1f ClipboardSend payload (after its 16-byte header),
 //   - a 0x450 cursor STORE once its comp_len is buffered,
-//   - a 0x06 zlib rect once its u32 length is buffered.
+//   - a 0x06 zlib rect once its u32 length is buffered,
+//   - a raw (0) rect (framebuffer mode only; its length is w*h*4).
 // Anything else left incomplete at the end of a record (e.g. an FBU that
 // claims more rects than its record holds) is dropped when the next record
 // arrives, and that record is parsed as a fresh message. Once a message is
@@ -34,6 +35,9 @@
 //   0x06 zlib .......... u32 length + payload      (RFC 6143 zlib / RFC §8.9.3; the
 //                        reference aborts the walk on 0x06 — see below)
 //   16 ZRLE ............ u32 length + payload      (RFC 6143 §7.7.6; skipped, `.unknown`)
+//   0 Raw .............. w*h*4 bytes               (RFC 6143 §7.7.1; ONLY with
+//                        `framebufferMode` — the TCP fallback sets 32-bpp
+//                        pixels — otherwise unknown, as before)
 //   -223 DesktopSize ... no payload                (RFC 6143 §7.8.2; skipped silently)
 //   anything else ...... length unknowable: emit `.unknown(type: 0, encoding:)`
 //                        and discard the rest of the record, exactly like the
@@ -135,6 +139,11 @@ enum ServerEvent: Equatable, Sendable {
     case bell
     /// 0x06 zlib rect, raw compressed payload (decoded on a persistent stream later).
     case zlibRect(x: Int, y: Int, w: Int, h: Int, payload: Data)
+    /// Raw (0) rect, w*h*4 pixel bytes (framebuffer mode only).
+    case rawRect(x: Int, y: Int, w: Int, h: Int, pixels: Data)
+    /// The end of a FramebufferUpdate (framebuffer mode only): the TCP
+    /// fallback publishes the picture and requests the next update.
+    case framebufferUpdateEnd
     /// Unknown message type, or (type 0) an unknown rect encoding.
     case unknown(type: UInt8, encoding: Int32? = nil)
 }
@@ -157,7 +166,9 @@ struct ServerMessageParser {
         case stream
     }
 
-    static let maxPendingBytes = 16 << 20
+    /// A full-screen raw/zlib rect at the largest backing (3840×3840×4 ≈
+    /// 59 MB) still fits.
+    static let maxPendingBytes = 64 << 20
 
     private enum State {
         case idle
@@ -173,6 +184,10 @@ struct ServerMessageParser {
     /// True only while the pending message may legitimately continue in the
     /// next record (see FRAMING). Cleared whenever a message/rect completes.
     private var spanOK = false
+
+    /// TCP fallback (Task 19): parse raw (0) rects as 32-bpp pixels and
+    /// report `.framebufferUpdateEnd` after every FramebufferUpdate.
+    var framebufferMode = false
 
     init(framing: Framing = .records) { self.framing = framing }
 
@@ -206,13 +221,18 @@ struct ServerMessageParser {
                 guard pos < buf.count else { break loop }
                 guard try startMessage(&events) else { break loop }
             case .fbu(let left, let sawRekey):
-                if left == 0 { finishMessage(halt: sawRekey); continue }
+                if left == 0 {
+                    if framebufferMode { events.append(.framebufferUpdateEnd) }
+                    finishMessage(halt: sawRekey); continue
+                }
                 switch parseRect(&events, afterRekey: sawRekey) {
                 case .needMore: break loop
                 case .done(let isRekey):
                     spanOK = false
                     state = .fbu(rectsLeft: left - 1, sawRekey: sawRekey || isRekey)
-                case .abort: finishMessage(halt: sawRekey)
+                case .abort:
+                    if framebufferMode { events.append(.framebufferUpdateEnd) }
+                    finishMessage(halt: sawRekey)
                 }
             case .clipboard(let header, let remaining):
                 let n = min(remaining, buf.count - pos)
@@ -415,6 +435,17 @@ struct ServerMessageParser {
                 events.append(.unknown(type: 0x00, encoding: enc))
             }
             pos = p + 4 + n
+            return .done(isRekey: false)
+
+        case 0 where framebufferMode:   // Raw: w*h*4 bytes (32 bpp in the fallback)
+            let n = rw * rh * 4
+            guard n <= Self.maxPendingBytes else {
+                Log.control.error("raw rect \(rw)x\(rh) exceeds the buffer cap; aborting record")
+                return abortRect(&events, enc: enc, afterRekey: afterRekey, scanForAnswer: false)
+            }
+            guard have >= n else { spanOK = true; return .needMore }
+            events.append(.rawRect(x: rx, y: ry, w: rw, h: rh, pixels: slice(p, n)))
+            pos = p + n
             return .done(isRekey: false)
 
         case -223:    // DesktopSize pseudo-encoding: no payload

@@ -60,6 +60,16 @@ struct SessionStatusOverlay: View {
             .animation(.easeInOut(duration: 0.25), value: model.isReconnecting)
             .animation(.easeInOut(duration: 0.25), value: model.hasFirstFrame)
         }
+        // TCP-only fallback (Task 19): the picture comes over the control
+        // connection (framebuffer path) instead of HP video.
+        .overlay(alignment: .bottomLeading) {
+            if model.fallbackReason != nil, model.hasFirstFrame {
+                ReducedPerformanceBadge()
+                    .padding(.leading, 20).padding(.bottom, 24)
+                    .transition(.opacity)
+            }
+        }
+        .animation(.easeInOut(duration: 0.25), value: model.fallbackReason != nil && model.hasFirstFrame)
         .allowsHitTesting(false)
         .onChange(of: model.hasFirstFrame, initial: true) { _, has in
             if has {
@@ -107,5 +117,19 @@ struct SessionStatusOverlay: View {
         .glassEffect(.regular, in: .capsule)
         .accessibilityElement(children: .combine)
         .animation(.easeInOut(duration: 0.2), value: model.stage)
+    }
+}
+
+/// "Reduced performance": the session runs on the TCP framebuffer path
+/// (SessionCoordinator.fallbackReason) — lower frame rate, no HP video.
+struct ReducedPerformanceBadge: View {
+    var body: some View {
+        Label(FallbackText.badge, systemImage: "tortoise.fill")
+            .font(.caption.weight(.semibold))
+            .foregroundStyle(.white)
+            .padding(.horizontal, 12).padding(.vertical, 7)
+            .glassEffect(.regular, in: .capsule)
+            .accessibilityLabel("Reduced performance. High Performance video isn't available; "
+                                + "the picture comes over a slower path.")
     }
 }

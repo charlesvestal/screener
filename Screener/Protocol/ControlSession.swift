@@ -62,6 +62,22 @@
 //     fallback canvas (live, 2026-11-18).
 //   * Session-select cmd 0/2 (share console / alt session) is not implemented
 //     in v1: the prompt is reported as `.sessionSelectUnsupported`.
+//
+// TCP-only fallback (Task 19; RFC §11 Profile A, §12; not in the reference,
+// which has no framebuffer client): `enterFramebufferMode(serverInit:sink:)`
+// switches a running session to classic RFB pixels on the control channel —
+// SetPixelFormat (only if ServerInit's format isn't 32-bit true colour),
+// SetEncodings `ClientMessage.framebufferEncodings` (zlib + raw +
+// pseudo-encodings, no 0x3f2/0x3f3/0x3ea: R-A18), a non-incremental 0x03,
+// then one incremental full-screen 0x03 after each update is consumed (at
+// most every `framebufferMinInterval`, re-sent after `framebufferRequestStale`
+// without an update), never 0x09. Pixel events (zlib/raw rects, update ends)
+// go to the sink — buffered until one is attached — and not to `events`. The
+// 1×1 cursor poll and the 0x1c re-offer on a resize stop.
+// `Config.framebufferOnly` connects without any media offer;
+// `Config.fallbackOnMediaFailure` returns from `start()` with
+// `MediaParams.framebufferOnly` instead of throwing when the 0x1c
+// negotiation fails, so the caller can fall back on this connection.
 import CoreGraphics
 import Foundation
 
@@ -136,6 +152,12 @@ actor ControlSession {
         var dynamicDisplay = true
         /// Pinned server key / legacy sign-in permission (H1; Authenticator.runWithFallback).
         var authPolicy = AuthPolicy()
+        /// TCP fallback: connect without a 0x1c media offer; `start()` returns
+        /// `MediaParams.framebufferOnly` (then call `enterFramebufferMode`).
+        var framebufferOnly = false
+        /// TCP fallback: a failed 0x1c negotiation returns
+        /// `MediaParams.framebufferOnly` (connection kept) instead of throwing.
+        var fallbackOnMediaFailure = false
         /// Handshake progress for the UI (ConnectionStage): auth ok, record
         /// layer active, media answer. Called on the session's actor.
         var onMilestone: (@Sendable (ConnectionMilestone) -> Void)?
@@ -156,6 +178,10 @@ actor ControlSession {
         var retryAnswerWait: Duration = .seconds(5)                // _read_video_answer settimeout(5.0)
         /// How often start() logs "still waiting for <step>" (diagnostics).
         var progressLogInterval: Duration = .seconds(5)
+        /// TCP fallback: at most one incremental 0x03 per this interval...
+        var framebufferMinInterval: Duration = .milliseconds(33)
+        /// ...and one is re-sent if no update consumed the last for this long.
+        var framebufferRequestStale: Duration = .seconds(2)
     }
 
     /// Injection points for tests.
@@ -209,6 +235,9 @@ actor ControlSession {
         /// SHA-256 of the Mac's RSA1 key (the TOFU pin) and how we signed in.
         var serverKeySHA256: Data? = nil
         var authMethod: AuthResult.Method = .srp
+        /// No media stream: `Config.framebufferOnly`, or the 0x1c negotiation
+        /// failed under `Config.fallbackOnMediaFailure` (keys/offers unused).
+        var framebufferOnly = false
     }
 
     /// Every server message after the rekey (plaintext prelude messages are
@@ -258,6 +287,18 @@ actor ControlSession {
     /// The backing size of the last 0x451 (the first one only confirms).
     private var lastLayoutBacking: (width: Int, height: Int)?
     private(set) var reoffersSent = 0
+
+    // TCP fallback (see the header).
+    private(set) var framebufferMode = false
+    private var framebufferSink: (@Sendable (ServerEvent) -> Void)?
+    /// Pixel events that arrived before a sink was attached.
+    private var framebufferBacklog: [ServerEvent] = []
+    static let framebufferBacklogLimit = 4096
+    private var framebufferRequestOutstanding = false
+    private var framebufferRequestScheduled = false
+    private var lastFramebufferRequest = ContinuousClock.now
+    private var framebufferWatchdog: Task<Void, Never>?
+    private(set) var framebufferRequestsSent = 0
 
     init(config: Config, tuning: Tuning = Tuning(), seams: Seams = .live) {
         self.config = config
@@ -350,6 +391,7 @@ actor ControlSession {
         let display = cfg.dynamicDisplay ? requested
             : DisplayGeometry.matching(serverWidth: serverInit.width, serverHeight: serverInit.height) ?? requested
         let scale = display.hidpiScale
+        let encodings = cfg.framebufferOnly ? ClientMessage.framebufferEncodings : ClientMessage.hpEncodingsFull
         let sdc = ClientMessage.setDisplayConfiguration(logicalWidth: display.logicalWidth,
                                                         logicalHeight: display.logicalHeight,
                                                         hidpiScale: scale, dynamic: cfg.dynamicDisplay,
@@ -362,7 +404,7 @@ actor ControlSession {
         switch cfg.startupOrder {
         case .reference:
             try await writePlain(sdc)
-            try await writePlain(ClientMessage.setEncodings())
+            try await writePlain(ClientMessage.setEncodings(encodings))
         case .native:
             try await writePlain(ClientMessage.setMode(1) + ClientMessage.setEncryption(command: .stop))
         }
@@ -377,7 +419,26 @@ actor ControlSession {
         Log.control.info("rekey received; record layer installed")
         cfg.onMilestone?(.recordLayerActive)
         let initial = rekey.tail
+        if cfg.framebufferOnly { framebufferMode = true }
         rxTask = Task { [weak self] in await self?.rxLoop(initial: initial) }
+
+        if cfg.framebufferOnly {
+            // No 0x1c: the encrypted preface only; enterFramebufferMode sends
+            // the encodings and the first 0x03.
+            beginStep("framebuffer preface")
+            switch cfg.startupOrder {
+            case .reference:
+                try await writePlain(ClientMessage.setEncryption(command: .stop))
+                try await Task.sleep(for: tuning.postToggleSettle)
+            case .native:
+                try await Task.sleep(for: tuning.postToggleSettle)
+                try await send(sdc)
+            }
+            beginStep("done")
+            guard let record else { throw ControlSessionError.closed }
+            Log.control.info("M2 framebuffer-only session (no media offer)")
+            return framebufferParams(serverInit: serverInit, record: record, auth: auth)
+        }
 
         // 5) Encrypted preface + 0x1c offer (_phase_enable_enc1103 / _phase_media_offer).
         beginStep("media offer")
@@ -417,8 +478,17 @@ actor ControlSession {
             if case .answer = outcome { break }
             if case .timedOut = outcome { lastTimedOut = true } else { lastTimedOut = false }
             guard attempt < tuning.degenerateRetryLimit else {
-                if lastTimedOut { throw ControlSessionError.timeout(step: "media answer") }
-                throw ControlSessionError.mediaNegotiationFailed
+                let error: ControlSessionError = lastTimedOut ? .timeout(step: "media answer") : .mediaNegotiationFailed
+                if cfg.fallbackOnMediaFailure, !isClosed, let record {
+                    // RFC §12: abandon the media path, keep the connection.
+                    collectingAnswers = false
+                    framebufferMode = true
+                    beginStep("done")
+                    Log.control.error("media negotiation failed (\(Self.describe(error))); "
+                                      + "falling back to the framebuffer path on this connection")
+                    return framebufferParams(serverInit: serverInit, record: record, auth: auth)
+                }
+                throw error
             }
             attempt += 1
             try await Task.sleep(for: tuning.degenerateRetryInterval)
@@ -439,6 +509,13 @@ actor ControlSession {
                            contentKey: record.contentKey, audioOffer: offers.audio, videoOffer: offers.video,
                            ltrpEnabled: answer.ltrpEnabled, serverInit: serverInit,
                            serverKeySHA256: auth.serverKeySHA256, authMethod: auth.method)
+    }
+
+    private func framebufferParams(serverInit: ServerInit, record: RecordLayer, auth: AuthResult) -> MediaParams {
+        let canvas = lastLayoutBacking ?? (serverInit.width, serverInit.height)
+        return MediaParams(keys: NegotiationKeys.random(), canvas: canvas, tiles: 1, contentKey: record.contentKey,
+                           audioOffer: Data(), videoOffer: Data(), ltrpEnabled: nil, serverInit: serverInit,
+                           serverKeySHA256: auth.serverKeySHA256, authMethod: auth.method, framebufferOnly: true)
     }
 
     /// Records the newest stream so `close()` can abort it. False if already closed.
@@ -601,6 +678,7 @@ actor ControlSession {
                             loggedRecordActive = true
                             Log.control.info("M2 record layer active")
                         }
+                        parser.framebufferMode = framebufferMode
                         let events = try parser.feed(body)
                         #if DEBUG
                         rxRecordCount += 1
@@ -624,7 +702,12 @@ actor ControlSession {
         var sawCursor = false
         for event in events {
             switch event {
+            case .zlibRect, .rawRect, .framebufferUpdateEnd:
+                // TCP fallback pixels: to the sink only (never `events`).
+                if framebufferMode { routeToFramebuffer(event) }
+                continue
             case .displayLayout(let l):
+                if framebufferMode { routeToFramebuffer(event) }
                 // session._handle_fbu 0x451 → _send_cursor_rearm: one
                 // non-incremental 0x03 on EVERY layout, never 0x09.
                 try await send(ClientMessage.framebufferUpdateRequest(incremental: false))
@@ -658,7 +741,8 @@ actor ControlSession {
         }
         // session._handle_fbu tail: after an FBU with a cursor rect, re-request a
         // 1×1 incremental update so shape changes keep flowing.
-        if sawCursor { try await send(Self.cursorPoll) }
+        // (The framebuffer path's own incremental requests cover it.)
+        if sawCursor && !framebufferMode { try await send(Self.cursorPoll) }
     }
 
     // MARK: dynamic resolution (RFC §7.3, §10.9)
@@ -687,10 +771,111 @@ actor ControlSession {
         guard let previous, previous != (l.backingWidth, l.backingHeight) else { return }
         Log.control.info("display: layout changed \(previous.width)x\(previous.height) → "
                          + "\(l.backingWidth)x\(l.backingHeight) (scaled \(l.scaledWidth)x\(l.scaledHeight))")
-        guard let offerMessage else { return }   // still negotiating: the answer wait covers it
+        guard let offerMessage, !framebufferMode else { return }   // still negotiating / no media path
         try await send(offerMessage)
         reoffersSent += 1
         Log.control.info("display: post-layout 0x1c re-offer sent (\(offerMessage.count)B, same keys)")
+    }
+
+    // MARK: TCP fallback (framebuffer path)
+
+    /// The pixel format the framebuffer path decodes: ServerInit's if it is
+    /// 32-bit true colour (`needsSet` false), else `RFBPixelFormat.bgra32`,
+    /// which must then be set with SetPixelFormat.
+    static func framebufferPixelFormat(serverInit pf: Data) -> (format: RFBPixelFormat, needsSet: Bool) {
+        if let f = RFBPixelFormat(pf), f.isDecodable { return (f, false) }
+        return (.bgra32, true)
+    }
+
+    /// Switches this session to the framebuffer path (see the header) and
+    /// attaches `sink` (called on this actor, in wire order, for every zlib /
+    /// raw rect, update end and 0x451). Idempotent for the mode; a later
+    /// call only replaces the sink.
+    func enterFramebufferMode(serverInit: ServerInit, sink: @escaping @Sendable (ServerEvent) -> Void) async throws {
+        let first = framebufferSink == nil && framebufferRequestsSent == 0
+        framebufferMode = true
+        framebufferSink = sink
+        pollTask?.cancel(); pollTask = nil
+        if !framebufferBacklog.isEmpty {
+            Log.control.info("framebuffer: replaying \(framebufferBacklog.count) buffered event(s)")
+            for e in framebufferBacklog { sink(e) }
+            framebufferBacklog = []
+        }
+        guard first else { return }
+        let (format, needsSet) = Self.framebufferPixelFormat(serverInit: serverInit.pixelFormat)
+        Log.control.info("framebuffer: entering TCP framebuffer mode (pixels \(format.bitsPerPixel)bpp "
+                         + "\(format.isNativeBGRA ? "BGRA" : "converted")\(needsSet ? ", SetPixelFormat sent" : ""); "
+                         + "encodings \(ClientMessage.framebufferEncodings))")
+        if needsSet { try await send(ClientMessage.setPixelFormat(format)) }
+        try await send(ClientMessage.setEncodings(ClientMessage.framebufferEncodings))
+        try await send(ClientMessage.framebufferUpdateRequest(incremental: false))
+        framebufferRequestOutstanding = true
+        lastFramebufferRequest = .now
+        framebufferRequestsSent += 1
+        startFramebufferWatchdog()
+    }
+
+    /// The sink finished an update: request the next one (rate-limited).
+    func framebufferUpdateConsumed() {
+        framebufferRequestOutstanding = false
+        scheduleFramebufferRequest()
+    }
+
+    private func routeToFramebuffer(_ event: ServerEvent) {
+        if let framebufferSink { framebufferSink(event); return }
+        guard framebufferBacklog.count < Self.framebufferBacklogLimit else {
+            Log.control.error("framebuffer: backlog full; event dropped")
+            return
+        }
+        framebufferBacklog.append(event)
+    }
+
+    private func scheduleFramebufferRequest() {
+        guard framebufferMode, framebufferSink != nil, !isClosed,
+              !framebufferRequestOutstanding, !framebufferRequestScheduled else { return }
+        framebufferRequestScheduled = true
+        let wait = tuning.framebufferMinInterval - (ContinuousClock.now - lastFramebufferRequest)
+        Task { [weak self] in
+            if wait > .zero { try? await Task.sleep(for: wait) }
+            await self?.sendFramebufferRequest()
+        }
+    }
+
+    /// Incremental, full backing area (the 0x451 size; 0xFFFF before one).
+    static func framebufferRequest(backing: (width: Int, height: Int)?) -> Data {
+        let w = backing.map { UInt16(clamping: $0.width) } ?? 0xFFFF
+        let h = backing.map { UInt16(clamping: $0.height) } ?? 0xFFFF
+        return ClientMessage.framebufferUpdateRequest(incremental: true, w: w, h: h)
+    }
+
+    private func sendFramebufferRequest() async {
+        framebufferRequestScheduled = false
+        guard framebufferMode, !isClosed else { return }
+        framebufferRequestOutstanding = true
+        lastFramebufferRequest = .now
+        framebufferRequestsSent += 1
+        do { try await send(Self.framebufferRequest(backing: lastLayoutBacking)) } catch {}
+    }
+
+    /// Re-requests when an update never came for the last request (a static
+    /// screen just answers late; a duplicate request is harmless).
+    private func startFramebufferWatchdog() {
+        let stale = tuning.framebufferRequestStale
+        framebufferWatchdog?.cancel()
+        framebufferWatchdog = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: stale / 2)
+                guard !Task.isCancelled, let self else { return }
+                await self.framebufferWatchdogTick(stale: stale)
+            }
+        }
+    }
+
+    private func framebufferWatchdogTick(stale: Duration) {
+        guard framebufferMode, framebufferRequestOutstanding,
+              ContinuousClock.now - lastFramebufferRequest >= stale else { return }
+        framebufferRequestOutstanding = false
+        scheduleFramebufferRequest()
     }
 
     // MARK: cursor poll (session._maybe_poll_cursor, every _TX_INTERVAL_S)
@@ -742,6 +927,8 @@ actor ControlSession {
         case .clipboard(let h, let c): return "clipboard(\(h.compressedSize),chunk \(c.count))"
         case .bell: return "bell"
         case .zlibRect(_, _, let w, let h, let p): return "zlib(\(w)x\(h),\(p.count)B)"
+        case .rawRect(_, _, let w, let h, _): return "raw(\(w)x\(h))"
+        case .framebufferUpdateEnd: return "fbuEnd"
         case .unknown(let t, let enc): return "unknown(0x\(String(t, radix: 16))\(enc.map { ",enc=\($0)" } ?? ""))"
         }
     }
@@ -770,6 +957,9 @@ actor ControlSession {
         if let error { failure = error }
         rxTask?.cancel()
         pollTask?.cancel()
+        framebufferWatchdog?.cancel()
+        framebufferSink = nil
+        framebufferBacklog = []
         stream?.close()
         resolveAnswer(.failure(error ?? ControlSessionError.closed))
         continuation.finish()

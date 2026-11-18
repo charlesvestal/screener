@@ -41,6 +41,14 @@ enum ClientMessage {
         -223, 1101, 1105, 1107, 1109, 1110,
     ]
 
+    /// TCP-only fallback (Task 19, RFC §11 Profile A / §12): zlib (6) and
+    /// raw (0) — the only pixel encodings ZlibRectDecoder decodes — then the
+    /// pseudo-encodings the session needs: 0x450 cursor, 0x451 layout, 0x453
+    /// vendor keysyms, 0x455 keyboard source, 0x456 device info, 0x44f
+    /// rekey. NO 0x3f2 (media init), 0x3f3 / 0x3ea (Apple codecs we can't
+    /// decode) or ZRLE (16): R-A18 / R-B4.
+    static let framebufferEncodings: [Int32] = [6, 0, 0x450, 0x451, 0x453, 0x455, 0x456, 0x44F]
+
     /// Apple's non-standard pointer button mask (bits 1/2 swapped vs RFC 6143).
     enum Button {
         static let left: UInt8 = 1 << 0
@@ -68,6 +76,13 @@ enum ClientMessage {
         var w = ByteWriter(capacity: 4 + 4 * encodings.count)
         w.u8(typeSetEncodings); w.u8(0); w.u16(UInt16(encodings.count))
         for e in encodings { w.u32(UInt32(bitPattern: e)) }
+        return w.data
+    }
+
+    /// RFC 6143 §7.5.1 SetPixelFormat: `00 pad×3 PIXEL_FORMAT(16)`.
+    static func setPixelFormat(_ format: RFBPixelFormat) -> Data {
+        var w = ByteWriter(capacity: 20)
+        w.u8(0); w.zeros(3); w.bytes(format.data)
         return w.data
     }
 

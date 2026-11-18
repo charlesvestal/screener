@@ -66,6 +66,17 @@
 // this is what the UIApplication background task waits for: the Mac must see
 // the close before iOS suspends us, or it keeps sharing (display privacy on).
 //
+// TCP-only fallback (Task 19; MediaFallbackPolicy.swift): no authenticated
+// video at the start burst, a failed 0x1c negotiation (ControlSession's
+// `fallbackOnMediaFailure`), or 3 hard decoder failures within 10 s switch the
+// SAME control connection to the framebuffer path (`enterFallback`): the HP
+// video consumer stops, the frame store is reset, a FramebufferPipeline
+// decodes ControlSession's zlib / raw rects into a BGRA picture, and
+// `fallbackReason` drives the "Reduced performance" badge + toast. If that
+// path shows no picture within `Policy.firstFrameDeadline`, the session is
+// re-established without any media offer (`ConnectRequest.framebufferOnly`,
+// also kept for this session's reconnects after a negotiation failure).
+//
 // First picture: once `.connected`, a picture must decode within
 // `Policy.firstFrameDeadline` (a keyframe is requested at
 // `firstFrameKeyframeAfter`), else the session fails with
@@ -97,6 +108,9 @@ final class SessionCoordinator {
         /// Pinned Mac key / legacy sign-in permission (H1). A first sign-in
         /// pins the key here too, so this session's reconnects are pinned.
         var authPolicy = AuthPolicy()
+        /// TCP fallback: connect without a media offer (framebuffer path),
+        /// and why. Set by the coordinator only.
+        var framebufferOnly: MediaFallbackPolicy.Reason?
     }
 
     /// A connect refused because the Mac's key isn't the pinned one (H1):
@@ -175,6 +189,11 @@ final class SessionCoordinator {
     /// A suspended session is being resumed: from the background close until
     /// the resumed session's first picture (or its failure).
     private(set) var isReconnecting = false
+    /// TCP-only fallback (Task 19): why this session shows the framebuffer
+    /// path instead of HP video (nil = HP). Drives the "Reduced performance" badge.
+    private(set) var fallbackReason: MediaFallbackPolicy.Reason?
+    @ObservationIgnored private var fallbackPolicy = MediaFallbackPolicy()
+    @ObservationIgnored private var framebuffer: FramebufferPipeline?
     /// "Signing in…" → "Securing…" → "Starting video…" (ConnectionStage.swift).
     private(set) var stage: ConnectionStage = .idle
     /// The Mac's model identifier (DeviceInfo 0x456), once this session sent it.
@@ -435,6 +454,8 @@ final class SessionCoordinator {
         }
         serverAddress = ip
         Log.app.info("connecting to \(private: host) as \(private: ip)")
+        fallbackPolicy.reset()
+        let framebufferOnly = lastRequest?.framebufferOnly
 
         // 2) UDP first, consumers attached before any packet can arrive.
         let media = MediaTransport(config: .init(host: ip, controlPort: port, localAddress: localAddress),
@@ -471,6 +492,8 @@ final class SessionCoordinator {
                                            logicalSize: logical, backingSize: backing, startupOrder: order)
         config.dynamicDisplay = mode.isDynamic
         config.authPolicy = authPolicy
+        config.framebufferOnly = framebufferOnly != nil
+        config.fallbackOnMediaFailure = true
         config.onMilestone = { [weak self] m in Task { @MainActor in self?.milestone(m, gen) } }
         let attempts = max(1, policy.burstRetryAttempts)
         for attempt in 1...attempts {
@@ -479,9 +502,10 @@ final class SessionCoordinator {
             self.control = session
             cursor.reset()
             let params: ControlSession.MediaParams
-            do {
+            activation: do {
                 params = try await session.start()
                 guard isCurrent(gen) else { return }
+                if params.framebufferOnly { break activation }
                 try await media.activate(.init(keys: params.keys,
                                                ourVideoSSRC: MediaOffer.extractSSRC(params.videoOffer, isVideo: true),
                                                ourAudioSSRC: MediaOffer.extractSSRC(params.audioOffer, isVideo: false)))
@@ -508,14 +532,32 @@ final class SessionCoordinator {
             }
             watch(session, gen)
 
+            // Mode of `display.start` once the picture flows (HP or fallback).
+            let mac = DisplayGeometry.matching(serverWidth: params.serverInit.width,
+                                               serverHeight: params.serverInit.height)
+            if params.framebufferOnly {
+                // No media keys: framebuffer path at once (negotiation failed,
+                // or a framebuffer-only reconnect).
+                let reason = framebufferOnly ?? .negotiationFailed
+                if reason == .negotiationFailed { _ = fallbackPolicy.negotiationFailed() }
+                guard await enterFallback(gen, session, params, reason: reason, closeMedia: true) else { return }
+                startFallbackStream(session, params, initial: mode.isDynamic ? geometry : mac, mac: mac)
+                return
+            }
+
             let outcome = await media.burstOutcome()
             guard isCurrent(gen) else { return }
+            if case .starved(let packets) = outcome,
+               case .fallBack(let reason) = fallbackPolicy.burstStarved(packets: packets, attempt: attempt,
+                                                                       attempts: attempts) {
+                guard await enterFallback(gen, session, params, reason: reason, closeMedia: false) else { return }
+                startFallbackStream(session, params, initial: mode.isDynamic ? geometry : mac, mac: mac)
+                return
+            }
             switch outcome {
             case .started:
                 frames.configure(canvas: CGSize(width: params.canvas.width, height: params.canvas.height))
                 startInput(session, params)
-                let mac = DisplayGeometry.matching(serverWidth: params.serverInit.width,
-                                                   serverHeight: params.serverInit.height)
                 display.start(initial: mode.isDynamic ? geometry : mac, mac: mac)
                 clipboard.start(send: { try await session.send($0) })
                 state = .connected(canvasWidth: params.canvas.width, canvasHeight: params.canvas.height)
@@ -567,6 +609,8 @@ final class SessionCoordinator {
     private func teardown(background: Bool = false) async {
         eventsTask?.cancel(); eventsTask = nil
         firstFrameTask?.cancel(); firstFrameTask = nil
+        framebuffer?.stop(); framebuffer = nil
+        fallbackReason = nil
         statsTask?.cancel(); statsTask = nil
         mediaFailureTask?.cancel(); mediaFailureTask = nil
         videoTask?.cancel(); videoTask = nil
@@ -690,7 +734,9 @@ final class SessionCoordinator {
                 // §10.9) the store switches to it with the new stream's first
                 // picture, holding the last one until then.
                 let canvas = CGSize(width: l.backingWidth, height: l.backingHeight)
-                if let previous, previous != (l.backingWidth, l.backingHeight) {
+                if fallbackReason != nil {
+                    // The framebuffer path sizes the store itself (FramebufferPipeline).
+                } else if let previous, previous != (l.backingWidth, l.backingHeight) {
                     Log.app.info("display: Mac resized to \(l.scaledWidth)x\(l.scaledHeight)pt "
                                  + "(\(l.backingWidth)x\(l.backingHeight)px), was \(previous.width)x\(previous.height)px")
                     frames.holdForResize(canvas: canvas)
@@ -744,7 +790,8 @@ final class SessionCoordinator {
             requestKeyframe: { _ = await media.requestKeyframe(ssrc: $0) },
             notePublished: { await media.notePublished() },
             onNotHEVC: { [weak self] in await self?.videoIsNotHEVC(gen) },
-            ackLTR: { await media.sendLTRAck(timestamp: $0, everyPicture: $1) })
+            ackLTR: { await media.sendLTRAck(timestamp: $0, everyPicture: $1) },
+            onHardFailure: { [weak self] in await self?.decoderHardFailure(gen) })
         let pipeline = VideoPipeline(store: frames, hooks: hooks)
         #if DEBUG
         let makeTap = makeVideoTap
@@ -781,6 +828,11 @@ final class SessionCoordinator {
         mediaFailureTask = Task { [weak self] in
             for await f in media.failures {
                 guard let self, !Task.isCancelled, self.media === media else { return }
+                guard self.fallbackReason == nil else {
+                    // The picture comes over TCP now; audio may be lost.
+                    Log.app.error("media channel failed during the TCP fallback (ignored): \(f)")
+                    return
+                }
                 await self.fail(gen, f)
                 return
             }
@@ -802,6 +854,99 @@ final class SessionCoordinator {
                 try? await Task.sleep(for: .seconds(1))
             }
         }
+    }
+
+    // MARK: TCP-only fallback (Task 19)
+
+    static let framebufferBrokenMessage = "The picture stream from the Mac broke. Reconnect to continue."
+
+    /// Switches session `gen` (control `session`) to the framebuffer path:
+    /// stops HP video, resets the frame store, starts a FramebufferPipeline
+    /// and ControlSession's framebuffer mode. `closeMedia`: no media keys
+    /// were installed, so the UDP transport is useless. False if the session
+    /// went away or failed meanwhile.
+    private func enterFallback(_ gen: Int, _ session: ControlSession, _ params: ControlSession.MediaParams,
+                               reason: MediaFallbackPolicy.Reason, closeMedia: Bool) async -> Bool {
+        guard isCurrent(gen), control === session, framebuffer == nil else { return false }
+        Log.app.error("TCP fallback: \(reason); switching to the framebuffer path (reduced performance)")
+        fallbackReason = reason
+        if reason == .negotiationFailed, lastRequest?.framebufferOnly == nil {
+            // Negotiation takes ~80 s to fail: this session's reconnects skip it.
+            lastRequest?.framebufferOnly = reason
+        }
+        videoTask?.cancel(); videoTask = nil
+        firstFrameTask?.cancel(); firstFrameTask = nil
+        frames.reset()
+        videoGeneration.value = gen
+        if closeMedia, let m = media {
+            Task { await m.close() }
+            Log.app.info("TCP fallback: media transport closed (no media keys)")
+        }
+        let size = hostBacking ?? (params.canvas.width, params.canvas.height)
+        let (format, _) = ControlSession.framebufferPixelFormat(serverInit: params.serverInit.pixelFormat)
+        let pipeline = FramebufferPipeline(
+            store: frames, format: format, size: size,
+            hooks: .init(updateConsumed: { Task { await session.framebufferUpdateConsumed() } },
+                         failed: { [weak self] error in
+                             Task { @MainActor in await self?.framebufferFailed(gen, error) }
+                         }))
+        framebuffer = pipeline
+        do {
+            try await session.enterFramebufferMode(serverInit: params.serverInit, sink: { pipeline.submit($0) })
+        } catch {
+            guard isCurrent(gen) else { return false }
+            await fail(gen, error)
+            return false
+        }
+        guard isCurrent(gen) else { return false }
+        startFallbackFirstFrameDeadline(gen)
+        return true
+    }
+
+    /// The `.started` set-up for a session that went straight to the framebuffer path.
+    private func startFallbackStream(_ session: ControlSession, _ params: ControlSession.MediaParams,
+                                     initial: DisplayGeometry?, mac: DisplayGeometry?) {
+        let size = hostBacking ?? (params.canvas.width, params.canvas.height)
+        startInput(session, params)
+        display.start(initial: initial, mac: mac)
+        clipboard.start(send: { try await session.send($0) })
+        state = .connected(canvasWidth: size.width, canvasHeight: size.height)
+        stage = stage.advanced(by: .streamStarted)
+    }
+
+    /// A hard decoder failure in session `gen` (VideoPipeline hook).
+    private func decoderHardFailure(_ gen: Int) async {
+        guard gen == generation, let control, let params = mediaParams, case .connected = state else { return }
+        guard case .fallBack(let reason) = fallbackPolicy.decoderFailed(at: .now) else { return }
+        _ = await enterFallback(gen, control, params, reason: reason, closeMedia: false)
+    }
+
+    /// The framebuffer path must show a picture within `firstFrameDeadline`
+    /// (`firstFrameArrived` cancels this): else re-establish the session
+    /// without a media offer, once; then give up.
+    private func startFallbackFirstFrameDeadline(_ gen: Int) {
+        firstFrameTask?.cancel()
+        let deadline = policy.firstFrameDeadline
+        firstFrameTask = Task { [weak self] in
+            try? await Task.sleep(for: deadline)
+            guard let self, !Task.isCancelled, self.isCurrent(gen) else { return }
+            if self.lastRequest != nil, self.lastRequest?.framebufferOnly == nil {
+                Log.app.error("TCP fallback: no picture \(deadline.ms) ms after switching; "
+                              + "reconnecting without a media offer")
+                self.lastRequest?.framebufferOnly = self.fallbackReason ?? .noVideo(packets: 0)
+                await self.suspend()
+                Task { [weak self] in await self?.reconnect() }
+            } else {
+                Log.app.error("TCP fallback: no picture \(deadline.ms) ms after switching; giving up")
+                await self.end(gen, .failed(Self.noPictureMessage))
+            }
+        }
+    }
+
+    private func framebufferFailed(_ gen: Int, _ error: Error) async {
+        guard gen == generation else { return }
+        Log.app.error("TCP fallback: framebuffer stream failed: \(error)")
+        await end(gen, .failed(Self.framebufferBrokenMessage))
     }
 
     // MARK: display (Task 21)

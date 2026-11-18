@@ -60,6 +60,10 @@ actor VideoPipeline {
         var onNotHEVC: @Sendable () async -> Void
         /// LTR acks: (RTP timestamp of a decoded picture, ack every picture).
         var ackLTR: (@Sendable (UInt32, Bool) async -> Void)? = nil
+        /// A hard decoder failure (a rebuild or an output-mode fallback, not a
+        /// concealment error): SessionCoordinator's TCP-fallback trigger
+        /// (MediaFallbackPolicy: 3 within 10 s).
+        var onHardFailure: (@Sendable () async -> Void)? = nil
     }
 
     /// Which decoded pictures are acknowledged (APP name 5 + DON on P+1).
@@ -276,6 +280,7 @@ actor VideoPipeline {
                             + "rebuilding (mode \(decoder.mode.map { "\($0)" } ?? "-"), "
                             + "IRAP failures in a row: \(recovery.consecutiveIRAPFailures))")
             do { try decoder.rebuild() } catch { Log.video.error("video: decoder rebuild failed: \(error)") }
+            await hooks.onHardFailure?()
         case .fallBack:
             let from = decoder.mode.map { "\($0)" } ?? "-"
             Log.video.error("video: !!! OUTPUT MODE FALLBACK from \(from): status=\(status) tile=\(tile) "
@@ -290,6 +295,7 @@ actor VideoPipeline {
                 Log.video.error("video: decoder fallback failed: \(error)")
             }
             recovery.noteModeChanged()
+            await hooks.onHardFailure?()
         }
         await handle(a.noteDecodeError(tile: tile, don: don))
     }

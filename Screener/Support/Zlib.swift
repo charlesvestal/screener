@@ -56,8 +56,21 @@ enum Zlib {
         /// passes `maxOutput` (the stream is then mid-message and should be
         /// discarded). Memory stays bounded by `maxOutput` + one chunk.
         func inflate(_ input: Data, maxOutput: Int = .max) throws -> Data {
-            guard !input.isEmpty else { return Data() }
             var out = Data()
+            try inflate(input, maxOutput: maxOutput) { out.append(contentsOf: $0) }
+            return out
+        }
+
+        /// Streaming form: hands each inflated chunk (≤ 1 MB) to `sink` as it
+        /// is produced, so a large output never has to be held at once (RFB
+        /// zlib rects are blitted straight into the framebuffer). Throws
+        /// `.outputLimit` BEFORE handing over a chunk that would take this
+        /// call's output past `maxOutput`. Returns the bytes produced.
+        @discardableResult
+        func inflate(_ input: Data, maxOutput: Int = .max,
+                     sink: (UnsafeRawBufferPointer) throws -> Void) throws -> Int {
+            guard !input.isEmpty else { return 0 }
+            var total = 0
             // Scratch buffer: ≥ 16 KB, ≤ 1 MB (input × 4 in between).
             var chunk = [UInt8](repeating: 0, count: max(16_384, min(input.count, 1 << 18) * 4))
             let local = Data(input)   // contiguous, 0-based
@@ -71,24 +84,24 @@ enum Zlib {
                 // Output-growth loop: keep draining fixed-size chunks while
                 // zlib fills them completely (high-ratio input).
                 while true {
-                    let produced: Int = try chunk.withUnsafeMutableBytes { dst in
+                    let filledAll: Bool = try chunk.withUnsafeMutableBytes { dst in
                         strm.pointee.next_out = dst.bindMemory(to: Bytef.self).baseAddress
                         strm.pointee.avail_out = uInt(dst.count)
                         let rc = zlib.inflate(strm, Z_SYNC_FLUSH)
                         // Z_BUF_ERROR = no progress possible (input exhausted); not fatal.
                         guard rc == Z_OK || rc == Z_STREAM_END || rc == Z_BUF_ERROR else { throw ZlibError.stream(rc) }
-                        return dst.count - Int(strm.pointee.avail_out)
+                        let produced = dst.count - Int(strm.pointee.avail_out)
+                        guard produced <= maxOutput - total else { throw ZlibError.outputLimit(maxOutput) }
+                        total += produced
+                        if produced > 0 { try sink(UnsafeRawBufferPointer(rebasing: dst[0..<produced])) }
+                        // Stop once all input is consumed and the output buffer
+                        // wasn't filled (nothing pending), or no progress was made.
+                        return strm.pointee.avail_out == 0 && produced > 0
                     }
-                    guard produced <= maxOutput - out.count else {
-                        throw ZlibError.outputLimit(maxOutput)
-                    }
-                    out.append(contentsOf: chunk[0..<produced])
-                    // Stop once all input is consumed and the output buffer
-                    // wasn't filled (nothing pending), or no progress was made.
-                    if strm.pointee.avail_out != 0 || produced == 0 { break }
+                    if !filledAll { break }
                 }
             }
-            return out
+            return total
         }
     }
 

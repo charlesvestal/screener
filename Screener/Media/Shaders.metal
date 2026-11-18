@@ -48,6 +48,14 @@ fragment float4 stripFragment(VOut in [[stage_in]],
     return float4(saturate(rgb), 1.0);
 }
 
+// TCP-only fallback (Task 19): the framebuffer path's BGRA8 picture
+// (FramebufferPipeline) is sampled as-is; same vertex stage as the strips.
+fragment float4 bgraFragment(VOut in [[stage_in]],
+                             texture2d<float> tex [[texture(0)]]) {
+    constexpr sampler s(filter::linear, address::clamp_to_edge);
+    return float4(tex.sample(s, in.uv).rgb, 1.0);
+}
+
 // Cursor overlay (gpu.py WGSL_CURSOR): one textured quad over the video.
 // The texture is premultiplied RGBA (RemoteCursor); the pipeline blends
 // one / one-minus-source-alpha. (gpu.py samples straight alpha and blends

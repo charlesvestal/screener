@@ -64,5 +64,11 @@ build-tint/
 build-tint-dev/
 build-cover/
 build-cover-dev/
+build-ux3/
+build-ux3-dev/
 build-ux2/
 build-ux2-dev/
+build-ux1/
+build-ux1-dev/
+build-ux4/
+build-ux4-dev/

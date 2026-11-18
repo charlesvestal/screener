@@ -35,6 +35,11 @@
 // BT.709 when absent, as gpu.py hard-codes. The range comes from the pixel
 // format ('444f' = full range, as the reference). Logged once per change.
 //
+// TCP-only fallback (Task 19): a 32BGRA pixel buffer (FramebufferPipeline,
+// one tile = the whole canvas) is wrapped as one bgra8Unorm texture and drawn
+// by `bgraFragment` through the same strip quad, aspect fit, zoom, ripples,
+// minimap and cursor overlay as the video.
+//
 // Cursor (gpu.py cursor overlay): the host's cursor (RemoteCursor, 0x450)
 // is drawn after the strips as one premultiplied-alpha quad at the pointer
 // position (host canvas pixels mapped through the same aspect fit), minus
@@ -142,6 +147,8 @@ final class MetalRenderer: NSObject, MTKViewDelegate {
     let device: MTLDevice
     private let queue: MTLCommandQueue
     private let pipeline: MTLRenderPipelineState
+    /// The framebuffer path's BGRA picture (TCP fallback).
+    private let bgraPipeline: MTLRenderPipelineState
     private let cursorPipeline: MTLRenderPipelineState
     private let ripplePipeline: MTLRenderPipelineState
     private let glowPipeline: MTLRenderPipelineState
@@ -203,6 +210,8 @@ final class MetalRenderer: NSObject, MTKViewDelegate {
             desc.fragmentFunction = library.makeFunction(name: "stripFragment")
             desc.colorAttachments[0].pixelFormat = Self.colorPixelFormat
             pipeline = try device.makeRenderPipelineState(descriptor: desc)
+            desc.fragmentFunction = library.makeFunction(name: "bgraFragment")
+            bgraPipeline = try device.makeRenderPipelineState(descriptor: desc)
             let cdesc = MTLRenderPipelineDescriptor()
             cdesc.vertexFunction = library.makeFunction(name: "cursorVertex")
             cdesc.fragmentFunction = library.makeFunction(name: "cursorFragment")
@@ -385,8 +394,9 @@ final class MetalRenderer: NSObject, MTKViewDelegate {
     /// filled per target).
     private struct PreparedStrip {
         var strip: CompositeLayout.Strip
+        /// Luma, or the whole BGRA picture when `chroma` is nil (TCP fallback).
         var luma: MTLTexture
-        var chroma: MTLTexture
+        var chroma: MTLTexture?
         var uniforms: StripUniforms
     }
 
@@ -411,6 +421,20 @@ final class MetalRenderer: NSObject, MTKViewDelegate {
         for strip in layout.strips {
             guard let buffer = snap.frames[strip.tile] else { continue }   // never arrived: stays black
             let type = CVPixelBufferGetPixelFormatType(buffer)
+            if type == kCVPixelFormatType_32BGRA {
+                guard let bgra = bgraTexture(buffer), let t = CVMetalTextureGetTexture(bgra) else { continue }
+                keep.append(bgra)
+                if lastColorDescription != "pixfmt=BGRA" {
+                    lastColorDescription = "pixfmt=BGRA"
+                    Log.video.info("M4 render colour: pixfmt=BGRA (framebuffer path)")
+                }
+                let u = StripUniforms(
+                    dstRect: .zero,
+                    texExtent: SIMD2(Float(strip.textureExtent.width), Float(strip.textureExtent.height)),
+                    range: .zero, coeffs: .zero)
+                out.append(PreparedStrip(strip: strip, luma: t, chroma: nil, uniforms: u))
+                continue
+            }
             guard let fmt = YCbCrFormat.of(type), CVPixelBufferGetPlaneCount(buffer) >= 2 else {
                 if !droppedFormatLogged {
                     droppedFormatLogged = true
@@ -440,8 +464,10 @@ final class MetalRenderer: NSObject, MTKViewDelegate {
     /// Draws `strips` aspect-fitted into a `size` target through `zoom`.
     private func drawStrips(_ enc: MTLRenderCommandEncoder, _ strips: [PreparedStrip], layout: CompositeLayout,
                             size: CGSize, zoom: Viewport) {
-        enc.setRenderPipelineState(pipeline)
+        var current: MTLRenderPipelineState?
         for p in strips {
+            let state = p.chroma == nil ? bgraPipeline : pipeline
+            if current !== state { enc.setRenderPipelineState(state); current = state }
             let r = zoom.toScreen(layout.viewRect(of: p.strip, in: size), viewSize: size)
             var u = p.uniforms
             u.dstRect = SIMD4(Float(r.minX / size.width * 2 - 1), Float(1 - r.minY / size.height * 2),
@@ -700,6 +726,15 @@ final class MetalRenderer: NSObject, MTKViewDelegate {
         cursorTexture = tex
         cursorTextureSerial = img.serial
         return tex
+    }
+
+    /// A non-planar 32BGRA buffer as one bgra8Unorm texture.
+    private func bgraTexture(_ buffer: CVPixelBuffer) -> CVMetalTexture? {
+        var out: CVMetalTexture?
+        let status = CVMetalTextureCacheCreateTextureFromImage(
+            kCFAllocatorDefault, textureCache, buffer, nil, .bgra8Unorm,
+            CVPixelBufferGetWidth(buffer), CVPixelBufferGetHeight(buffer), 0, &out)
+        return status == kCVReturnSuccess ? out : nil
     }
 
     private func texture(_ buffer: CVPixelBuffer, plane: Int, format: MTLPixelFormat) -> CVMetalTexture? {
