@@ -410,7 +410,7 @@ final class SocketDatagramChannel: DatagramChannel, @unchecked Sendable {
             if let svc {
                 let err = svc.errno == 0 ? "" : " error=\(String(cString: strerror(svc.errno)))(\(svc.errno))"
                 emit("netsvc requested=\(BSDSocket.serviceTypeName(BSDSocket.mediaServiceType())) "
-                     + "effective=\(BSDSocket.serviceTypeName(svc.effective)) marking_level=\(svc.marking.map(String.init) ?? "?")"
+                     + "effective=\(BSDSocket.serviceTypeName(svc.effective)) marking_level=\((BSDSocket.getInt(s, SOL_SOCKET, SO_NETSVC_MARKING_LEVEL) ?? svc.marking).map(String.init) ?? "?")"
                      + "\(err) qos=\(queue.qos.qosClass)")
             } else {
                 emit("netsvc off (SCREENER_NETSVC=off) qos=\(queue.qos.qosClass)")

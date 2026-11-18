@@ -283,6 +283,9 @@ actor MediaTransport {
         /// SCREENER_RCTL_ECHO=low: echo the RTP timestamp >> 8 (AVConference's
         /// useLowPrecisionEchoTimeStamp) instead of its low 16 bits.
         var rctlLowPrecisionEcho = false
+        /// SCREENER_KF_CUTS_BWE=1: assembler keyframe requests count as
+        /// recovery events (a ×0.9 cut each, BandwidthEstimator). Default off.
+        var keyframeRequestCutsBWE = false
 
         static func fromEnvironment(_ env: [String: String] = ProcessInfo.processInfo.environment) -> Feedback {
             var f = Feedback()
@@ -295,6 +298,7 @@ actor MediaTransport {
             if let v = env["SCREENER_RCTL_LOSS"] { f.rctlLoss = v != "0" }
             if let v = env["SCREENER_FB_RR_LOSS"] { f.rrLoss = v != "0" }
             if let v = env["SCREENER_RCTL_ECHO"] { f.rctlLowPrecisionEcho = v == "low" }
+            if let v = env["SCREENER_KF_CUTS_BWE"] { f.keyframeRequestCutsBWE = v == "1" }
             return f
         }
     }
@@ -630,11 +634,15 @@ actor MediaTransport {
     /// Keyframe request for one tile SSRC, the reference's default variant:
     /// compound RR + AVPF FIR (PT 206) + PLI + legacy FIR (PT 192), sent to P.
     /// `congestionSignal`: the request comes from the assembler (loss or a
-    /// decode error) and counts as a recovery event for the BWE; an SSRC
-    /// group adoption does not.
+    /// decode error); it counts as a recovery event for the BWE only with
+    /// Feedback.keyframeRequestCutsBWE (off: Wi-Fi loss bursts are not
+    /// congestion, and sustained loss already cuts through the loss rate —
+    /// iPad, induced loss 2026-11-18: the per-request cuts held the BWE at a
+    /// median 19–36 Mbps on an otherwise clean 60 Mbps link). An SSRC group
+    /// adoption never does.
     @discardableResult
     func requestKeyframe(ssrc: UInt32, congestionSignal: Bool = true) -> Bool {
-        if congestionSignal { pendingRecoveryEvents += 1 }
+        if congestionSignal, tuning.feedback.keyframeRequestCutsBWE { pendingRecoveryEvents += 1 }
         guard let a = activation, let sender = a.ourVideoSSRC, let enc = rtcpEncryptor,
               let channel = channels[.audio] else { return false }
         let now = clock.now

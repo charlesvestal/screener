@@ -74,3 +74,34 @@ Host→Screener video rate from a host-side packet capture (UDP to .33:5901, IP+
 - Env: `SCREENER_RCTL_BWE=<kbps>` pins (0 = measured), `SCREENER_RCTL_INIT/MIN/MAX`, `SCREENER_RCTL_LOSS=0`, `SCREENER_FB_RR_LOSS=0`, `SCREENER_FB_RCTL=0`. Log every 2 s: `rctl bwe=… (adaptive; est=…) loss%=… rx_kbps=… state=increase|decrease|hold|hold-app|hold-off|hold-idle decreases=… sent_loss=…%/burst…`.
 - The simulator drops packets at these rates: the host capture has ~15–40% more video datagrams than the app reads (worst with per-tile acks). The kernel socket buffer is the likely place; worth checking on the iPad.
 - The echo field's exact source (RTP timestamp, low vs high precision) is unverified; the host accepted it either way.
+
+## Loss recovery, LTR acks, QoS (same day, later)
+
+### What the stream looks like (decrypted captures, slice headers via hevc_rps.py)
+- The four tiles are ONE HEVC sequence: shared POC space (tile k of frame n ≈ POC 4n + k), one DPB, IDR only on tile 0 (the other tiles' first pictures are P slices with no used references). SPS: log2_max_poc_lsb 11, 16 short-term RPS sets (keep up to 15 previous POCs), no long-term refs.
+- References cross tiles: tiles 2/3 often use tile 0's picture of the same frame (delta -1/-2); every picture also keeps one old "anchor" picture as a used reference (e.g. delta -119 … -472), refreshed every few seconds.
+- So a lost picture breaks exactly the later pictures whose RPS marks it used — on any tile — and often nothing at all (e.g. a lost tile-2 picture that only tile 2's next picture would have used, when that next picture predicts from tile 0 instead).
+
+### LTR ack semantics (AVConference, macOS 27)
+- `_VideoReceiver_ProcessRtcpLTRAck` logs "Received APP_LTRP_ACK timestamp=%u"; `VideoTransmitter_ACKLTRFrame` matches the value against a ring (≤ 100) of the timestamps of frames it sent; `__VCVideoReceiverDefault_sendLTRAckWithTS` / `VideoTransmitter_SendLTRACK` on the viewer side queue the same. The APP name-5 u32 is the picture's **RTP timestamp**, not the DONL the reference sends.
+- With timestamp acks on every tile picture (SCREENER_FB_ACKALL=1), the host still answered every FIR or PLI (SCREENER_KF_MODE=pli) with an IDR, and with the FIR held back 1.5 s (SCREENER_FIR_DELAY_MS) it never repaired on its own. iPad A/B under induced loss: IDRs 20 / 30 with acks vs 24 / 17 without — noise. Acks stay opt-in.
+
+### Reference recovery (HEVCReferenceTracker + HEVCAssembler, default on)
+Release every picture whose used references were decoded (also on a tile that just lost one), drop any picture that needs a lost/broken one (any tile) and request a keyframe then, or 300 ms after a loss that left the tile with nothing decodable. Replay check: the Swift tracker's broken-picture count equals hevc_rps.py's on three captures (1423, 817, 123).
+
+Keyframe requests no longer cut the BWE (SCREENER_KF_CUTS_BWE=1 restores it): sustained loss already cuts through the loss rate, and the per-request ×0.9 steps held the estimate far below the link.
+
+### iPad Pro M5 (Wi-Fi, host 192.0.2.54, textured window dragged full-screen; Debug -O builds; 2 s windows after startup)
+| Run | Mbps (median) | BWE median / min | loss events | keyframe req | IDRs | recovered by refs | decode errors |
+|---|---|---|---|---|---|---|---|
+| old bfd7940, 60 s | 37 | 44 / 26 | 7 | 4 | 2 | – | 0 |
+| old bfd7940, 120 s | 58 | 65 / 35 | 10 | 7 | 4 | – | 0 |
+| new, 60 s | 57 | 65 / 49 | 7 (all at start) | 4 | 2 | 0 | 0 |
+| new, 120 s | 58 | 65 / 58 | 0 | 0 | 1 | 0 | 0 |
+| new, 120 s | 58 | 65 / 56 | 5 | 4 | 2 | 0 | 0 |
+| new, SO_NET_SERVICE_TYPE off, 120 s | 57 | 65 / 55 | 5 | 0 | 1 | 3 | 0 |
+| induced loss (4 datagrams / 2 s), refs OFF, KF cuts BWE | 21 | 19 / 6 | 78 | 126 | 47 | – | 11 |
+| induced loss, refs ON, KF cuts BWE | 31 | 36 / 20 | 79 | 70 | 27 | 31 | 0 |
+| induced loss, refs ON (new default) | 50 | 65 / 54 | 76 | 78 | 24 | 20 | 0 |
+
+The Wi-Fi was much cleaner than in the user's earlier session (rx_gaps50 ≈ 2 per 2 s vs 7–12): 0–10 loss events per 2 minutes at ~58 Mbps, so no evidence for capping the BWE below 65 Mbps, and none for or against NET_SERVICE_TYPE_VI (SO_NETSVC_MARKING_LEVEL reads 0 = unknown on the iPad).
