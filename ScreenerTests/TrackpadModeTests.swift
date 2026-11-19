@@ -107,10 +107,18 @@ final class TrackpadModeTests: XCTestCase {
         XCTAssertFalse(actions.contains { if case .moveTo = $0 { true } else { false } }, "no absolute move")
     }
 
-    func testLongStillTouchIsNotAClick() {
+    func testLongStillTouchIsADragNotAClick() {
         let t = make()
         t.began(1, at: .zero, time: clock.now)
         t.ended(1, at: .zero, time: at(0.8))
+        clock.advance(by: 1)
+        XCTAssertEqual(buttonsAndHaptics, [.haptic(.medium), .button(L, down: true), .button(L, down: false)])
+    }
+
+    func testTouchLiftedBeforeTheLongPressIsNotAClick() {
+        let t = make()
+        t.began(1, at: .zero, time: clock.now)
+        t.ended(1, at: .zero, time: at(TouchInterpreter.Tuning.longPress - 0.1))
         clock.advance(by: 1)
         XCTAssertEqual(buttonsAndHaptics, [])
     }

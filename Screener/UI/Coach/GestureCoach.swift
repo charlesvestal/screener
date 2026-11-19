@@ -73,7 +73,7 @@ enum GestureCoach {
                   title: "Click & Right-Click", subtitle: "Tap to click. Two fingers, tap together, to right-click.",
                   kind: .tap),
         CoachCard(id: "drag", systemImage: "hand.draw.fill",
-                  title: "Drag", subtitle: "Double-tap and hold, then move, to drag.",
+                  title: "Drag", subtitle: "Press and hold, then move, to drag. Or double-tap and hold.",
                   kind: .drag),
         CoachCard(id: "scrollZoom", systemImage: "hand.draw",
                   title: "Scroll & Zoom", subtitle: "Two fingers drag to scroll. Pinch to zoom; "

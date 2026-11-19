@@ -19,12 +19,14 @@
 //     tap's cue fires at its own touch-up, giving two rings)
 //   - double-tap-and-hold (second touch within the window, then held still
 //     `tapMaxDuration` or moved): left-button drag until it lifts
-//   - long press (`longPressRightClick`, Settings, default OFF — two-finger
-//     tap is the usual right click): one finger held still for
-//     `Tuning.longPress` is a right click (medium haptic) the
-//     moment it fires; moving after it moves the cursor, lifting does
-//     nothing more. Not armed for the second touch of a double tap (that is
-//     double-tap-and-hold = drag) nor under the drag lock
+//   - long press: one finger held still for `Tuning.longPress` starts a
+//     left-button drag (medium haptic) until it lifts — like
+//     double-tap-and-hold, in one touch. With `longPressRightClick`
+//     (Settings, default OFF — two-finger tap is the usual right click) it
+//     is a right click instead, the moment it fires; moving after it moves
+//     the cursor, lifting does nothing more. Neither is armed for the second
+//     touch of a double tap (that is double-tap-and-hold = drag) nor under
+//     the drag lock
 //   - two-finger tap: right click; two-finger drag: scroll (momentum after)
 //   - three-finger drag: drag lock — the button goes down and stays down
 //     after the fingers lift; one-finger drags keep dragging; a tap releases
@@ -468,7 +470,7 @@ final class TouchInterpreter {
                 pendingClick = nil
                 owedClick = true
                 timer = schedule(Tuning.tapMaxDuration) { [weak self] in self?.holdBecameDrag() }
-            } else if longPressRightClick, !dragLocked {
+            } else if !dragLocked {
                 timer = schedule(Tuning.longPress) { [weak self] in self?.trackpadLongPressFired() }
             }
         } else {
@@ -556,15 +558,21 @@ final class TouchInterpreter {
         startDrag()
     }
 
-    /// Trackpad: one finger held still for `Tuning.longPress` — a right
-    /// click now; the rest of the touch only moves the cursor.
+    /// Trackpad: one finger held still for `Tuning.longPress` — a drag
+    /// starts (button down until the finger lifts), or with
+    /// `longPressRightClick` a right click now and the rest of the touch
+    /// only moves the cursor.
     private func trackpadLongPressFired() {
         timer = nil
         guard phase == .pending, effectiveMode == .trackpad, !owedClick, !dragLocked, fingers.count == 1
         else { return }
         flushPendingRightClick()
-        phase = .moving
-        click(InputController.Button.right, haptic: .medium)
+        if longPressRightClick {
+            phase = .moving
+            click(InputController.Button.right, haptic: .medium)
+        } else {
+            startDrag()
+        }
     }
 
     private func longPressFired() {

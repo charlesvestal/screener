@@ -14,7 +14,8 @@
 // - Long-press to right-click ("input.longPressRightClick", default OFF —
 //   two-finger tap is the usual trackpad right click): trackpad mode, one
 //   finger held still for TouchInterpreter.Tuning.longPress is a right click
-//   (with a haptic) — TouchInterpreter.longPressRightClick.
+//   (with a haptic) instead of starting a drag —
+//   TouchInterpreter.longPressRightClick.
 // - Pointer Speed / Touch Pointer Speed ("input.pointerSpeed",
 //   "input.touchPointerSpeed", 0.25×–3×, default 1×): PointerScaling.swift.
 // - Keyboard Tester ("input.keyboardTester", default off): a diagnostic

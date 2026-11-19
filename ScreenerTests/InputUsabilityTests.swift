@@ -567,13 +567,42 @@ final class TapDelayAndLongPressTests: XCTestCase {
         XCTAssertEqual(buttonsAndHaptics, [])
     }
 
-    func testOffLeavesALongStillTouchAlone() {
+    func testOffALongStillTouchStartsADragUntilItLifts() {
         let t = make(longPress: false)
         t.began(1, at: p, time: clock.now)
+        clock.advance(by: TouchInterpreter.Tuning.longPress - 0.05)
+        XCTAssertEqual(buttonsAndHaptics, [], "nothing before the threshold")
+        clock.advance(by: 0.06)
+        XCTAssertEqual(buttonsAndHaptics, [.haptic(.medium), .button(L, down: true)])
+        t.moved(1, to: CGPoint(x: 160, y: 100), time: at(0.05))
+        XCTAssertTrue(actions.contains { if case .moveBy = $0 { true } else { false } }, "the drag moves the cursor")
+        t.ended(1, at: CGPoint(x: 160, y: 100), time: at(0.01))
         clock.advance(by: 1)
-        t.ended(1, at: p, time: at(0.01))
+        XCTAssertEqual(buttonsAndHaptics, [.haptic(.medium), .button(L, down: true), .button(L, down: false)])
+    }
+
+    func testOffMovingBeforeTheThresholdIsJustAMove() {
+        let t = make(longPress: false)
+        t.began(1, at: p, time: clock.now)
+        t.moved(1, to: CGPoint(x: 160, y: 100), time: at(0.1))
         clock.advance(by: 1)
+        t.ended(1, at: CGPoint(x: 160, y: 100), time: at(0.01))
         XCTAssertEqual(buttonsAndHaptics, [])
+    }
+
+    func testOffLongPressUnderTheDragLockDoesNotPressAgain() {
+        let t = make(longPress: false)
+        // Three-finger drag engages the lock.
+        t.began(1, at: CGPoint(x: 100, y: 100), time: clock.now)
+        t.began(2, at: CGPoint(x: 150, y: 100), time: at(0.01))
+        t.began(3, at: CGPoint(x: 200, y: 100), time: at(0.01))
+        for (i, x) in [100.0, 150, 200].enumerated() { t.moved(i + 1, to: CGPoint(x: x, y: 140), time: at(0.01)) }
+        for i in 1...3 { t.ended(i, at: CGPoint(x: 0, y: 140), time: at(0.01)) }
+        XCTAssertTrue(t.dragLocked)
+        actions = []
+        t.began(4, at: p, time: clock.now)
+        clock.advance(by: 1)
+        XCTAssertEqual(buttonsAndHaptics, [], "the lock already holds the button")
     }
 
     func testAQuickTapIsStillALeftClick() {
