@@ -110,7 +110,7 @@ Screener works day to day against Apple-silicon Macs. Things to know:
 - Discovery is Bonjour only. To reach a Mac away from home, add it by address over a VPN.
 - The clipboard syncs plain text only.
 - The Mac's screen is always curtained (dark) during a session. That's how High Performance mode works.
-- Screener isn't on the App Store yet. Build it yourself as described above.
+- Screener isn't distributed through the App Store or TestFlight. Build it yourself as described above.
 
 ## Privacy and security
 
