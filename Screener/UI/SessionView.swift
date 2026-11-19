@@ -39,6 +39,10 @@ struct SessionView: View {
     @State private var sessionSize: CGSize = .zero
     @State private var landscapeHint = false
     @State private var landscapeHintShown = false
+    /// The window's safe area. The video layer ignores it (so its HUD can't
+    /// read it there); the HUD uses it to keep clear of the Dynamic Island /
+    /// notch / corners on iPhone. The other overlays here sit inside it.
+    @State private var safeArea = EdgeInsets()
 
     var body: some View {
         ZStack {
@@ -47,7 +51,7 @@ struct SessionView: View {
                              menu: menu, keyboardVisible: $keyboardVisible, menuExpanded: $menuExpanded,
                              touchMode: TouchInputMode(rawValue: touchModeRaw) ?? .default, feedback: feedback,
                              pip: pip)
-                .overlay { FeedbackOverlayView(center: feedback) }
+                .overlay { FeedbackOverlayView(center: feedback, safeArea: safeArea) }
                 .resizeFeedback(model)
                 .ignoresSafeArea()
             // Stages / first-picture reveal / "Reconnecting…" (SessionOverlays.swift).
@@ -85,6 +89,7 @@ struct SessionView: View {
             }
         }
         .onGeometryChange(for: CGSize.self) { $0.size } action: { sessionSize = $0 }
+        .onGeometryChange(for: EdgeInsets.self) { $0.safeAreaInsets } action: { safeArea = $0 }
         .onChange(of: wantsLandscapeHint, initial: true) { _, wants in updateLandscapeHint(wants) }
         .animation(.easeInOut(duration: 0.3), value: landscapeHint)
         .onChange(of: scenePhase, initial: true) { _, phase in

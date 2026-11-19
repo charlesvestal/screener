@@ -1346,9 +1346,12 @@ final class RemoteInputView: UIView, UIPointerInteractionDelegate, UIGestureReco
     }
 
     private func layoutKeyTester() {
-        let maxW = min(360, bounds.width - 32)
+        let maxW = min(360, bounds.width - 32 - (window?.safeAreaInsets.left ?? 0) - (window?.safeAreaInsets.right ?? 0))
         let size = keyTesterLabel.sizeThatFits(CGSize(width: maxW, height: .greatestFiniteMagnitude))
-        keyTesterLabel.frame = CGRect(x: 16, y: safeAreaInsets.top + 16, width: min(maxW, size.width + 8),
+        // The window's safe area: this view fills the screen under SwiftUI's
+        // ignoresSafeArea, so keep clear of the island / notch on iPhone.
+        let safe = window?.safeAreaInsets ?? safeAreaInsets
+        keyTesterLabel.frame = CGRect(x: safe.left + 16, y: safe.top + 16, width: min(maxW, size.width + 8),
                                       height: size.height + 8)
     }
 

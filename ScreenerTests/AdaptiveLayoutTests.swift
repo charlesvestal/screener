@@ -68,6 +68,56 @@ final class AdaptiveLayoutTests: XCTestCase {
         XCTAssertEqual(AdaptiveLayout.statsTopInset(horizontal: .regular), 16)
     }
 
+    // MARK: HUD clear of the Dynamic Island
+
+    /// iPhone 17 Pro: portrait / landscape sizes and safe areas (status bar hidden).
+    private let phonePortrait = (size: CGSize(width: 402, height: 874),
+                                 safe: EdgeInsets(top: 62, leading: 0, bottom: 34, trailing: 0))
+    private let phoneLandscape = (size: CGSize(width: 874, height: 402),
+                                  safe: EdgeInsets(top: 0, leading: 62, bottom: 20, trailing: 62))
+
+    func testZoomPillSitsBelowTheIslandInPortraitAndCentredInLandscape() {
+        typealias H = FeedbackHUDLayout
+        let p = H.zoomPillCenter(in: phonePortrait.size, insets: H.hudInsets(platform: .phone, safeArea: phonePortrait.safe))
+        XCTAssertEqual(p.x, 201)
+        XCTAssertGreaterThanOrEqual(p.y - 18, 62)                   // the ~36 pt pill's top below the island
+        let l = H.zoomPillCenter(in: phoneLandscape.size, insets: H.hudInsets(platform: .phone, safeArea: phoneLandscape.safe))
+        XCTAssertEqual(l, CGPoint(x: 437, y: H.zoomPillY))          // the island is at the side
+    }
+
+    func testMinimapAndScrollPillKeepClearOfTheIslandAndCorners() {
+        typealias H = FeedbackHUDLayout
+        let map = MinimapGeometry.size(aspect: 16.0 / 10)
+        let half = CGSize(width: map.width / 2 + H.minimapRim, height: map.height / 2 + H.minimapRim)
+        // Portrait: below the island row.
+        let ins = H.hudInsets(platform: .phone, safeArea: phonePortrait.safe)
+        let p = H.minimapCenter(size: map, in: phonePortrait.size, insets: ins)
+        XCTAssertGreaterThanOrEqual(p.y - half.height, 62)
+        XCTAssertLessThanOrEqual(p.x + half.width, 402 - H.minimapTrailing)
+        // Landscape (island on either side, vertically centred): inside the side insets.
+        let lins = H.hudInsets(platform: .phone, safeArea: phoneLandscape.safe)
+        let l = H.minimapCenter(size: map, in: phoneLandscape.size, insets: lins)
+        XCTAssertLessThanOrEqual(l.x + half.width, 874 - 62)
+        let s = H.scrollPillCenter(in: phoneLandscape.size, insets: lins)
+        XCTAssertLessThanOrEqual(s.x + 2.5, 874 - 62)
+        XCTAssertEqual(s.y, (402 - 20) / 2)
+    }
+
+    func testIPadHUDLayoutIsUnchanged() {
+        typealias H = FeedbackHUDLayout
+        let size = CGSize(width: 1376, height: 1032)
+        let ins = H.hudInsets(platform: .pad, safeArea: EdgeInsets(top: 24, leading: 0, bottom: 20, trailing: 0))
+        XCTAssertEqual(ins, EdgeInsets())
+        XCTAssertEqual(H.hudInsets(platform: .mac, safeArea: EdgeInsets(top: 28, leading: 0, bottom: 0, trailing: 0)),
+                       EdgeInsets())
+        // The positions it always had.
+        XCTAssertEqual(H.zoomPillCenter(in: size, insets: ins), CGPoint(x: 688, y: 44))
+        let map = MinimapGeometry.size(aspect: 16.0 / 10)
+        XCTAssertEqual(H.minimapCenter(size: map, in: size, insets: ins),
+                       CGPoint(x: 1376 - map.width / 2 - 6 - 20, y: map.height / 2 + 6 + 28))
+        XCTAssertEqual(H.scrollPillCenter(in: size, insets: ins), CGPoint(x: 1376 - 8, y: 516))
+    }
+
     func testCoachCardsAreShorterInACompactHeight() {
         XCTAssertLessThan(AdaptiveLayout.coachCardHeight(vertical: .compact),
                           AdaptiveLayout.coachCardHeight(vertical: .regular))

@@ -4,16 +4,72 @@
 //     it; gone at once on a move; a brief completion pop when it fires)
 //   - zoom pill: "2.4×" at the top while pinching, fading 1 s after
 //   - minimap (top-right, glass) while zoomed: the whole picture with the
-//     visible region outlined; tap or drag on it to move the view there
+//     visible region outlined; tap or drag on it to move the view there. It
+//     fades out `FeedbackCenter.minimapLinger` after the view last moved,
+//     even while still zoomed; the next zoom / pan brings it back
 //   - scroll pill: a slim thumb at the right edge during touch scroll and
 //     momentum, fading after
 // Must share the coordinate space of RemoteScreenView (same frame, safe area
-// ignored). Only the minimap takes touches. Reduce Motion: fades only.
+// ignored), so the proxy here reports no safe area: SessionView measures it
+// and passes `safeArea` in, and the HUD keeps clear of it on iPhone (Dynamic
+// Island / notch / rounded corners / home indicator: FeedbackHUDLayout).
+// Only the minimap takes touches. Reduce Motion: fades only.
 import SwiftUI
+
+/// Where the HUD pieces sit in the full-screen overlay (pure; AdaptiveLayoutTests).
+/// `insets` are what to keep clear of (`hudInsets`): the safe area on iPhone,
+/// none on iPad / Mac, where the layout is unchanged.
+enum FeedbackHUDLayout {
+    /// The zoom pill's centre from the top on iPad (and the floor on iPhone).
+    static let zoomPillY: CGFloat = 44
+    /// The minimap's distance from the top / trailing edges on iPad (floors on iPhone).
+    static let minimapTop: CGFloat = 28
+    static let minimapTrailing: CGFloat = 20
+    /// The glass rim around the minimap's picture.
+    static let minimapRim: CGFloat = 6
+    /// The scroll pill's centre from the trailing edge on iPad (floor on iPhone).
+    static let scrollPillTrailing: CGFloat = 8
+    /// Gap kept beyond the safe-area edge on iPhone.
+    static let gap: CGFloat = 8
+
+    /// What the HUD keeps clear of on `platform` given the window's safe area.
+    static func hudInsets(platform: AdaptiveLayout.Platform, safeArea: EdgeInsets) -> EdgeInsets {
+        platform == .phone ? safeArea : EdgeInsets()
+    }
+
+    /// Top centre, below the Dynamic Island / notch in portrait; centred
+    /// between the side insets in landscape.
+    static func zoomPillCenter(in size: CGSize, insets: EdgeInsets) -> CGPoint {
+        let x = insets.leading + (size.width - insets.leading - insets.trailing) / 2
+        let y = max(zoomPillY, insets.top + 26)
+        return CGPoint(x: x, y: y)
+    }
+
+    /// Top trailing corner, clear of the island (portrait: below it;
+    /// landscape: inside the side inset) and the rounded corner.
+    static func minimapCenter(size map: CGSize, in size: CGSize, insets: EdgeInsets) -> CGPoint {
+        let top = max(minimapTop, insets.top + gap)
+        let trailing = max(minimapTrailing, insets.trailing + gap)
+        return CGPoint(x: size.width - trailing - minimapRim - map.width / 2,
+                       y: top + minimapRim + map.height / 2)
+    }
+
+    /// The trailing edge, vertically centred: in landscape that is where the
+    /// Dynamic Island sits, so it moves inside the side inset.
+    static func scrollPillCenter(in size: CGSize, insets: EdgeInsets) -> CGPoint {
+        let trailing = max(scrollPillTrailing, insets.trailing + gap)
+        let midY = insets.top + (size.height - insets.top - insets.bottom) / 2
+        return CGPoint(x: size.width - trailing, y: midY)
+    }
+}
 
 struct FeedbackOverlayView: View {
     let center: FeedbackCenter
+    /// The window's safe area (this overlay ignores it; SessionView measures it).
+    var safeArea = EdgeInsets()
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    private var insets: EdgeInsets { FeedbackHUDLayout.hudInsets(platform: .current, safeArea: safeArea) }
 
     var body: some View {
         GeometryReader { geo in
@@ -27,21 +83,27 @@ struct FeedbackOverlayView: View {
                 }
                 if let scale = center.zoomPill {
                     ZoomPill(scale: scale)
-                        .position(x: geo.size.width / 2, y: 44)
+                        .position(FeedbackHUDLayout.zoomPillCenter(in: geo.size, insets: insets))
                         .transition(reduceMotion ? .opacity : .opacity.combined(with: .scale(scale: 0.9)))
                         .allowsHitTesting(false)
                 }
                 if let pos = center.scrollPill {
                     ScrollPill(position: pos, trackHeight: geo.size.height * 0.3)
-                        .position(x: geo.size.width - 8, y: geo.size.height / 2)
+                        .position(FeedbackHUDLayout.scrollPillCenter(in: geo.size, insets: insets))
                         .transition(.opacity)
                         .allowsHitTesting(false)
                 }
                 if let map = center.minimap {
                     let size = MinimapGeometry.size(aspect: map.aspect)
-                    MinimapView(map: map, thumbnail: center.thumbnail, size: size) { center.onMinimapJump?($0) }
-                        .position(x: geo.size.width - size.width / 2 - 6 - 20, y: size.height / 2 + 6 + 28)
-                        .transition(.opacity)
+                    MinimapView(map: map, thumbnail: center.thumbnail, size: size) {
+                        center.wakeMinimap()
+                        center.onMinimapJump?($0)
+                    }
+                    .position(FeedbackHUDLayout.minimapCenter(size: size, in: geo.size, insets: insets))
+                    .opacity(center.minimapShown ? 1 : 0)
+                    .allowsHitTesting(center.minimapShown)
+                    .accessibilityHidden(!center.minimapShown)
+                    .transition(.opacity)
                 }
             }
             .frame(width: geo.size.width, height: geo.size.height, alignment: .topLeading)
@@ -49,6 +111,7 @@ struct FeedbackOverlayView: View {
         .animation(.easeOut(duration: 0.2), value: center.zoomPill == nil)
         .animation(.easeOut(duration: 0.3), value: center.scrollPill == nil)
         .animation(.easeOut(duration: 0.25), value: center.minimap == nil)
+        .animation(.easeInOut(duration: 0.4), value: center.minimapShown)
         .animation(.easeOut(duration: 0.12), value: center.longPress?.id)
     }
 }
@@ -141,7 +204,7 @@ private struct MinimapView: View {
         .gesture(DragGesture(minimumDistance: 0).onChanged { v in
             jump(MinimapGeometry.contentPoint(v.location, minimapSize: size))
         })
-        .padding(6)
+        .padding(FeedbackHUDLayout.minimapRim)
         .glassEffect(.regular, in: RoundedRectangle(cornerRadius: 14))
         .accessibilityLabel("Zoomed region on the remote screen")
     }
