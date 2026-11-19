@@ -23,23 +23,39 @@
 // at the strip seams). So a frame that carries its RTP timestamp is STAGED,
 // per picture, and the presentable set (`snapshot`) changes once per picture.
 //
-// Apple's encoder skips tiles with nothing new (live, 2026-11-18: with
-// motion in one corner, 2 of 4 tiles are missing from ~60% of the pictures;
-// ~2% even with full-screen motion), so most pictures never get all strips.
-// Strips decode in decoding order, which is picture order (one DON counter,
-// the tiles of a timestamp in tile order: HEVCAssembler), so a picture is
-// shown:
-//   * at once when it has every tile that changed recently (the union of the
-//     tile sets of the last `recentPictures` pictures shown; all tiles at the
-//     start): a tile that has been static that long is assumed skipped. When
-//     it does come after all (a region starts moving), it fills the shown
-//     picture in (one short tear at the onset of motion, not a held picture);
-//   * when a strip of a newer picture decodes: the older picture has every
-//     strip it will ever get (a skipped tile is unchanged, a gated one keeps
-//     its last good strip), so it is final — never held for strips that are
-//     not coming, which used to delay motion by two pictures and then jump;
+// Apple's encoder skips tiles with nothing new — with LTR acks almost
+// entirely (live, 2026-11-19: a window moving inside strips 1–2 of 4 sends
+// {1,2} in ~70% of the pictures, a third tile now and then, the fourth
+// almost never), so most pictures never get all strips. Nothing in the
+// stream says which tiles a picture will have (live captures, 2026-11-19):
+// the RTP header extension (profile 0x9311 or 0x9301, one word) is u16
+// packets in this tile picture + u16 frame counter, and that counter is
+// global (shared by the tiles of a timestamp, +1 per picture sent); DON and
+// POC are one counter each, +1 per tile picture SENT (a skipped tile
+// consumes neither); the marker ends each tile picture. What IS known:
+// tile pictures are sent, and decode, in (timestamp, tile) order, all of a
+// timestamp's strips back to back (≤ 5 ms apart on the sender's wire) before
+// the next timestamp. So a picture is shown:
+//   * at once when it has the last tile (nothing can follow it);
+//   * at once when no strip of it is still on its way (`noteArrival`: the
+//     pipeline reports each tile picture's first packet) and either a packet
+//     of a newer picture has arrived (it is final), or the previous picture
+//     shown had no tile after its last strip (predicted complete; if one does
+//     come after all — a region starts moving — it fills the shown picture
+//     in: one short tear at the onset of motion, usually absorbed by the
+//     pacing delay). Otherwise it waits for that evidence: about one frame
+//     while the stream is live (the next picture's first packet), longer only
+//     when the stream goes silent (a Wi-Fi stall holds the old picture
+//     rather than tearing for its length);
+//   * when a strip of a newer picture decodes (it is final: a skipped tile is
+//     unchanged, a gated one keeps its last good strip);
 //   * when `flushStaged` (the pipeline ticker) finds that no strip came for
-//     its picture for `stagingTimeout` (the last picture of a motion burst).
+//     its picture for `stagingTimeout` (a stall, or the end of a burst whose
+//     last picture dropped a tile the previous one had).
+// The previous store expected every tile seen in the last 30 pictures, so a
+// tile that changed once (a cursor, a clock) made the next ~0.5 s of
+// pictures wait for the next picture's strip (up to `stagingTimeout`): with
+// motion in two strips, wait_ms 6–8 avg / ~100 max and paced judder.
 // A complete newer picture supersedes older staged ones. Frames without a
 // timestamp (tests, single-tile streams) commit at once.
 //
@@ -120,16 +136,19 @@ final class VideoFrameStore: @unchecked Sendable {   // all state behind `lock`
         var judderCount = 0
         var judderTotalMs = 0.0
         var judderOver8 = 0
+        /// Shown pictures that waited until a newer strip decoded or the
+        /// staging timeout (nothing told the store earlier that they were done).
+        var held = 0
 
         /// `shown=… merged=… skips=… fills=… wait_ms=avg/max ooo=… hold_ms=avg/max
-        /// pace_skips=… drawn=… age_ms=avg/max judder_ms=avg judder8=…`.
+        /// pace_skips=… drawn=… age_ms=avg/max judder_ms=avg judder8=… held=…`.
         var summary: String {
             String(format: "shown=%d merged=%d skips=%d fills=%d wait_ms=%.1f/%.0f ooo=%d hold_ms=%.1f/%.0f "
-                   + "pace_skips=%d drawn=%d age_ms=%.1f/%.0f judder_ms=%.1f judder8=%d",
+                   + "pace_skips=%d drawn=%d age_ms=%.1f/%.0f judder_ms=%.1f judder8=%d held=%d",
                    shown, merged, skips, fills, shown > 0 ? waitTotalMs / Double(shown) : 0, waitMaxMs, outOfOrder,
                    queued > 0 ? holdTotalMs / Double(queued) : 0, holdMaxMs, paceSkips,
                    drawn, drawn > 0 ? ageTotalMs / Double(drawn) : 0, ageMaxMs,
-                   judderCount > 0 ? judderTotalMs / Double(judderCount) : 0, judderOver8)
+                   judderCount > 0 ? judderTotalMs / Double(judderCount) : 0, judderOver8, held)
         }
     }
 
@@ -160,20 +179,17 @@ final class VideoFrameStore: @unchecked Sendable {   // all state behind `lock`
     }
 
     /// How long a staged picture waits after its newest strip when nothing
-    /// newer decodes (see the header). On live captures consecutive strips of
-    /// one picture arrive ≤ 13 ms apart (p99.9; one in ~19000 gaps above
-    /// 50 ms), but the paced stream has been seen to stall every tile for up
-    /// to ~100 ms; with newer strips resolving every mid-stream picture, the
-    /// timeout only ends a motion burst whose last picture skipped a tile.
+    /// resolves it (see the header). Consecutive strips of one picture leave
+    /// the host ≤ 5 ms apart, but Wi-Fi stalls the stream for 80–150 ms a few
+    /// times a second on some networks (2026-11-19: the host's wired send
+    /// side shows no gap), mid-picture too; holding the old picture through
+    /// one is better than tearing for its length. Mid-stream pictures are
+    /// resolved by the next picture's first packet long before this.
     static let stagingTimeout: Duration = .milliseconds(100)
 
-    /// Pictures whose tile sets make up the expected set (see the header):
-    /// ~0.5 s at 60 fps, so a tile skipped now and then during motion is
-    /// still waited for. On a live capture with motion in one corner, 4 / 8 /
-    /// 16 / 30 / 60 pictures traded fills (onset tears) of 91 / 63 / 33 / 21
-    /// / 4 for an average wait after the last strip of 2.8 / 4.5 / 6.9 / 9.3
-    /// / 11.2 ms (the previous store: 23 ms, and 53 pictures never shown).
-    static let recentPictures = 30
+    /// Timestamps whose wire tiles are remembered (`noteArrival`): ~2 s at
+    /// 60 fps, well beyond the decode backlog after a stall.
+    static let wireMemory = 128
 
     /// Resize hold: a partial first picture of the new stream is shown this
     /// long after its first strip; a held canvas without a new stream is
@@ -195,8 +211,13 @@ final class VideoFrameStore: @unchecked Sendable {   // all state behind `lock`
     /// The picture on screen and the tiles it was shown without.
     private var shownTimestamp: UInt32?
     private var shownMissing: Set<Int> = []
-    /// Tile sets of the last `recentPictures` pictures shown, oldest first.
-    private var recentSets: [Set<Int>] = []
+    /// Tile set of the last picture shown (the completeness prediction).
+    private var previousTiles: Set<Int>?
+    /// Tiles with a packet on the wire per RTP timestamp (`noteArrival`; the
+    /// timestamps in arrival order for pruning), and the newest one seen.
+    private var wire: [UInt32: Set<Int>] = [:]
+    private var wireOrder: [UInt32] = []
+    private var newestWire: UInt32?
     private var partialCommits = 0
     /// Resize hold (see the header).
     private struct NextGroup {
@@ -293,7 +314,7 @@ final class VideoFrameStore: @unchecked Sendable {   // all state behind `lock`
         let (e, cb) = lock.withLock {
             frames = [:]; version += 1; canvas = nil; tileCount = 4
             nextGroup = nil; heldCanvas = nil
-            pending = []; shownTimestamp = nil; shownMissing = []; newestStaged = nil; recentSets = []
+            pending = []; shownTimestamp = nil; shownMissing = []; newestStaged = nil; previousTiles = nil; wire = [:]; wireOrder = []; newestWire = nil
             resetPacingLocked()
             counters = Counters(); firstFrameSeen = false
             epoch += 1
@@ -312,7 +333,7 @@ final class VideoFrameStore: @unchecked Sendable {   // all state behind `lock`
             if let tileCount, tileCount > 0, tileCount != self.tileCount {
                 self.tileCount = tileCount
                 frames = frames.filter { $0.key < tileCount }
-                pending = []; shownTimestamp = nil; shownMissing = []; recentSets = []
+                pending = []; shownTimestamp = nil; shownMissing = []; previousTiles = nil; wire = [:]; wireOrder = []; newestWire = nil
                 version += 1
             }
             if let canvas {
@@ -388,7 +409,7 @@ final class VideoFrameStore: @unchecked Sendable {   // all state behind `lock`
             guard ts == shown, shownMissing.contains(f.tile) else { return false }
             frames[f.tile] = entry
             shownMissing.remove(f.tile)
-            if !recentSets.isEmpty { recentSets[recentSets.count - 1].insert(f.tile) }
+            previousTiles?.insert(f.tile)
             present.fills += 1
             version += 1
             changedAt = now
@@ -402,17 +423,52 @@ final class VideoFrameStore: @unchecked Sendable {   // all state behind `lock`
             let at = pending.firstIndex { Self.isAfter($0.ts, ts) } ?? pending.endIndex
             pending.insert(StagedPicture(ts: ts, strips: [f.tile: entry], since: now, lastStrip: now), at: at)
         }
-        // The newest picture with every recently changed tile wins; older
-        // staged ones are never shown.
-        let expected = recentSets.isEmpty ? Set(0..<tileCount) : recentSets.reduce(into: Set<Int>()) { $0.formUnion($1) }
-        if let done = pending.lastIndex(where: { expected.isSubset(of: $0.strips.keys) }) {
-            commitLocked(through: done, now: now, reason: "complete")
-            return true
-        }
+        if commitCompleteLocked(now: now, reason: "complete") { return true }
         // A strip of a newer picture decoded: every older one is final.
         guard pending.count > 1 else { return false }
         commitLocked(through: pending.count - 2, now: now, reason: "final")
+        present.held += 1
+        _ = commitCompleteLocked(now: now, reason: "complete")   // the newer one, predicted from it
         return true
+    }
+
+    /// Shows the newest complete staged picture (older staged ones are never
+    /// shown), repeatedly: the picture shown is the next one's prediction.
+    private func commitCompleteLocked(now: ContinuousClock.Instant, reason: String) -> Bool {
+        var changed = false
+        while let done = pending.lastIndex(where: isCompleteLocked) {
+            commitLocked(through: done, now: now, reason: reason)
+            changed = true
+        }
+        return changed
+    }
+
+    /// Whether staged picture `p` has every strip it will get (see the header).
+    private func isCompleteLocked(_ p: StagedPicture) -> Bool {
+        guard let top = p.strips.keys.max() else { return false }
+        if top >= tileCount - 1 { return true }                          // nothing can follow the last tile
+        let have = Set(p.strips.keys)
+        if let w = wire[p.ts], !w.isSubset(of: have) { return false }      // on its way
+        if let n = newestWire, Self.isAfter(n, p.ts) { return true }      // the next picture has begun
+        let previous = previousTiles ?? Set(0..<tileCount)
+        return !previous.contains { $0 > top }
+    }
+
+    /// The pipeline saw the first packet of tile picture (`ts`, `tile`) — before
+    /// it is assembled and decoded. A packet of a newer picture finalizes the
+    /// staged ones whose strips are all in (see the header).
+    func noteArrival(rtpTimestamp ts: UInt32, tile: Int, now: ContinuousClock.Instant = .now) {
+        let cb: (@Sendable () -> Void)? = lock.withLock {
+            if wire[ts, default: []].insert(tile).inserted, wire[ts]!.count == 1 {
+                wireOrder.append(ts)
+                if wireOrder.count > Self.wireMemory { wire[wireOrder.removeFirst()] = nil }
+            }
+            let newer = newestWire.map { Self.isAfter(ts, $0) } ?? true
+            if newer { newestWire = ts }
+            guard newer, nextGroup == nil, commitCompleteLocked(now: now, reason: "next on wire") else { return nil }
+            return _onChange
+        }
+        cb?()
     }
 
     // MARK: resize hold
@@ -477,7 +533,7 @@ final class VideoFrameStore: @unchecked Sendable {   // all state behind `lock`
         tileCount = newTiles
         if let held = heldCanvas { canvas = held.size }
         heldCanvas = nil
-        pending = []; shownTimestamp = nil; shownMissing = []; recentSets = []; newestStaged = nil
+        pending = []; shownTimestamp = nil; shownMissing = []; previousTiles = nil; wire = [:]; wireOrder = []; newestWire = nil; newestStaged = nil
         version += 1
         changedAt = now
         scheduleLocked(ts: nil, now: now)
@@ -491,8 +547,10 @@ final class VideoFrameStore: @unchecked Sendable {   // all state behind `lock`
             var changed = false
             while let oldest = pending.first, now - oldest.lastStrip >= timeout {
                 commitLocked(through: 0, now: now, reason: "timeout")
+                present.held += 1
                 changed = true
             }
+            if changed { _ = commitCompleteLocked(now: now, reason: "complete") }
             if let first = nextGroup?.firstAt, now - first >= Self.incomingTimeout {
                 switchToNextGroupLocked(now: now, reason: "timeout")
                 changed = true
@@ -562,8 +620,7 @@ final class VideoFrameStore: @unchecked Sendable {   // all state behind `lock`
         for p in pending[...index] { for (tile, entry) in p.strips { frames[tile] = entry } }
         shownTimestamp = picture.ts
         shownMissing = Set(0..<tileCount).subtracting(picture.strips.keys)
-        recentSets.append(Set(picture.strips.keys))
-        if recentSets.count > Self.recentPictures { recentSets.removeFirst(recentSets.count - Self.recentPictures) }
+        previousTiles = Set(picture.strips.keys)
         pending.removeFirst(index + 1)
         if partial { present.skips += 1 }
         if partial, reason == "timeout" { partialCommits += 1 }

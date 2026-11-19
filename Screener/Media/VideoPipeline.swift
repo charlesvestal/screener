@@ -25,7 +25,10 @@
 //   * frames are published with the store epoch this pipeline was created
 //     under (late callbacks after a reset are dropped);
 //   * the ticker also commits a picture whose strips stopped coming
-//     (VideoFrameStore.flushStaged; strips are presented per picture);
+//     (VideoFrameStore.flushStaged; strips are presented per picture), and
+//     each tile picture's first packet is reported to the store
+//     (noteArrival: which strips are on their way, and that a newer picture
+//     has begun, so a picture without its last tiles is shown at once);
 //   * LTR acks, ON by default (SCREENER_LTR_ACK=0 turns them off): one APP
 //     name 5 per decoded tile picture carrying that picture's DONL, as the
 //     native viewer sends (one 30-byte SRTCP APP per tile marker). In the
@@ -110,6 +113,7 @@ actor VideoPipeline {
     private var lastArrival: ContinuousClock.Instant?
     private var rxGapMax: Duration = .zero
     private var rxGaps50 = 0
+    private var lastNoted: (ssrc: UInt32, ts: UInt32) = (0, 0)
     private let publishThrottle = PublishThrottle()
 
     init(store: VideoFrameStore, hooks: Hooks, ltrAcks: LTRAckMode = VideoPipeline.ltrAckMode) {
@@ -183,6 +187,13 @@ actor VideoPipeline {
                 assembler = HEVCAssembler(tileSSRCs: group, config: Self.assemblerConfig)
                 store.configure(tileCount: group.count)
             }
+        }
+        // The store's completeness evidence: which tile pictures are on their
+        // way, and when a newer picture has begun (once per tile picture).
+        if p.ssrc != lastNoted.ssrc || p.timestamp != lastNoted.ts,
+           let tile = assembler!.tileSSRCs.firstIndex(of: p.ssrc) {
+            lastNoted = (p.ssrc, p.timestamp)
+            store.noteArrival(rtpTimestamp: p.timestamp, tile: tile)
         }
         await handle(assembler!.ingest(p))
     }

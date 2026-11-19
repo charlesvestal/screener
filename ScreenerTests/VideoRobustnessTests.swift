@@ -65,10 +65,10 @@ final class VideoRobustnessTests: XCTestCase {
         XCTAssertEqual(store.takePresentStats().skips, 1)
     }
 
-    /// Motion in one corner (live, 2026-11-18: tiles {0,1} in ~60% of the
-    /// pictures, the others skipped as unchanged): once the static tiles
-    /// have been missing for a while, each picture is shown as soon as its
-    /// last changing strip decodes, not one or two pictures later.
+    /// Motion in one corner (tiles {0,1}, the others skipped as unchanged):
+    /// each picture is shown as soon as its last changing strip decodes, not
+    /// one or two pictures later. Only the first picture without tiles 2 and
+    /// 3 (the previous one had them) waits, for the next picture to start.
     func testSkippedStaticTilesDoNotDelayPictures() throws {
         let store = VideoFrameStore()
         let e = store.reset()
@@ -76,7 +76,7 @@ final class VideoRobustnessTests: XCTestCase {
         var seq = 100
         for t in 0..<4 { store.publish(try frame(tile: t, seq: seq, ts: 0), epoch: e); seq += 1 }
         var shownAtOnce = 0
-        let pictures = VideoFrameStore.recentPictures + 4
+        let pictures = 12
         for k in 1...pictures {
             let ts = UInt32(400 * k)
             store.publish(try frame(tile: 0, seq: seq, ts: ts), epoch: e); seq += 1
@@ -84,13 +84,122 @@ final class VideoRobustnessTests: XCTestCase {
             store.publish(last, epoch: e)
             if store.snapshot(ifNewerThan: nil)?.frames[1] === last.pixelBuffer { shownAtOnce += 1 }
         }
-        // The first picture without tiles 2 and 3 waits for the next one to
-        // start; after `recentPictures` pictures without them, none waits.
-        XCTAssertEqual(shownAtOnce, 4)
+        XCTAssertEqual(shownAtOnce, pictures - 1)
         let stats = store.takePresentStats()
         XCTAssertEqual(stats.shown, 1 + pictures)
         XCTAssertEqual(stats.merged, 0)
+        XCTAssertEqual(stats.held, 1, "only the first picture without tiles 2 and 3 waited")
         XCTAssertEqual(store.takePartialCommits(), 0)
+    }
+
+    /// The user's case (2026-11-19: a window dragged in two strips while
+    /// another tile changes now and then, `tiles=[2,60,9,56]`): a tile that
+    /// changed once no longer makes the following pictures wait. With the
+    /// pipeline's arrival reports a picture is shown on its last strip, or on
+    /// the next picture's first packet when the previous picture had a tile
+    /// after its last strip — never on the next picture's decode or timeout.
+    func testAnOccasionalTileDoesNotHoldTheFollowingPictures() throws {
+        let store = VideoFrameStore()
+        let e = store.reset()
+        store.configure(tileCount: 4)
+        var seq = 0
+        let sets: [[Int]] = [[0, 1, 2, 3], [1, 3], [1, 3], [1, 2, 3], [1, 3], [1], [1], [0, 1], [1, 3], [1, 3]]
+        var lastStrips: [DecodedFrame] = []
+        for (k, tiles) in sets.enumerated() {
+            let ts = UInt32(400 * k)
+            for t in tiles { store.noteArrival(rtpTimestamp: ts, tile: t) }
+            for t in tiles {
+                let f = try frame(tile: t, seq: seq, ts: ts); seq += 1
+                store.publish(f, epoch: e)
+                if t == tiles.last { lastStrips.append(f) }
+            }
+        }
+        store.noteArrival(rtpTimestamp: UInt32(400 * sets.count), tile: 1)
+        let stats = store.takePresentStats()
+        XCTAssertEqual(stats.shown, sets.count)
+        XCTAssertEqual(stats.held, 0)
+        XCTAssertEqual(stats.fills, 0)
+        XCTAssertTrue(store.snapshot(ifNewerThan: nil)?.frames[3] === lastStrips.last?.pixelBuffer)
+    }
+
+    /// A strip whose first packet has arrived is waited for even when the
+    /// previous picture predicts the picture complete without it (no fill).
+    func testAStripOnTheWireIsWaitedFor() throws {
+        let store = VideoFrameStore()
+        let e = store.reset()
+        store.configure(tileCount: 4)
+        var seq = 0
+        for (k, tiles) in [[0, 1, 2, 3], [1]].enumerated() {
+            for t in tiles { store.publish(try frame(tile: t, seq: seq, ts: UInt32(400 * k)), epoch: e); seq += 1 }
+        }
+        store.noteArrival(rtpTimestamp: 800, tile: 1)
+        store.noteArrival(rtpTimestamp: 800, tile: 2)
+        let one = try frame(tile: 1, seq: seq, ts: 800)
+        store.publish(one, epoch: e)
+        XCTAssertFalse(store.snapshot(ifNewerThan: nil)?.frames[1] === one.pixelBuffer, "tile 2 is on its way")
+        let two = try frame(tile: 2, seq: seq + 1, ts: 800)
+        store.publish(two, epoch: e)
+        let snap = try XCTUnwrap(store.snapshot(ifNewerThan: nil))
+        XCTAssertTrue(snap.frames[1] === one.pixelBuffer)
+        XCTAssertTrue(snap.frames[2] === two.pixelBuffer)
+        XCTAssertEqual(store.takePresentStats().fills, 0)
+    }
+
+    /// A picture that may still get a strip (the previous one had a tile after
+    /// its last strip) is shown as soon as a packet of a newer picture
+    /// arrives — before that picture decodes — but not on a packet of its own.
+    func testANewerPictureOnTheWireFinalizesTheStagedOne() throws {
+        let store = VideoFrameStore()
+        let e = store.reset()
+        store.configure(tileCount: 4)
+        var seq = 0
+        for t in 0..<4 { store.publish(try frame(tile: t, seq: seq, ts: 0), epoch: e); seq += 1 }
+        store.noteArrival(rtpTimestamp: 400, tile: 0)
+        let f = try frame(tile: 0, seq: seq, ts: 400)
+        store.publish(f, epoch: e)
+        let changes = Counter()
+        store.onChange = { changes.bump() }
+        store.noteArrival(rtpTimestamp: 400, tile: 0)
+        XCTAssertFalse(store.snapshot(ifNewerThan: nil)?.frames[0] === f.pixelBuffer)
+        store.noteArrival(rtpTimestamp: 800, tile: 1)
+        XCTAssertTrue(store.snapshot(ifNewerThan: nil)?.frames[0] === f.pixelBuffer)
+        XCTAssertEqual(changes.value, 1)
+        let stats = store.takePresentStats()
+        XCTAssertEqual(stats.skips, 1)
+        XCTAssertEqual(stats.held, 0)
+    }
+
+    /// With pacing, a strip that fills a picture shown without it before
+    /// that picture is due replaces it in the queue: the viewer never sees
+    /// the incomplete picture.
+    func testAFillBeforeTheDueTimeIsNeverSeen() throws {
+        let store = VideoFrameStore()
+        store.setPacing(.init(delay: .milliseconds(10), window: .seconds(1), maxHold: .milliseconds(40)))
+        let e = store.reset()
+        store.configure(tileCount: 2)
+        _ = store.snapshot(ifNewerThan: nil)
+        let start = ContinuousClock.now
+        var seq = 0
+        for (k, tiles) in [[0, 1], [0]].enumerated() {
+            for t in tiles {
+                store.publish(try frame(tile: t, seq: seq, ts: UInt32(400 * k)), epoch: e,
+                              now: start + .microseconds(Int64(16_667 * k)))
+                seq += 1
+            }
+        }
+        // Picture 800's tile 0 is predicted complete (picture 400 had tile 0
+        // only), so it is queued at once; its tile 1 then comes after all.
+        let t0 = try frame(tile: 0, seq: seq, ts: 800)
+        store.publish(t0, epoch: e, now: start + .milliseconds(34))
+        let t1 = try frame(tile: 1, seq: seq + 1, ts: 800)
+        XCTAssertEqual(store.takePresentStats().shown, 3)
+        store.publish(t1, epoch: e, now: start + .milliseconds(36))
+        let shown = try XCTUnwrap(store.snapshot(ifNewerThan: nil, now: start + .milliseconds(60)))
+        XCTAssertTrue(shown.frames[0] === t0.pixelBuffer)
+        XCTAssertTrue(shown.frames[1] === t1.pixelBuffer)
+        let stats = store.takePresentStats()
+        XCTAssertEqual(stats.fills, 1)
+        XCTAssertEqual(stats.queued, 0, "the fill replaced the queued picture")
     }
 
     /// A static tile that starts changing (a window moving into it) after the
@@ -104,10 +213,10 @@ final class VideoRobustnessTests: XCTestCase {
             try tiles.map { t in defer { seq += 1 }; return try frame(tile: t, seq: seq, ts: ts) }
         }
         for f in try pic(0, [0, 1]) { store.publish(f, epoch: e) }
-        for k in 1...(VideoFrameStore.recentPictures + 1) {
+        for k in 1...3 {
             for f in try pic(UInt32(400 * k), [0]) { store.publish(f, epoch: e) }
         }
-        let moving = try pic(UInt32(400 * (VideoFrameStore.recentPictures + 2)), [0, 1])
+        let moving = try pic(UInt32(400 * 4), [0, 1])
         store.publish(moving[0], epoch: e)
         XCTAssertTrue(store.snapshot(ifNewerThan: nil)?.frames[0] === moving[0].pixelBuffer, "tile 1 was static")
         store.publish(moving[1], epoch: e)
@@ -116,8 +225,9 @@ final class VideoRobustnessTests: XCTestCase {
     }
 
     /// Full-screen motion with an occasional skipped tile (~2% of pictures):
-    /// that picture waits only for the next picture's first strip, and the
-    /// tile is still expected afterwards (no tear in the next picture).
+    /// that picture waits only for the next picture's first packet, and the
+    /// next picture waits for its tile 3, which is on the wire by the time
+    /// its tile 2 decodes (no tear in the next picture).
     func testAnOccasionalSkipDuringFullMotionWaitsForTheNextPictureOnly() throws {
         let store = VideoFrameStore()
         let e = store.reset()
@@ -126,6 +236,7 @@ final class VideoRobustnessTests: XCTestCase {
         func publish(_ ts: UInt32, _ tiles: [Int]) throws -> [DecodedFrame] {
             try tiles.map { t in
                 defer { seq += 1 }
+                store.noteArrival(rtpTimestamp: ts, tile: t)
                 let f = try frame(tile: t, seq: seq, ts: ts)
                 store.publish(f, epoch: e)
                 return f
@@ -134,9 +245,12 @@ final class VideoRobustnessTests: XCTestCase {
         _ = try publish(0, [0, 1, 2, 3])
         let skip = try publish(400, [0, 1, 2])                          // tile 3 unchanged
         XCTAssertFalse(store.snapshot(ifNewerThan: nil)?.frames[0] === skip[0].pixelBuffer, "tile 3 may still come")
-        let next = try publish(800, [0, 1, 2])
+        store.noteArrival(rtpTimestamp: 800, tile: 0)
         var snap = try XCTUnwrap(store.snapshot(ifNewerThan: nil))
-        XCTAssertTrue(snap.frames[2] === skip[2].pixelBuffer, "400 shown when 800 started")
+        XCTAssertTrue(snap.frames[2] === skip[2].pixelBuffer, "400 shown when 800's first packet arrived")
+        store.noteArrival(rtpTimestamp: 800, tile: 3)                   // in flight while 0–2 decode
+        let next = try publish(800, [0, 1, 2])
+        XCTAssertNil(store.snapshot(ifNewerThan: snap.version), "tile 3 is on its way")
         let last = try publish(800, [3])
         snap = try XCTUnwrap(store.snapshot(ifNewerThan: nil))
         XCTAssertTrue(snap.frames[0] === next[0].pixelBuffer)
