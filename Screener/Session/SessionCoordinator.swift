@@ -244,6 +244,13 @@ final class SessionCoordinator {
     /// resize the scene): applied when active again, never sent to the Mac
     /// while Picture in Picture shows the session.
     @ObservationIgnored private var deferredViewGeometry: (points: CGSize, scale: CGFloat)?
+    /// A dynamic resize is in flight (0x1d sent, waiting for the new stream's
+    /// picture): SessionView shows "Resizing…" and blurs the held last frame
+    /// (ResizeFeedback.swift; the trigger logic below).
+    private(set) var isResizing = false
+    @ObservationIgnored private var resizeFeedback = ResizeFeedback()
+    @ObservationIgnored private var resizeObserverToken: Int?
+    @ObservationIgnored private var resizeTimeoutTask: Task<Void, Never>?
     /// The session view is up: connected, suspended, or reconnecting.
     var isSessionActive: Bool {
         switch state {
@@ -704,6 +711,7 @@ final class SessionCoordinator {
         releaseInput?()
         clipboard.stop()
         display.stop()
+        endResize(reason: "teardown")
         let input = input
         self.input = nil
         cursor.reset()
@@ -1072,15 +1080,69 @@ final class SessionCoordinator {
 
     private func requestDisplay(_ g: DisplayGeometry) async {
         guard let control, case .connected = state else { return }
+        // Before the first picture there's no held frame to blur and nothing
+        // visibly "resizes" yet (it's the connect-time sizing, not a
+        // follow-on request), so no toast/blur for it — only for a resize
+        // once a picture is already up.
+        if hasFirstFrame { beginResize() }
         do {
             try await control.requestDisplay(g)
         } catch {
             Log.app.error("display: resize request failed: \(ControlSession.describe(error))")
+            endResize(reason: "request failed")
         }
     }
 
     /// The UI text for `error` (UserFacingError: no raw errno text).
     static func describe(_ error: Error) -> String { UserFacingError.message(for: error) }
+
+    // MARK: resize feedback (Task 21 UX: "Resizing…" toast + held-frame blur)
+
+    static let resizeFeedbackTimeout: Duration = .seconds(5)
+
+    /// A dynamic resize was just requested (0x1d sent): SessionView shows
+    /// "Resizing…" and blurs the held last frame until `isResizing` goes
+    /// back to false (ResizeFeedback.swift has the coalescing policy: a
+    /// resize already in flight just gets its timeout extended).
+    private func beginResize() {
+        resizeFeedback.begin()
+        isResizing = true
+        if resizeObserverToken == nil {
+            resizeObserverToken = frames.addObserver { [weak self] in
+                Task { @MainActor in self?.checkResizeComplete() }
+            }
+        }
+        armResizeTimeout()
+    }
+
+    private func armResizeTimeout() {
+        resizeTimeoutTask?.cancel()
+        let gen = generation
+        resizeTimeoutTask = Task { [weak self] in
+            try? await Task.sleep(for: SessionCoordinator.resizeFeedbackTimeout)
+            guard let self, !Task.isCancelled, self.isCurrent(gen), self.isResizing else { return }
+            Log.app.error("display: resize feedback timed out after "
+                          + "\(SessionCoordinator.resizeFeedbackTimeout.ms) ms with no new picture")
+            self.endResize(reason: "timeout")
+        }
+    }
+
+    /// Called (on the frame store's own threads, hopped to the main actor)
+    /// after every frame-store change while a resize is in flight: ends the
+    /// feedback once the new stream's picture is no longer being held.
+    private func checkResizeComplete() {
+        guard isResizing, !frames.isHoldingForNewStream else { return }
+        endResize(reason: "new picture")
+    }
+
+    private func endResize(reason: String) {
+        resizeTimeoutTask?.cancel(); resizeTimeoutTask = nil
+        if let token = resizeObserverToken { frames.removeObserver(token); resizeObserverToken = nil }
+        guard isResizing else { return }
+        isResizing = false
+        resizeFeedback.end()
+        Log.app.info("display: resize feedback ended (\(reason))")
+    }
 
     /// Before the session view reports its size: the window scene's size in
     /// points (the window in Stage Manager, the screen in full screen, in the

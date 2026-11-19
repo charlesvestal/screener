@@ -19,9 +19,12 @@ struct SessionView: View {
     @State private var menuExpanded = false
     /// Touch feedback: GPU ripples / cursor halo (renderer) and the HUD overlay.
     @State private var feedback = FeedbackCenter()
-    /// First-run gesture coach (GestureCoach): shown once on the first
-    /// session to reach a picture, and reopenable from the "?" menu tile.
-    @AppStorage(GestureCoach.seenKey) private var coachSeen = false
+    /// First-run gesture coach (GestureCoach): shown once ever, on the first
+    /// session (of any, across reconnects/resizes/relaunches) to reach a
+    /// picture, and reopenable any time from the "?" menu tile. The "once
+    /// ever" gate is `GestureCoach.markSeenIfFirstTime`, not a View-local
+    /// flag, precisely because this View can be recreated underneath an
+    /// unchanged `model` (zoom transition, layout swap, PiP restore, …).
     @State private var showCoach = false
     @AppStorage(TouchInputMode.defaultsKey) private var touchModeRaw = TouchInputMode.default.rawValue
     @AppStorage(DisplayMode.defaultsKey) private var displayModeRaw = DisplayMode.default.rawValue
@@ -45,6 +48,7 @@ struct SessionView: View {
                              touchMode: TouchInputMode(rawValue: touchModeRaw) ?? .default, feedback: feedback,
                              pip: pip)
                 .overlay { FeedbackOverlayView(center: feedback) }
+                .resizeFeedback(model)
                 .ignoresSafeArea()
             // Stages / first-picture reveal / "Reconnecting…" (SessionOverlays.swift).
             SessionStatusOverlay(model: model)
@@ -110,8 +114,7 @@ struct SessionView: View {
             model.setDisplayMode(DisplayMode(rawValue: raw) ?? .default)
         }
         .onChange(of: model.hasFirstFrame) { _, has in
-            guard has, !coachSeen else { return }
-            coachSeen = true
+            guard has, GestureCoach.markSeenIfFirstTime() else { return }
             showCoach = true
         }
         // Toasts, the stats overlay, Keep Screen Awake (UI/Toast/SessionPolish.swift).
