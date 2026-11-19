@@ -3,9 +3,10 @@
 //
 // Pill: drag it anywhere; on release it springs to the nearest screen edge.
 // Its place (edge + position along it) is remembered per orientation
-// (@AppStorage). It fades to 30% after 3 s without interaction, steps aside
-// while the remote pointer is over it, and shows latched/locked modifier
-// badges. ⌘⌥M on a hardware keyboard toggles the panel (RemoteInputView).
+// (@AppStorage). It fades to `PillAppearance.idleOpacity` after 3 s without
+// interaction (still findable: a thin light ring and a soft dark shadow keep
+// it legible over light and dark Mac content), steps aside while the remote
+// pointer is over it, and shows latched/locked modifier badges. ⌘⌥M on a hardware keyboard toggles the panel (RemoteInputView).
 //
 // On a compact width or height (iPhone, a narrow window) the panel is a
 // bottom sheet (.medium / .large detents) with the same sections, opened
@@ -79,6 +80,19 @@ struct PillPlacement: Equatable {
             return CGSize(width: fraction < 0.5 ? dx : -dx, height: 0)
         }
     }
+}
+
+/// The collapsed pill's look (AdaptiveLayoutTests pins the idle level).
+enum PillAppearance {
+    /// Faded after `idleDelay` without interaction: out of the way, still easy to find.
+    static let idleOpacity = 0.6
+    static let idleDelay: Duration = .seconds(3)
+    /// A thin light ring (reads on dark content) ...
+    static let ringOpacity = 0.6
+    static let ringWidth: CGFloat = 1
+    /// ... and a soft dark shadow (reads on light content).
+    static let shadowOpacity = 0.35
+    static let shadowRadius: CGFloat = 4
 }
 
 /// What the session offers the menu beyond keys.
@@ -186,7 +200,9 @@ struct FloatingMenuView: View {
         .frame(minWidth: 52, minHeight: 44)
         .contentShape(Capsule())
         .menuGlass(Capsule())
-        .opacity(idle && !dragging ? 0.3 : 1)
+        .overlay(Capsule().strokeBorder(.white.opacity(PillAppearance.ringOpacity), lineWidth: PillAppearance.ringWidth))
+        .shadow(color: .black.opacity(PillAppearance.shadowOpacity), radius: PillAppearance.shadowRadius, y: 1)
+        .opacity(idle && !dragging ? PillAppearance.idleOpacity : 1)
         .animation(.easeInOut(duration: 0.4), value: idle)
         .onTapGesture { expanded = true }
         .accessibilityElement(children: .ignore)
@@ -242,12 +258,12 @@ struct FloatingMenuView: View {
         }
     }
 
-    /// Interaction: full opacity now, fade again after 3 s idle.
+    /// Interaction: full opacity now, fade again after `PillAppearance.idleDelay` idle.
     private func poke() {
         idle = false
         idleTask?.cancel()
         idleTask = Task { @MainActor in
-            try? await Task.sleep(for: .seconds(3))
+            try? await Task.sleep(for: PillAppearance.idleDelay)
             guard !Task.isCancelled else { return }
             idle = true
         }
@@ -265,7 +281,6 @@ private struct ControlPanel: View {
     var style: Style = .floating
     @State private var passwordArmed = false
     @State private var disarmTask: Task<Void, Never>?
-    @AppStorage(PacingConfig.defaultsKey) private var smoothPlayback = false
     @AppStorage(TouchInputMode.defaultsKey) private var touchModeRaw = TouchInputMode.default.rawValue
     private var touchMode: TouchInputMode { TouchInputMode(rawValue: touchModeRaw) ?? .default }
     @AppStorage(AudioPlayer.mutedDefaultsKey) private var audioMuted = false
@@ -322,12 +337,32 @@ private struct ControlPanel: View {
                 .accessibilityLabel("Close Control Menu")
             }
             if let liveStats { QualityBadge(stats: liveStats) }
-            section("Modifiers") { ModifierBar(menu: menu) }
-            section("Keys") { SpecialKeysPanel(menu: menu) }
-            section("Mac Shortcuts") { shortcuts }
-            section("Session") { sessionControls }
+            // Sections and their tiles: ControlMenuLayout.
+            ForEach(ControlMenuLayout.Section.allCases, id: \.self) { s in
+                section(s.title) {
+                    switch s {
+                    case .keyboard:
+                        tileGrid(s)
+                        ModifierBar(menu: menu)
+                        SpecialKeysPanel(menu: menu)
+                    case .shortcuts:
+                        shortcuts
+                    default:
+                        tileGrid(s)
+                    }
+                }
+            }
         }
         .padding(16)
+    }
+
+    private func tileGrid(_ section: ControlMenuLayout.Section) -> some View {
+        let tiles = ControlMenuLayout.tiles(section, pictureInPicture: controls.togglePictureInPicture != nil,
+                                            switchMac: controls.switchMac != nil)
+        return LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 6),
+                                        count: ControlMenuLayout.columns), spacing: 6) {
+            ForEach(Array(tiles.enumerated()), id: \.offset) { _, t in tileView(t) }
+        }
     }
 
     private func section<C: View>(_ title: String, @ViewBuilder _ c: () -> C) -> some View {
@@ -369,12 +404,15 @@ private struct ControlPanel: View {
         action == .appSwitcher && menu.appSwitcherActive
     }
 
-    private var sessionControls: some View {
-        LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 6), count: 4), spacing: 6) {
+    @ViewBuilder
+    private func tileView(_ t: ControlMenuLayout.Tile) -> some View {
+        switch t {
+        case .keyboard:
             tile(keyboardVisible ? "Hide Keyboard" : "Keyboard",
                  keyboardVisible ? "keyboard.chevron.compact.down" : "keyboard",
                  selected: keyboardVisible) { keyboardTapped() }
                 .disabled(!controls.inputAvailable)
+        case .typePassword:
             tile(passwordArmed ? "Tap to Type" : "Type Password",
                  passwordArmed ? "key.fill" : "key", selected: passwordArmed,
                  hint: menu.canTypePassword
@@ -383,35 +421,15 @@ private struct ControlPanel: View {
                 typePasswordTapped()
             }
             .disabled(!controls.inputAvailable || !menu.canTypePassword)
-            tile(clipboardFlash?.tile == 0 ? clipboardFlash!.text : "Get Clipboard", "doc.on.clipboard",
-                 hint: "Copies the Mac's clipboard text to this iPad.") {
-                controls.getClipboard?()
-                flashClipboard(0, "Requested")
-            }
-            .disabled(controls.getClipboard == nil || !controls.inputAvailable)
-            tile(clipboardFlash?.tile == 1 ? clipboardFlash!.text : "Send Clipboard", "clipboard",
-                 hint: "Sends this iPad's clipboard text to the Mac.") {
-                flashClipboard(1, controls.sendClipboard?() == true ? "Sent" : "No Text")
-            }
-            .disabled(controls.sendClipboard == nil || !controls.inputAvailable)
-            tile("Auto Clipboard", clipboardAuto ? "arrow.left.arrow.right.circle.fill" : "arrow.left.arrow.right.circle",
-                 selected: clipboardAuto,
-                 hint: "On: text copied on either side is copied to the other automatically; iPadOS may ask "
-                    + "to allow pasting. Off: use Get Clipboard and Send Clipboard.") {
-                clipboardModeRaw = (clipboardAuto ? ClipboardSyncMode.manual : .automatic).rawValue
-            }
-            .accessibilityValue(clipboardAuto ? "On" : "Off")
-            .accessibilityAddTraits(.isToggle)
-            tile("Mute", audioMuted ? "speaker.slash.fill" : "speaker.wave.2", selected: audioMuted,
-                 hint: "Silences the Mac's sound on this iPad.") { audioMuted.toggle() }
-                .accessibilityValue(audioMuted ? "On" : "Off")
-                .accessibilityAddTraits(.isToggle)
+        case .display:
             displayMenu
+        case .touchMode:
             tile(touchMode.title, touchMode == .trackpad ? "rectangle.and.hand.point.up.left" : "hand.point.up.left",
                  hint: "Input mode for your fingers. Trackpad: drag to move the pointer, tap to click. "
                     + "Touch: the pointer goes where you touch. Tap to switch.") {
                 touchModeRaw = (touchMode == .trackpad ? TouchInputMode.direct : .trackpad).rawValue
             }
+        case .findCursor:
             tile("Find Cursor", "scope",
                  hint: "Closes the menu, centres the view on the Mac's pointer and enlarges it briefly. "
                     + "Shaking the pointer does the same.") {
@@ -419,25 +437,7 @@ private struct ControlPanel: View {
                 menu.findCursor()
             }
             .disabled(!controls.inputAvailable)
-            tile("Stats", showStats ? "chart.bar.fill" : "chart.bar", selected: showStats,
-                 hint: "Shows frame rate, bitrate, decode time and loss over the session.") { showStats.toggle() }
-                .accessibilityValue(showStats ? "On" : "Off")
-                .accessibilityAddTraits(.isToggle)
-            tile("Smooth Playback", smoothPlayback ? "waveform.path" : "waveform.path.ecg",
-                 selected: smoothPlayback,
-                 hint: "Presents frames on the Mac's timeline: smoother motion, a little more delay. "
-                    + "Takes effect on the next connection.") { smoothPlayback.toggle() }
-                .accessibilityValue(smoothPlayback ? "On" : "Off")
-                .accessibilityAddTraits(.isToggle)
-            ShareLink(item: RedactedLog(), preview: SharePreview("screener.log")) {
-                tileLabel("Share Log", "doc.text.magnifyingglass", selected: false, destructive: false)
-            }
-            .buttonStyle(.plain)
-            .accessibilityLabel("Share Log")
-            tile("Gesture Help", "questionmark.circle", hint: "Shows the gesture coach again.") {
-                controls.openCoach?()
-            }
-            .disabled(controls.openCoach == nil)
+        case .pictureInPicture:
             if let togglePiP = controls.togglePictureInPicture {
                 tile("Picture in Picture", controls.pictureInPictureActive ? "pip.exit" : "pip.enter",
                      selected: controls.pictureInPictureActive,
@@ -448,11 +448,71 @@ private struct ControlPanel: View {
                 .disabled(!controls.pictureInPictureActive && !controls.pictureInPicturePossible)
                 .accessibilityValue(controls.pictureInPictureActive ? "On" : "Off")
             }
+        case .getClipboard:
+            tile(clipboardFlash?.tile == 0 ? clipboardFlash!.text : "Get", "doc.on.clipboard",
+                 label: "Get Clipboard", hint: "Copies the Mac's clipboard text to this device.") {
+                controls.getClipboard?()
+                flashClipboard(0, "Requested")
+            }
+            .disabled(controls.getClipboard == nil || !controls.inputAvailable)
+        case .sendClipboard:
+            tile(clipboardFlash?.tile == 1 ? clipboardFlash!.text : "Send", "clipboard",
+                 label: "Send Clipboard", hint: "Sends this device's clipboard text to the Mac.") {
+                flashClipboard(1, controls.sendClipboard?() == true ? "Sent" : "No Text")
+            }
+            .disabled(controls.sendClipboard == nil || !controls.inputAvailable)
+        case .autoClipboard:
+            tile("Auto", clipboardAuto ? "arrow.left.arrow.right.circle.fill" : "arrow.left.arrow.right.circle",
+                 selected: clipboardAuto, label: "Auto Clipboard",
+                 hint: "On: text copied on either side is copied to the other automatically; iOS may ask "
+                    + "to allow pasting. Off: use Get and Send.") {
+                clipboardModeRaw = (clipboardAuto ? ClipboardSyncMode.manual : .automatic).rawValue
+            }
+            .accessibilityValue(clipboardAuto ? "On" : "Off")
+            .accessibilityAddTraits(.isToggle)
+        case .mute:
+            tile("Mute", audioMuted ? "speaker.slash.fill" : "speaker.wave.2", selected: audioMuted,
+                 hint: "Silences the Mac's sound on this device.") { audioMuted.toggle() }
+                .accessibilityValue(audioMuted ? "On" : "Off")
+                .accessibilityAddTraits(.isToggle)
+        case .switchMac:
             if let switcher = controls.switchMac {
                 SwitchMacTile(switcher: switcher) { expanded = false }
             }
+        case .more:
+            moreMenu
+        case .disconnect:
             tile("Disconnect", "xmark.circle.fill", destructive: true) { controls.disconnect() }
         }
+    }
+
+    /// Rarely needed, kept one tap further away (ControlMenuLayout.MoreItem).
+    private var moreMenu: some View {
+        Menu {
+            ForEach(ControlMenuLayout.MoreItem.allCases, id: \.self) { item in
+                switch item {
+                case .stats:
+                    Toggle(isOn: $showStats) { Label("Stats", systemImage: "chart.bar") }
+                case .gestureHelp:
+                    if let openCoach = controls.openCoach {
+                        Button {
+                            expanded = false
+                            openCoach()
+                        } label: { Label("Gesture Help", systemImage: "questionmark.circle") }
+                    }
+                case .shareLog:
+                    ShareLink(item: RedactedLog(), preview: SharePreview("screener.log")) {
+                        Label("Share Log", systemImage: "doc.text.magnifyingglass")
+                    }
+                }
+            }
+        } label: {
+            tileLabel("More", showStats ? "ellipsis.circle.fill" : "ellipsis.circle", selected: false,
+                      destructive: false)
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("More")
+        .accessibilityHint("Stats, gesture help and sharing the log.")
     }
 
     /// The sheet covers the session (and its keyboard proxy): it closes
@@ -512,12 +572,12 @@ private struct ControlPanel: View {
     }
 
     private func tile(_ title: String, _ image: String, selected: Bool = false, destructive: Bool = false,
-                      hint: String? = nil, action: @escaping () -> Void) -> some View {
+                      label: String? = nil, hint: String? = nil, action: @escaping () -> Void) -> some View {
         Button(action: action) {
             tileLabel(title, image, selected: selected, destructive: destructive)
         }
         .buttonStyle(.plain)
-        .accessibilityLabel(title)
+        .accessibilityLabel(label ?? title)
         .accessibilityHint(hint ?? "")
     }
 
