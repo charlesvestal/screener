@@ -314,10 +314,7 @@ final class ClipboardBridgeTests: XCTestCase {
         let msg = try Clipboard.send(text: text)
         var parser = ServerMessageParser()
         for e in try parser.feed(msg) { bridge.handle(e) }
-        for _ in 0..<200 {
-            try await Task.sleep(for: .milliseconds(5))
-            if pb.stored == text { return }
-        }
+        await bridge.settleDecodes()
     }
 
     private func sentText(_ d: Data) throws -> String? {
@@ -354,7 +351,6 @@ final class ClipboardBridgeTests: XCTestCase {
         XCTAssertEqual(wire.sent.count, 3)
         // The same text again isn't rewritten.
         try await receive("hello-from-mac")
-        try await Task.sleep(for: .milliseconds(50))
         XCTAssertEqual(pb.changeCount, count)
     }
 
@@ -373,7 +369,6 @@ final class ClipboardBridgeTests: XCTestCase {
         // The Mac echoes it back: not rewritten on the iPad.
         let count = pb.changeCount
         try await receive("from ipad ✓")
-        try await Task.sleep(for: .milliseconds(50))
         XCTAssertEqual(pb.changeCount, count)
     }
 
@@ -450,7 +445,7 @@ final class ClipboardBridgeTests: XCTestCase {
         w.u8(0x1f); w.zeros(3); w.u32(0); w.u32(0); w.u32(UInt32(empty.count)); w.bytes(empty)
         var parser = ServerMessageParser()
         for e in try parser.feed(w.data) { bridge.handle(e) }
-        try await Task.sleep(for: .milliseconds(100))
+        await bridge.settleDecodes()
         try await receive("unsolicited")
         XCTAssertEqual(pb.stored, "local")
     }

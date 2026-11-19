@@ -209,7 +209,12 @@ final class SessionCoordinator {
     @ObservationIgnored private var fallbackPolicy = MediaFallbackPolicy()
     @ObservationIgnored private var framebuffer: FramebufferPipeline?
     /// "Signing in…" → "Securing…" → "Starting video…" (ConnectionStage.swift).
-    private(set) var stage: ConnectionStage = .idle
+    private(set) var stage: ConnectionStage = .idle {
+        didSet { if stage != oldValue { onStageChange?(stage) } }
+    }
+    /// Called on every stage change, in order, including transient stages a
+    /// later observer of `stage` could miss (tests record the sequence here).
+    @ObservationIgnored var onStageChange: ((ConnectionStage) -> Void)?
     /// The Mac's model identifier (DeviceInfo 0x456), once this session sent it.
     private(set) var deviceModel: String?
     /// The Mac's key fingerprint and sign-in method of the current (or last

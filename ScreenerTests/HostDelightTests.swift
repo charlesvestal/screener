@@ -66,14 +66,15 @@ final class SessionCoordinatorStageTests: XCTestCase {
         policy.firstFrameDeadline = .seconds(120)
         let c = SessionCoordinator(policy: policy, seams: h.seams(ip: "192.0.2.150"))
         XCTAssertEqual(c.stage, .idle)
-        let t = Task { await c.connect(host: "mac", port: 5900, username: "u", password: "p") }
+        // Record every transition as it happens: "Signing in" can last less
+        // than a polling interval.
         var seen: [ConnectionStage] = []
-        try await waitUntil("handshake") {
-            if c.stage != .idle, seen.last != c.stage { seen.append(c.stage) }
-            return c.mediaParams != nil && c.stage == .startingVideo
-        }
+        c.onStageChange = { seen.append($0) }
+        let t = Task { await c.connect(host: "mac", port: 5900, username: "u", password: "p") }
+        try await waitUntil("handshake") { c.mediaParams != nil && c.stage == .startingVideo }
         XCTAssertEqual(seen, seen.sorted(), "never steps back: \(seen)")
         XCTAssertEqual(seen.first, .signingIn)
+        XCTAssertEqual(seen.last, .startingVideo)
         try h.deliverBurst(try XCTUnwrap(c.mediaParams?.keys))
         try await waitUntil("connected") { if case .connected = c.state { true } else { false } }
         await t.value

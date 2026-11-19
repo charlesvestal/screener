@@ -123,6 +123,8 @@ final class ClipboardBridge {
     private var writing = false
     /// Every send goes through this chain, so wire order = call order.
     private var chain: Task<Void, Never>?
+    /// Inbound 0x1f decodes, in arrival order.
+    private var decodeChain: Task<Void, Never>?
     private var observer: NSObjectProtocol?
 
     init(pasteboard: PasteboardAccess = SystemPasteboard(), observeChanges: Bool = true) {
@@ -166,6 +168,7 @@ final class ClipboardBridge {
         reassembler.reset()
         fetchRequested = false
         chain = nil
+        decodeChain = nil
     }
 
     /// The control channel's clipboard events (0x14 MiscStatus, 0x1f).
@@ -246,11 +249,17 @@ final class ClipboardBridge {
         }
     }
 
+    /// Inflates off the main actor, applying results in arrival order, so a
+    /// Get Clipboard's answer is consumed before the message after it.
     private func decode(_ header: ClipboardSendHeader, _ payload: Data) {
         let e = epoch
-        Task.detached(priority: .utility) { [weak self] in
-            let result = Result { try Clipboard.decodeText(header: header, payload: payload) }
-            await self?.received(result, epoch: e)
+        let previous = decodeChain
+        decodeChain = Task { [weak self] in
+            await previous?.value
+            let result = await Task.detached(priority: .utility) {
+                Result { try Clipboard.decodeText(header: header, payload: payload) }
+            }.value
+            self?.received(result, epoch: e)
         }
     }
 
@@ -326,6 +335,14 @@ final class ClipboardBridge {
         while let c = chain {
             await c.value
             if chain == c { break }
+        }
+    }
+
+    /// Waits for queued inbound decodes (tests).
+    func settleDecodes() async {
+        while let c = decodeChain {
+            await c.value
+            if decodeChain == c { break }
         }
     }
 }
