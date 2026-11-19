@@ -104,6 +104,17 @@ private struct SessionPolish: ViewModifier {
                 guard was, !now, model.hasFirstFrame, case .connected = model.state else { return }
                 toasts.show(SessionToasts.reconnected, systemImage: "checkmark.circle.fill", key: "session")
             }
+            // One toast per resize burst: `isResizing` only flips false→true
+            // at the start of a burst (SessionCoordinator/ResizeFeedback
+            // coalesce the rest), so this onChange fires once per burst.
+            // Informational — shown regardless of `feedback.visual` (the
+            // held-frame blur, UI/SessionOverlays.swift, is the part that
+            // setting gates).
+            .onChange(of: model.isResizing) { was, now in
+                guard !was, now else { return }
+                toasts.show(SessionToasts.resizing, systemImage: "arrow.up.left.and.arrow.down.right",
+                            key: "resize")
+            }
             .onChange(of: keepsAwake, initial: true) { _, on in
                 UIApplication.shared.isIdleTimerDisabled = on
             }
@@ -124,6 +135,7 @@ enum SessionToasts {
     static let sentToMac = "Copied to Mac ↗"
     static let fromMac = "Clipboard from Mac"
     static let reconnected = "Reconnected"
+    static let resizing = "Resizing…"
     static func display(_ mode: DisplayMode) -> String { "Display: \(mode.title)" }
     static func touchMode(_ mode: TouchInputMode) -> String {
         switch mode {

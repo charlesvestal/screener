@@ -33,9 +33,29 @@ enum CoachAnimationKind: Equatable {
 }
 
 enum GestureCoach {
-    /// @AppStorage key: the coach has been shown once (set when it's first
-    /// presented, whether or not it was dismissed).
+    /// UserDefaults key: the coach has been shown once (set when it's first
+    /// presented, whether or not it was dismissed). Gated by
+    /// `markSeenIfFirstTime`, not read/written directly, so "shown once ever
+    /// per install" holds regardless of how many times SessionView itself is
+    /// torn down and recreated (a reconnect, a display-mode resize that
+    /// restarts the stream, Picture in Picture restoring, the card→session
+    /// zoom transition, an iPhone/iPad layout swap, or a second window/Mac) —
+    /// every one of those re-reads live from UserDefaults instead of trusting
+    /// a value a View's own @State captured earlier.
     static let seenKey = "coach.seen"
+
+    /// Atomically checks and marks "seen": returns `true` — meaning "present
+    /// the automatic coach now" — at most once per install. The first caller
+    /// to ask (across any number of reconnects, resizes, or SessionView
+    /// instances, in this run or a past one) wins; every later caller gets
+    /// `false`. A plain `UserDefaults` read-then-write, not `@AppStorage`'s
+    /// View-bound cache, so the check is always against the live value.
+    @discardableResult
+    static func markSeenIfFirstTime(defaults: UserDefaults = .standard) -> Bool {
+        guard !defaults.bool(forKey: seenKey) else { return false }
+        defaults.set(true, forKey: seenKey)
+        return true
+    }
 
     /// The cards for the touch mode currently in effect.
     static func cards(for mode: TouchInputMode) -> [CoachCard] {

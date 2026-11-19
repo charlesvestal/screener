@@ -120,6 +120,36 @@ struct SessionStatusOverlay: View {
     }
 }
 
+extension View {
+    /// Blurs and slightly dims the live picture while a dynamic resize is in
+    /// flight (`SessionCoordinator.isResizing`: 0x1d sent, waiting for the
+    /// new stream's first picture at the new canvas — VideoFrameStore holds
+    /// the old one on screen meanwhile), then fades back to sharp over
+    /// ~250 ms once it shows. A cheap SwiftUI compositing effect over the
+    /// live video (RemoteScreenView keeps rendering the held frame as-is;
+    /// no MetalRenderer change). Reduce Motion: no animated transition, it
+    /// just appears/disappears. `feedback.visual` off: skipped — the
+    /// "Resizing…" toast (SessionPolish.swift) is informational and stays.
+    func resizeFeedback(_ model: SessionCoordinator) -> some View {
+        modifier(ResizeFeedbackBlur(model: model))
+    }
+}
+
+private struct ResizeFeedbackBlur: ViewModifier {
+    let model: SessionCoordinator
+    @AppStorage("feedback.visual") private var visualFeedback = true
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    private var active: Bool { model.isResizing && visualFeedback }
+
+    func body(content: Content) -> some View {
+        content
+            .blur(radius: active ? 14 : 0)
+            .brightness(active ? -0.08 : 0)
+            .animation(reduceMotion ? nil : .easeOut(duration: 0.25), value: active)
+    }
+}
+
 /// "Reduced performance": the session runs on the TCP framebuffer path
 /// (SessionCoordinator.fallbackReason) — lower frame rate, no HP video.
 struct ReducedPerformanceBadge: View {
