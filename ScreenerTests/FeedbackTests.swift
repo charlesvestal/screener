@@ -606,8 +606,8 @@ final class MinimapGeometryTests: XCTestCase {
 
 @MainActor
 final class RippleRenderTests: XCTestCase {
-    static let pngPath = "/tmp/screener-scratch/"
-        + "59248b49-582f-4f43-89af-e8356a049371/scratchpad/ripple.png"
+    /// Where the rippled frame is written for eyeballing (best effort).
+    static let pngPath = (NSTemporaryDirectory() as NSString).appendingPathComponent("screener-ripple.png")
 
     func testRippleUniformsMapThroughZoomAndPixels() {
         let s = RippleSample(center: CGPoint(x: 50, y: 25), radius: 10, amplitude: 4, width: 6, highlight: 0.3,

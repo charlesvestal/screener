@@ -20,13 +20,17 @@
 # Values are raw (not shell-quoted). The file is parsed line by line — never
 # sourced — and must be mode 600. Nothing secret is echoed: no `set -x`.
 #
+# Simulator: SCREENER_SIM_UDID (environment or Tools/local.env).
+#
 # WARNING: a live HP session turns on display privacy on the target Mac until
 # the app disconnects (after `seconds`).
 set -euo pipefail
 set +x
 
-UDID=00000000-0000-0000-0000-000000000000
-BUNDLE=com.vestal.screener
+source "$(dirname "$0")/local-env.sh"
+require_env SCREENER_SIM_UDID "xcrun simctl list devices"
+UDID=$SCREENER_SIM_UDID
+BUNDLE=$SCREENER_BUNDLE_ID
 HOST=${1:-127.0.0.1}
 AFTER=${2:-20}
 ORDER=${3:-}

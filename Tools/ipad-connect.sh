@@ -1,9 +1,11 @@
 #!/bin/bash
 # Live check on the paired iPad (DEBUG build), the device twin of sim-connect.sh.
 #
-#   Tools/ipad-connect.sh [host] [seconds]
-#     host     Screen Sharing host (default: this Mac's en0 IPv4)
+#   Tools/ipad-connect.sh <host> [seconds]
+#     host     Screen Sharing host (IPv4 address or name; required)
 #     seconds  -autoDisconnectAfter (default 30)
+#
+# Device: SCREENER_DEVICE_UDID (environment or Tools/local.env).
 #
 # Credentials come from ~/.screener-test.env (SCREENER_TEST_ENV overrides),
 # parsed line by line (never sourced), mode 600, and handed to the app only via
@@ -15,9 +17,12 @@
 set -euo pipefail
 set +x
 
-DEVICE=00000000-0000000000000000
-BUNDLE=com.vestal.screener
-HOST=${1:-$(ipconfig getifaddr en0)}
+source "$(dirname "$0")/local-env.sh"
+require_env SCREENER_DEVICE_UDID "xcrun devicectl list devices"
+DEVICE=$SCREENER_DEVICE_UDID
+BUNDLE=$SCREENER_BUNDLE_ID
+[[ $# -ge 1 && -n $1 ]] || { echo "usage: $0 <host> [seconds]" >&2; exit 2; }
+HOST=$1
 AFTER=${2:-30}
 ENV_FILE=${SCREENER_TEST_ENV:-$HOME/.screener-test.env}
 
