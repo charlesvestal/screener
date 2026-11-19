@@ -26,15 +26,20 @@
 //     under (late callbacks after a reset are dropped);
 //   * the ticker also commits a picture whose strips stopped coming
 //     (VideoFrameStore.flushStaged; strips are presented per picture);
-//   * LTR acks (session._on_frame_published → _send_ltr_ack): APP name 5
-//     carrying the RTP TIMESTAMP of a decoded picture (AVConference logs
-//     "Received APP_LTRP_ACK timestamp=%u" and matches it against the frames
-//     it sent; the reference sent the DON, which matches nothing). OFF by
-//     default: SCREENER_LTR_ACK=1 acks the newest tile-0 picture,
-//     SCREENER_FB_ACKALL=1 every tile's picture as the native viewer does
-//     (one APP per marker). On 2026-11-18 (simulator, induced loss) the host
-//     answered every FIR/PLI with an IDR with or without them — no LTR-based
-//     repair was seen — and the bitrate was the same;
+//   * LTR acks, ON by default (SCREENER_LTR_ACK=0 turns them off): one APP
+//     name 5 per decoded tile picture carrying that picture's DONL, as the
+//     native viewer sends (one 30-byte SRTCP APP per tile marker). In the
+//     host's multi-tile screen mode AVConference keys its LTR ring by a
+//     per-tile-picture 16-bit id that the packetizer sends as the RFC 7798
+//     DONL (VideoTransmitter_ACKLTRFrame; the receiver side acks
+//     VideoPacketBuffer's frame DON). Without matching acks the host's
+//     encoder keeps only tile 0's pictures as references: tiles 1–3 are
+//     re-encoded from tile 0 every frame (25–275 KB each, a quality sawtooth
+//     seen as a flash on every keypress) and unchanged tiles are never
+//     skipped. With them every tile predicts from its own previous picture
+//     and the host stops sending unchanged tiles (~60 → ~0.2–5 Mbps on a
+//     terminal workload, 2026-11-19). RTP timestamps (shared by the four
+//     tiles) or the extension's frame counter match nothing;
 //   * loss recovery: HEVCAssembler's reference recovery (HEVCReferenceTracker)
 //     releases every picture whose references were decoded and asks for a
 //     keyframe only for a broken picture or a tile left without a decodable
@@ -58,28 +63,23 @@ actor VideoPipeline {
         var requestKeyframe: @Sendable (UInt32) async -> Void
         var notePublished: @Sendable () async -> Void
         var onNotHEVC: @Sendable () async -> Void
-        /// LTR acks: (RTP timestamp of a decoded picture, ack every picture).
-        var ackLTR: (@Sendable (UInt32, Bool) async -> Void)? = nil
+        /// LTR acks: the DONL of each decoded tile picture.
+        var ackLTR: (@Sendable (UInt16) async -> Void)? = nil
         /// A hard decoder failure (a rebuild or an output-mode fallback, not a
         /// concealment error): SessionCoordinator's TCP-fallback trigger
         /// (MediaFallbackPolicy: 3 within 10 s).
         var onHardFailure: (@Sendable () async -> Void)? = nil
     }
 
-    /// Which decoded pictures are acknowledged (APP name 5 + DON on P+1).
+    /// Whether decoded pictures are acknowledged (APP name 5 + DONL on P+1).
     enum LTRAckMode: Sendable, Equatable {
         case off
-        /// Reference: the newest tile-0 DON (SCREENER_LTR_ACK=1).
-        case tile0
         /// Native viewer: one ack per decoded picture of every tile, right
-        /// after it decodes (≈1–3 ms after the tile's marker packet; one 30-byte
-        /// SRTCP APP per marker in the native capture). SCREENER_FB_ACKALL=1.
-        case allTiles
+        /// after it decodes. Default; SCREENER_LTR_ACK=0 turns it off.
+        case everyPicture
 
         static func fromEnvironment(_ env: [String: String] = ExperimentEnv.current) -> LTRAckMode {
-            if env["SCREENER_FB_ACKALL"] == "1" { return .allTiles }
-            if env["SCREENER_LTR_ACK"] == "1" { return .tile0 }
-            return .off
+            env["SCREENER_LTR_ACK"] == "0" ? .off : .everyPicture
         }
     }
 
@@ -119,22 +119,15 @@ actor VideoPipeline {
         let weakSelf = WeakBox<VideoPipeline>()
         let epoch = store.currentEpoch
         let ackLTR = ltrAcks != .off ? hooks.ackLTR : nil
-        let ackAll = ltrAcks == .allTiles
-        let lastTS = LatestTimestamp()
-        if ackLTR != nil { Log.video.info("video: LTR acks ON (RTP timestamp of \(ackAll ? "every tile" : "each tile-0") picture decoded)") }
+        Log.video.info("video: LTR acks \(ackLTR != nil ? "ON (DONL of every decoded tile picture)" : "OFF")")
         self.decoder = VideoDecoder { event in
             switch event {
             case .frame(let f):
                 store.publish(f, epoch: epoch)
                 if throttle.shouldNotify() { Task { await hooks.notePublished() } }
-                // Tasks may run out of order: each sends the newest timestamp at that moment.
-                if let ts = f.rtpTimestamp, let ackLTR {
-                    if ackAll {
-                        Task { await ackLTR(ts, true) }
-                    } else if f.tile == 0 {
-                        lastTS.set(ts)
-                        Task { if let ts = lastTS.get() { await ackLTR(ts, false) } }
-                    }
+                if let ackLTR {
+                    let don = f.don
+                    Task { await ackLTR(don) }
                 }
             case .error(let tile, let don, let status, let irap):
                 store.noteError()
@@ -368,14 +361,6 @@ private final class PublishThrottle: @unchecked Sendable {   // state behind `lo
             return true
         }
     }
-}
-
-/// The newest decoded tile-0 RTP timestamp (VideoToolbox thread → ack tasks).
-private final class LatestTimestamp: @unchecked Sendable {   // `value` behind `lock`
-    private let lock = NSLock()
-    private var value: UInt32?
-    func set(_ v: UInt32) { lock.withLock { value = v } }
-    func get() -> UInt32? { lock.withLock { value } }
 }
 
 private final class WeakBox<T: AnyObject>: @unchecked Sendable {   // set once, before use

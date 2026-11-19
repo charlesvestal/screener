@@ -83,7 +83,7 @@ Host→Screener video rate from a host-side packet capture (UDP to .33:5901, IP+
 - So a lost picture breaks exactly the later pictures whose RPS marks it used — on any tile — and often nothing at all (e.g. a lost tile-2 picture that only tile 2's next picture would have used, when that next picture predicts from tile 0 instead).
 
 ### LTR ack semantics (AVConference, macOS 27)
-- `_VideoReceiver_ProcessRtcpLTRAck` logs "Received APP_LTRP_ACK timestamp=%u"; `VideoTransmitter_ACKLTRFrame` matches the value against a ring (≤ 100) of the timestamps of frames it sent; `__VCVideoReceiverDefault_sendLTRAckWithTS` / `VideoTransmitter_SendLTRACK` on the viewer side queue the same. The APP name-5 u32 is the picture's **RTP timestamp**, not the DONL the reference sends.
+- `_VideoReceiver_ProcessRtcpLTRAck` logs "Received APP_LTRP_ACK timestamp=%u"; `VideoTransmitter_ACKLTRFrame` matches the value against a ring (≤ 100) of the keys of frames it sent; `__VCVideoReceiverDefault_sendLTRAckWithTS` / `VideoTransmitter_SendLTRACK` on the viewer side queue the same. ~~The APP name-5 u32 is the picture's RTP timestamp~~ — wrong for the multi-tile screen stream, see "LTR acks carry the DONL" below.
 - With timestamp acks on every tile picture (SCREENER_FB_ACKALL=1), the host still answered every FIR or PLI (SCREENER_KF_MODE=pli) with an IDR, and with the FIR held back 1.5 s (SCREENER_FIR_DELAY_MS) it never repaired on its own. iPad A/B under induced loss: IDRs 20 / 30 with acks vs 24 / 17 without — noise. Acks stay opt-in.
 
 ### Reference recovery (HEVCReferenceTracker + HEVCAssembler, default on)
@@ -105,3 +105,30 @@ Keyframe requests no longer cut the BWE (SCREENER_KF_CUTS_BWE=1 restores it): su
 | induced loss, refs ON (new default) | 50 | 65 / 54 | 76 | 78 | 24 | 20 | 0 |
 
 The Wi-Fi was much cleaner than in the user's earlier session (rx_gaps50 ≈ 2 per 2 s vs 7–12): 0–10 loss events per 2 minutes at ~58 Mbps, so no evidence for capping the BWE below 65 Mbps, and none for or against NET_SERVICE_TYPE_VI (SO_NETSVC_MARKING_LEVEL reads 0 = unknown on the iPad).
+
+## LTR acks carry the DONL: the cause of the per-keypress flash (2026-11-19)
+
+### Symptom
+Decrypted captures of our stream: tile 0 predicts from its own previous picture and is tiny when static; tiles 1–3 always predict from tile 0's pictures (used deltas (-1,-5), (-2,-6), (-3,-7)). Their RPS keeps only tile-0 pictures (`-1 -5 -9 … -59` for tile 1): tiles 1–3 are never kept as references. So every unchanged strip is re-encoded from the wrong strip at 10–140 KB per picture, quality ramps up and steps down (the "flash"), and the host never skips an unchanged tile. Decoding the capture confirms the strips really are unchanged (median per-pixel difference to the tile's previous picture ≈ 0). The host's encoder stats (`[VCPEncStatsMonitor]` in avconferenced's log, readable with `log show --predicate 'process == "avconferenced"'`) show it: ours drop_fps ≈ 0 and Tx_fps ≈ 160–240 at 40–60 Mbps; the native viewer's session drop_fps ≈ 110–160 and Tx_fps ≈ 30–90 at 0.04–6 Mbps. Every VCPEnc property is identical between the two sessions (the native NegotiationDetails has an extra `SW:0`; adding it to our offer changed nothing in a controlled A/B).
+
+### Cause
+In multi-tile screen mode (`tilesPerFrame ≥ 2`, `VideoTransmitter_CreateHandle` sets `tx+0x5ee4 = 1`), `_videoTransmitter_HandleLTRFrame` keys the LTR ring by a 16-bit per-tile-picture id (`tx+0x5ee6` = `hwrandom16()` + the sample's TileID / decoding order), which the packetizer sends as the RFC 7798 **DONL**. The receiver side (`VideoPacketBuffer_GetNextFrame`) acks the frame's DON in that mode and the RTP timestamp otherwise. Our acks carried the RTP timestamp, which the four tiles share and which matches nothing in this mode, so the host never saw an acknowledged picture: the encoder kept tile 0's history as references and could not keep the other tiles'.
+
+### Fix
+One APP name-5 ack per decoded tile picture, u32 = the picture's DONL (first NAL's DON), sent right after it decodes, as the native viewer does (one 30-byte SRTCP APP per tile marker). ON by default; `SCREENER_LTR_ACK=0` turns it off. The old `SCREENER_LTR_ACK=1` (tile 0, timestamp) and `SCREENER_FB_ACKALL=1` modes are gone.
+
+Ruled out on the way (live A/B, simulator → this Mac): acks per tile marker carrying the RTP timestamp, the extension's frame counter, the whole extension word, the first or the marker RTP sequence number; `SW:0`/`SW:4` in the offer's feature strings (with and without the bitfield bit); a Mac hardware model in RemoteEndpointInfo; RCTL off, per-port RRs, zero-loss RRs (2026-11-19 morning).
+
+### A/B (simulator, host 192.0.2.54 from 192.0.2.33, a Terminal printing a line every 0.5 s; steady state after startup; per tile: pictures/s, median KB, share of pictures predicting from the tile's own previous picture)
+| Variant | tile 0 | tile 1 | tile 2 | tile 3 | total | host encoder (drop/s, tx/s) |
+|---|---|---|---|---|---|---|
+| acks off (old behaviour) | 44/s 0.13 KB 98 % | 44/s 44.8 KB 34 % | 44/s 35.3 KB 5 % | 43/s 19.5 KB 3 % | 41.6 Mbps | 0–14, 170–190; 37–52 Mbps |
+| acks off, second run | 40/s 0.13 KB 100 % | 40/s 0.43 KB 67 % | 39/s 41.1 KB 2 % | 39/s 20.0 KB 1 % | 61.4 Mbps | 0–11, 140–160; 10–124 Mbps |
+| DONL acks (new default) | 3.7/s 0.39 KB 100 % | 2.3/s 0.13 KB 100 % | 2.3/s 0.13 KB 100 % | 10/s 0.30 KB 100 % | 0.07 Mbps | 126–164, 0–55; 0–4 Mbps |
+| DONL acks per marker (pre-decode) | 19/s 0.15 KB 100 % | 9/s 0.13 KB 100 % | 45/s 0.16 KB 100 % | 6/s 0.13 KB 100 % | 0.19 Mbps | 92–138, 18–92; 0.1–7 Mbps |
+
+A sliding textured window (60 % of the screen) with DONL acks: tiles 1–3 at 60 pictures/s, 5–8 KB median, 100 % own-reference, 7–35 Mbps, 0 decode errors. Keyframe requests per 25 s run: 0–6 with acks vs 30 without.
+
+### Open
+- Acks are sent for every decoded picture; the native receiver acks only pictures with the LTR flag (VideoPacketBuffer frame flags bit 0, wire source unidentified — possibly the 0x93xx extension profile's low byte). Acking every picture works on this host.
+- Several runs today needed a 0x1c re-query (media answer after ~8 s instead of ~2–3 s) with or without the change.
