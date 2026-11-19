@@ -264,6 +264,18 @@ actor MediaTransport {
         /// Native-viewer feedback shape (docs/research/2026-11-18-native-feedback.md).
         var feedback = Feedback.fromEnvironment()
         var rateControlInterval: Duration = .milliseconds(50)
+        /// The PT 101 keepalive on P. The native viewer sends it ~80 times a
+        /// second (a 26-byte datagram, ~17 kbit/s); since the host stopped
+        /// re-sending unchanged tiles, an idle session is otherwise nearly
+        /// silent and the iPad's Wi-Fi power save showed 80–440 ms receive
+        /// gaps at the onset of motion. nil: the reference's 2/s on the tx
+        /// tick. SCREENER_HEARTBEAT_MS overrides (0 = the reference's).
+        var heartbeatInterval: Duration? = Tuning.heartbeatFromEnvironment()
+
+        static func heartbeatFromEnvironment(_ env: [String: String] = ExperimentEnv.current) -> Duration? {
+            guard let v = env["SCREENER_HEARTBEAT_MS"], let ms = Int(v) else { return .milliseconds(12) }
+            return ms > 0 ? .milliseconds(ms) : nil
+        }
     }
 
     /// What the native viewer sends that the reference does not. Each piece
@@ -393,6 +405,7 @@ actor MediaTransport {
     /// audioKeyV SRTCP context for the split-mode RR on P (own SRTCP index).
     private var audioRTCPEncryptor: SRTCPEncryptor?
     private var rateControlTask: Task<Void, Never>?
+    private var heartbeatTask: Task<Void, Never>?
     /// RCTL inputs: newest video RTP timestamp + its arrival, server audio SSRC, receive-rate window.
     private var lastVideoRTP: (ts: UInt32, at: ContinuousClock.Instant)?
     private var serverAudioSSRC: UInt32?
@@ -548,6 +561,15 @@ actor MediaTransport {
                 try? await Task.sleep(for: interval)
             }
         }
+        if let every = tuning.heartbeatInterval {
+            heartbeatTask = Task { [weak self] in
+                while !Task.isCancelled {
+                    try? await Task.sleep(for: every)
+                    guard let self else { return }
+                    await self.sendHeartbeat()
+                }
+            }
+        }
         if tuning.feedback.rateControl {
             let every = tuning.rateControlInterval
             rateControlTask = Task { [weak self] in
@@ -576,6 +598,7 @@ actor MediaTransport {
         guard !isClosed, failure == nil else { return }
         txTask?.cancel(); txTask = nil
         rateControlTask?.cancel(); rateControlTask = nil
+        heartbeatTask?.cancel(); heartbeatTask = nil
         burstTimer?.cancel(); burstTimer = nil
         resolveBurst(.starved(packets: counters.videoPackets), ifUnresolvedOnly: true)
         activation = nil
@@ -603,7 +626,7 @@ actor MediaTransport {
     func close() async {
         guard !isClosed else { return }
         isClosed = true
-        punchTask?.cancel(); txTask?.cancel(); burstTimer?.cancel(); rateControlTask?.cancel()
+        punchTask?.cancel(); txTask?.cancel(); burstTimer?.cancel(); rateControlTask?.cancel(); heartbeatTask?.cancel()
         let open = Array(channels.values)
         channels = [:]
         for f in finishers { f() }
@@ -932,7 +955,7 @@ actor MediaTransport {
     private func txTick() {
         guard !isClosed else { return }
         tick += 1
-        sendHeartbeat()
+        if tuning.heartbeatInterval == nil { sendHeartbeat() }
         if tuning.feedback.splitReports {
             if tick % 2 == 1 { sendSplitReports() }
         } else {

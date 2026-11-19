@@ -236,6 +236,7 @@ final class MediaTransportTests: XCTestCase {
         try await t.open()
         try await t.activate(activation)
         try await waitUntil("reports") { await t.stats.reportsSent >= 2 }
+        try await waitUntil("keepalives") { await t.stats.keepalivesSent >= 2 }
         await t.close()
 
         let audioDec = try SRTPDecryptor(blob: keys.audioKeyV)
@@ -268,6 +269,7 @@ final class MediaTransportTests: XCTestCase {
         let ch = FakeChannels()
         var tuning = fastTuning
         tuning.txInterval = .seconds(60)   // keep RR/keepalive out of the way
+        tuning.heartbeatInterval = nil
         let t = make(ch, tuning: tuning)
         try await t.open()
         try await t.activate(activation)
