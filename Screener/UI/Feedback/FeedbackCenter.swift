@@ -21,6 +21,10 @@ final class FeedbackCenter: FeedbackSink {
     static let scrollPillLinger: TimeInterval = 0.6
     /// The long-press ring lingers this long after firing (completion flash).
     static let longPressFlash: TimeInterval = 0.25
+    /// The minimap fades this long after it appeared or the view last moved
+    /// (zoom / pan / a jump), like the control pill's idle fade; the next
+    /// zoom or pan brings it back.
+    static let minimapLinger: TimeInterval = 3
 
     struct LongPress: Equatable {
         var id: Int
@@ -56,8 +60,11 @@ final class FeedbackCenter: FeedbackSink {
     private(set) var zoomPill: CGFloat?
     /// The scroll pill's thumb position 0…1 (nil: hidden).
     private(set) var scrollPill: CGFloat?
-    /// Shown while zoomed (set by the renderer).
+    /// Present while zoomed (set by the renderer).
     private(set) var minimap: Minimap?
+    /// The minimap is on screen: it is faded out (and takes no touches)
+    /// `minimapLinger` after the view last moved, even while still zoomed.
+    private(set) var minimapShown = false
     /// A downscaled picture for the minimap (renderer, ≤ 4 Hz).
     private(set) var thumbnail: CGImage?
 
@@ -83,6 +90,8 @@ final class FeedbackCenter: FeedbackSink {
     @ObservationIgnored private var scrollTravel: CGFloat = 0
     @ObservationIgnored private var lastZoomAt: Double = 0
     @ObservationIgnored private var lastScrollAt: Double = 0
+    @ObservationIgnored private var lastMinimapAt: Double = 0
+    @ObservationIgnored private var minimapTimer: (() -> Void)?
     @ObservationIgnored private var zoomTimer: (() -> Void)?
     @ObservationIgnored private var scrollTimer: (() -> Void)?
     @ObservationIgnored private var longPressTimer: (() -> Void)?
@@ -145,6 +154,7 @@ final class FeedbackCenter: FeedbackSink {
             zoomPill = scale
             lastZoomAt = t
             if zoomTimer == nil { armZoomTimer(Self.zoomPillLinger) }
+            wakeMinimap()
         case .scrolled(let dy):
             guard visual else { return }
             if scrollPill == nil { scrollTravel = 0 }
@@ -209,10 +219,38 @@ final class FeedbackCenter: FeedbackSink {
     }
 
     /// Minimap state from the renderer (nil: not zoomed). Assigned only on
-    /// a change, so SwiftUI isn't invalidated every frame.
+    /// a change, so SwiftUI isn't invalidated every frame. A change (zoomed
+    /// in, zoom or pan moved the view) shows it for `minimapLinger`.
     func setMinimap(_ m: Minimap?) {
-        if m != minimap { minimap = m }
-        if m == nil, thumbnail != nil { thumbnail = nil }
+        guard m != minimap else { return }
+        minimap = m
+        if m == nil {
+            if thumbnail != nil { thumbnail = nil }
+            minimapTimer?()
+            minimapTimer = nil
+            if minimapShown { minimapShown = false }
+        } else {
+            wakeMinimap()
+        }
+    }
+
+    /// The user is navigating (a minimap touch, zoom, pan): show the minimap
+    /// and restart its fade.
+    func wakeMinimap() {
+        guard minimap != nil else { return }
+        lastMinimapAt = now()
+        if !minimapShown { minimapShown = true }
+        if minimapTimer == nil { armMinimapTimer(Self.minimapLinger) }
+    }
+
+    private func armMinimapTimer(_ delay: TimeInterval) {
+        minimapTimer = schedule(delay) { [weak self] in
+            guard let self else { return }
+            self.minimapTimer = nil
+            guard self.minimap != nil else { return }
+            let left = Self.minimapLinger - (self.now() - self.lastMinimapAt)
+            if left > 0.01 { self.armMinimapTimer(left) } else { self.minimapShown = false }
+        }
     }
 
     func setThumbnail(_ image: CGImage?) {

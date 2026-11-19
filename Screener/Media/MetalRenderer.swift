@@ -690,6 +690,9 @@ final class MetalRenderer: NSObject, MTKViewDelegate {
         feedback.setMinimap(.init(aspect: layout.canvas.width / layout.canvas.height,
                                   viewport: MinimapGeometry.viewportRect(visible: zoom.visibleUnitRect,
                                                                          content: content)))
+        // Faded out after idle (FeedbackCenter.minimapLinger): no thumbnail
+        // work until it shows again (thumbVersion is stale then, so it renders).
+        guard feedback.minimapShown else { return }
         guard snap.version != thumbVersion || feedback.thumbnail == nil else { return }
         let now = feedback.now()
         let wait = Self.thumbnailInterval - (now - lastThumbAt)

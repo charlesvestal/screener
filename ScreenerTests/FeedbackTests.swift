@@ -256,6 +256,51 @@ final class FeedbackCenterTests: XCTestCase {
         XCTAssertNil(c.zoomPill)
     }
 
+    func testMinimapFadesAfterIdleEvenWhileStillZoomed() {
+        let c = make()
+        let map = FeedbackCenter.Minimap(aspect: 1.6, viewport: CGRect(x: 0.2, y: 0.2, width: 0.5, height: 0.5))
+        c.setMinimap(map)                           // zoomed in
+        XCTAssertTrue(c.minimapShown)
+        clock.advance(by: FeedbackCenter.minimapLinger - 0.5)
+        c.setMinimap(map)                           // same view, every frame: not activity
+        XCTAssertTrue(c.minimapShown)
+        clock.advance(by: 0.51)
+        XCTAssertFalse(c.minimapShown)              // faded...
+        XCTAssertNotNil(c.minimap)                  // ...though still zoomed
+    }
+
+    func testPanOrZoomBringsTheMinimapBackThenItFadesAgain() {
+        let c = make()
+        var map = FeedbackCenter.Minimap(aspect: 1.6, viewport: CGRect(x: 0.2, y: 0.2, width: 0.5, height: 0.5))
+        c.setMinimap(map)
+        clock.advance(by: FeedbackCenter.minimapLinger + 0.01)
+        XCTAssertFalse(c.minimapShown)
+        map.viewport.origin.x = 0.3                 // a pan
+        c.setMinimap(map)
+        XCTAssertTrue(c.minimapShown)
+        clock.advance(by: 2)
+        c.feedback(.zoomChanged(scale: 2.5))        // a pinch restarts the fade
+        clock.advance(by: 2)
+        XCTAssertTrue(c.minimapShown)
+        clock.advance(by: FeedbackCenter.minimapLinger - 2 + 0.01)
+        XCTAssertFalse(c.minimapShown)
+        c.wakeMinimap()                             // a touch on it
+        XCTAssertTrue(c.minimapShown)
+    }
+
+    func testUnzoomingHidesTheMinimapAndZoomAloneDoesNotShowIt() {
+        let c = make()
+        c.feedback(.zoomChanged(scale: 1.2))        // before the renderer reports the zoom
+        XCTAssertFalse(c.minimapShown)
+        c.setMinimap(.init(aspect: 1.6, viewport: CGRect(x: 0, y: 0, width: 0.8, height: 0.8)))
+        XCTAssertTrue(c.minimapShown)
+        c.setMinimap(nil)
+        XCTAssertFalse(c.minimapShown)
+        XCTAssertNil(c.minimap)
+        clock.advance(by: FeedbackCenter.minimapLinger + 1)
+        XCTAssertFalse(c.minimapShown)
+    }
+
     func testScrollPillMovesWithTravelAndFades() {
         let c = make()
         c.feedback(.scrolled(dy: -100))             // fingers up: content scrolls down
