@@ -8,15 +8,20 @@
 // Trackpad mode (the default for fingers; like Screens):
 //   - one-finger drag: moves the cursor relatively; finger speed sets the
 //     gain (TrackpadAcceleration, 1.0 → 2.5)
-//   - tap: left click at the cursor. The click waits `tapDelay` (Settings →
-//     Tap to Click: 0.15 / 0.25 / 0.35 s) for a second touch, so a tap-and-drag
-//     never reaches the Mac as a click followed by a press (= a double-click
-//     drag: word selection, window zoom)
-//   - double-tap: a double click (both clicks sent at the second tap)
+//   - tap: left click at the cursor. The click (haptic + button) waits
+//     `tapDelay` (Settings → Tap to Click: 0.15 / 0.25 / 0.35 s) for a second
+//     touch, so a tap-and-drag never reaches the Mac as a click followed by a
+//     press (= a double-click drag: word selection, window zoom); the click's
+//     *cue* (`onCue`, for the ripple) fires immediately at the tap's touch-up,
+//     not after the wait, so the feedback reads as instant even though the
+//     click itself is still held back
+//   - double-tap: a double click (both clicks sent at the second tap; each
+//     tap's cue fires at its own touch-up, giving two rings)
 //   - double-tap-and-hold (second touch within the window, then held still
 //     `tapMaxDuration` or moved): left-button drag until it lifts
-//   - long press (`longPressRightClick`, Settings, default on): one finger
-//     held still for `Tuning.longPress` is a right click (medium haptic) the
+//   - long press (`longPressRightClick`, Settings, default OFF — two-finger
+//     tap is the usual right click): one finger held still for
+//     `Tuning.longPress` is a right click (medium haptic) the
 //     moment it fires; moving after it moves the cursor, lifting does
 //     nothing more. Not armed for the second touch of a double tap (that is
 //     double-tap-and-hold = drag) nor under the drag lock
@@ -484,19 +489,24 @@ final class TouchInterpreter {
         }
         guard quick else { return }
         if owedClick {
+            // The first tap's ring already fired at its own touch-up; this is
+            // the second tap's ring (together: the double-click look).
             owedClick = false
             perform(.haptic(.light))
             perform(.button(InputController.Button.left, down: true))
             perform(.button(InputController.Button.left, down: false))
             perform(.button(InputController.Button.left, down: true))
             perform(.button(InputController.Button.left, down: false))
-            onCue?(.click(button: InputController.Button.left, count: 2))
+            onCue?(.click(button: InputController.Button.left, count: 1))
             return
         }
+        // The ripple fires now, at recognition; the click itself (haptic +
+        // button) waits `tapDelay` for a possible tap-drag / double tap.
+        onCue?(.click(button: InputController.Button.left, count: 1))
         pendingClick = schedule(tapDelay) { [weak self] in
             guard let self else { return }
             self.pendingClick = nil
-            self.click(InputController.Button.left, haptic: .light)
+            self.sendClick(InputController.Button.left, haptic: .light)
         }
     }
 
@@ -511,10 +521,13 @@ final class TouchInterpreter {
         }
         if isZoomed() {
             pendingRightClickAt = at
+            // Ripple now, at recognition; the click waits for a possible
+            // second two-finger tap (zoom reset).
+            onCue?(.click(button: InputController.Button.right, count: 1))
             pendingRightClick = schedule(tapDelay) { [weak self] in
                 guard let self else { return }
                 self.pendingRightClick = nil
-                self.rightClick(at: self.pendingRightClickAt ?? at)
+                self.sendRightClick(at: self.pendingRightClickAt ?? at)
                 self.pendingRightClickAt = nil
             }
         } else {
@@ -525,6 +538,13 @@ final class TouchInterpreter {
     private func rightClick(at p: CGPoint) {
         if effectiveMode == .direct { perform(.moveTo(p)) }
         click(InputController.Button.right, haptic: .medium)
+    }
+
+    /// `rightClick(at:)` without the cue: for a delayed send whose ripple
+    /// already fired at recognition.
+    private func sendRightClick(at p: CGPoint) {
+        if effectiveMode == .direct { perform(.moveTo(p)) }
+        sendClick(InputController.Button.right, haptic: .medium)
     }
 
     /// Trackpad: double-tap-and-hold without moving.
@@ -577,26 +597,34 @@ final class TouchInterpreter {
     }
 
     private func click(_ button: Int, haptic: TouchHaptic?) {
-        if let haptic { perform(.haptic(haptic)) }
-        perform(.button(button, down: true))
-        perform(.button(button, down: false))
+        sendClick(button, haptic: haptic)
         onCue?(.click(button: button, count: 1))
     }
 
-    /// A gesture that is not a click came in while one was waiting: send it now.
+    /// `click`'s haptic + button press, with no cue: for a delayed send
+    /// whose ripple already fired at recognition (touch-up).
+    private func sendClick(_ button: Int, haptic: TouchHaptic?) {
+        if let haptic { perform(.haptic(haptic)) }
+        perform(.button(button, down: true))
+        perform(.button(button, down: false))
+    }
+
+    /// A gesture that is not a click came in while one was waiting: send it
+    /// now. Its ripple already fired at the tap's own touch-up.
     private func flushOwedClick() {
         guard owedClick else { return }
         owedClick = false
-        click(InputController.Button.left, haptic: .light)
+        sendClick(InputController.Button.left, haptic: .light)
     }
 
     /// A one-finger gesture committed while a zoomed two-finger tap waited
-    /// for its double tap: right click now, before the cursor moves.
+    /// for its double tap: right click now, before the cursor moves. Its
+    /// ripple already fired when the two-finger tap was recognised.
     private func flushPendingRightClick() {
         guard let cancelRight = pendingRightClick else { return }
         cancelRight()
         pendingRightClick = nil
-        rightClick(at: pendingRightClickAt ?? startCentroid)
+        sendRightClick(at: pendingRightClickAt ?? startCentroid)
         pendingRightClickAt = nil
     }
 

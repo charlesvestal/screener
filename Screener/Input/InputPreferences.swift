@@ -11,9 +11,10 @@
 //   fingers, and the hardware trackpad/mouse follows the iPad's own
 //   setting); Reversed flips the sign of every scroll sent to the Mac —
 //   touch (+ momentum), wheel, hardware continuous and pointer-lock.
-// - Long-press to right-click ("input.longPressRightClick", default on):
-//   trackpad mode, one finger held still for TouchInterpreter.Tuning.longPress
-//   is a right click (with a haptic) — TouchInterpreter.longPressRightClick.
+// - Long-press to right-click ("input.longPressRightClick", default OFF —
+//   two-finger tap is the usual trackpad right click): trackpad mode, one
+//   finger held still for TouchInterpreter.Tuning.longPress is a right click
+//   (with a haptic) — TouchInterpreter.longPressRightClick.
 // - Pointer Speed / Touch Pointer Speed ("input.pointerSpeed",
 //   "input.touchPointerSpeed", 0.25×–3×, default 1×): PointerScaling.swift.
 // - Keyboard Tester ("input.keyboardTester", default off): a diagnostic
@@ -67,7 +68,7 @@ enum ScrollDirection: String, CaseIterable, Sendable {
 
 struct InputPreferences: Equatable, Sendable {
     static let longPressRightClickKey = "input.longPressRightClick"
-    static let longPressRightClickDefault = true
+    static let longPressRightClickDefault = false
     static let keyboardTesterKey = "input.keyboardTester"
 
     var tapDelay = TapClickDelay.default

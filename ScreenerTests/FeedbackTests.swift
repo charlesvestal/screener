@@ -298,14 +298,17 @@ final class FeedbackCenterTests: XCTestCase {
 final class FeedbackCueTests: XCTestCase {
     private var clock = FakeRepeatClock()
     private var cues: [TouchCue] = []
+    private var zoomed = false
     private let L = InputController.Button.left
     private let R = InputController.Button.right
 
     private func make(_ mode: TouchInputMode = .trackpad) -> TouchInterpreter {
         clock = FakeRepeatClock()
         cues = []
+        zoomed = false
         let t = TouchInterpreter(schedule: clock.schedule) { _ in }
         t.mode = mode
+        t.isZoomed = { [weak self] in self?.zoomed ?? false }
         t.onCue = { [weak self] in self?.cues.append($0) }
         return t
     }
@@ -315,32 +318,41 @@ final class FeedbackCueTests: XCTestCase {
         return clock.now
     }
 
-    func testTrackpadTapIsFingerDownThenAClickAfterTheWindow() {
+    /// The ripple cue fires the moment the tap is recognised (touch-up); the
+    /// actual click (haptic + button, TouchAction, tested in
+    /// TrackpadModeTests) still waits for the tap-drag window.
+    func testTrackpadTapRippleFiresAtTouchUpBeforeTheClickIsSent() {
         let t = make()
         t.began(1, at: CGPoint(x: 10, y: 10), time: at(0))
         t.ended(1, at: CGPoint(x: 10, y: 10), time: at(0.1))
-        XCTAssertEqual(cues, [.fingerDown])
+        XCTAssertEqual(cues, [.fingerDown, .click(button: L, count: 1)], "the ripple cue, right away")
         _ = at(TouchInterpreter.Tuning.tapDragWindow + 0.01)
-        XCTAssertEqual(cues, [.fingerDown, .click(button: L, count: 1)])
+        XCTAssertEqual(cues, [.fingerDown, .click(button: L, count: 1)], "no second cue once the click is sent")
     }
 
-    func testTrackpadDoubleTapIsOneDoubleClick() {
+    /// Each tap of a double tap rings on its own touch-up: the first tap's
+    /// ring, then the second's — together, the double-click look.
+    func testTrackpadDoubleTapRipplesOnceAtEachTap() {
         let t = make()
         t.began(1, at: .zero, time: at(0))
         t.ended(1, at: .zero, time: at(0.08))
+        XCTAssertEqual(cues, [.fingerDown, .click(button: L, count: 1)], "the first tap's ring, immediately")
         t.began(2, at: .zero, time: at(0.1))
         t.ended(2, at: .zero, time: at(0.08))
+        XCTAssertEqual(cues, [.fingerDown, .click(button: L, count: 1), .fingerDown, .click(button: L, count: 1)])
         _ = at(1)
-        XCTAssertEqual(cues, [.fingerDown, .fingerDown, .click(button: L, count: 2)])
+        XCTAssertEqual(cues.count, 4, "no further cue once both clicks are actually sent")
     }
 
+    /// The first tap's ring already fired at its touch-up (its click was
+    /// never sent); the drag just adds its own pulse on top.
     func testTrackpadTapDragIsADragStart() {
         let t = make()
         t.began(1, at: .zero, time: at(0))
         t.ended(1, at: .zero, time: at(0.08))
         t.began(2, at: .zero, time: at(0.1))
         t.moved(2, to: CGPoint(x: 40, y: 0), time: at(0.05))
-        XCTAssertEqual(cues, [.fingerDown, .fingerDown, .dragBegan])
+        XCTAssertEqual(cues, [.fingerDown, .click(button: L, count: 1), .fingerDown, .dragBegan])
     }
 
     func testTrackpadTapDragEndsWithDragEndedOnLift() {
@@ -360,6 +372,21 @@ final class FeedbackCueTests: XCTestCase {
         t.ended(1, at: CGPoint(x: 10, y: 10), time: at(0.1))
         t.ended(2, at: CGPoint(x: 60, y: 10), time: at(0.01))
         XCTAssertEqual(cues.last, .click(button: R, count: 1))
+    }
+
+    /// Zoomed, a two-finger tap's right-click ripple also fires at
+    /// recognition, even though the click itself waits for a possible
+    /// second two-finger tap (zoom reset).
+    func testZoomedTwoFingerTapRippleFiresAtRecognition() {
+        let t = make()
+        zoomed = true
+        t.began(1, at: CGPoint(x: 10, y: 10), time: at(0))
+        t.began(2, at: CGPoint(x: 60, y: 10), time: at(0.01))
+        t.ended(1, at: CGPoint(x: 10, y: 10), time: at(0.1))
+        t.ended(2, at: CGPoint(x: 60, y: 10), time: at(0.01))
+        XCTAssertEqual(cues.last, .click(button: R, count: 1), "the ripple, right away")
+        _ = at(TouchInterpreter.Tuning.tapDragWindow + 0.01)
+        XCTAssertEqual(cues.filter { $0 == .click(button: R, count: 1) }.count, 1, "no second cue when it's sent")
     }
 
     func testThreeFingerDragLocksAndATapReleases() {

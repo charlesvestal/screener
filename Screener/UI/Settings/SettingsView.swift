@@ -98,8 +98,9 @@ struct SettingsView: View {
                          + "captured (full screen); Touch Pointer Speed sets it for finger moves in Trackpad mode. "
                          + "Scroll Direction: Natural follows the iPad; Reversed flips every scroll. "
                          + "Tap to Click Delay is how long a tap waits for a double tap or tap-and-drag: Fast "
-                         + "clicks sooner, Relaxed gives more time. Long-Press to Right-Click: in Trackpad mode, "
-                         + "hold one finger still to right-click. Shake the pointer to find it. "
+                         + "clicks sooner, Relaxed gives more time. Right-click is two fingers, tap together. "
+                         + "Long-Press to Right-Click (off by default) adds: in Trackpad mode, holding one finger "
+                         + "still also right-clicks. Shake the pointer to find it. "
                          + "Visual Feedback shows where touches and clicks land. Keyboard Tester lists the last "
                          + "hardware key events on screen during a session (for checking a keyboard).")
                 }

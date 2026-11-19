@@ -412,12 +412,12 @@ final class InputPreferencesTests: XCTestCase {
     func testLoadDefaultsAndStoredValues() {
         let d = suite()
         XCTAssertEqual(InputPreferences.load(d), InputPreferences())
-        XCTAssertTrue(InputPreferences().longPressRightClick)
+        XCTAssertFalse(InputPreferences().longPressRightClick, "off by default: two-finger tap is the right click")
         d.set("relaxed", forKey: TapClickDelay.defaultsKey)
         d.set("reversed", forKey: ScrollDirection.defaultsKey)
-        d.set(false, forKey: InputPreferences.longPressRightClickKey)
+        d.set(true, forKey: InputPreferences.longPressRightClickKey)
         XCTAssertEqual(InputPreferences.load(d),
-                       InputPreferences(tapDelay: .relaxed, scrollDirection: .reversed, longPressRightClick: false))
+                       InputPreferences(tapDelay: .relaxed, scrollDirection: .reversed, longPressRightClick: true))
         d.set("bogus", forKey: TapClickDelay.defaultsKey)
         d.set("sideways", forKey: ScrollDirection.defaultsKey)
         XCTAssertEqual(InputPreferences.load(d).tapDelay, .normal)
