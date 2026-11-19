@@ -2,7 +2,7 @@
 
 Screener is a fast iPad and iPhone client for macOS Screen Sharing's **High Performance** mode. It connects straight to the Screen Sharing service built into every Mac. There's nothing to install on the Mac, and no server sits in between.
 
-High Performance mode is the protocol Apple's own Screen Sharing app uses between Apple-silicon Macs: HEVC 4:4:4 video at up to ~60 fps, stereo audio and a shared clipboard. Screener implements that protocol natively in Swift for iPadOS and iOS. On a good Wi-Fi network it holds ~60 fps at up to ~60 Mbps, so text stays sharp and windows move smoothly.
+High Performance mode is the protocol Apple's own Screen Sharing app uses between Apple-silicon Macs: HEVC 4:4:4 video at up to ~60 fps, stereo audio and a shared clipboard. Screener implements that protocol natively in Swift for iPadOS and iOS. On a good Wi-Fi network it holds ~60 fps at up to ~60 Mbps when the screen is busy, and drops to almost nothing when it isn't, so text stays sharp and windows move smoothly.
 
 > Screener is an independent project. It is not affiliated with, endorsed by, or sponsored by Apple.
 
@@ -10,23 +10,29 @@ High Performance mode is the protocol Apple's own Screen Sharing app uses betwee
 
 **Picture and sound**
 - HEVC Range Extensions 4:4:4 video (full chroma, so small text stays crisp), decoded in hardware with VideoToolbox and drawn with Metal.
-- Adaptive bitrate up to ~60 Mbps (see [How it works](#how-it-works)), with loss recovery that keeps decoding whenever the lost pictures weren't needed.
+- Adaptive bitrate up to ~60 Mbps (see [How it works](#how-it-works)). Unchanged parts of the screen cost nothing, and loss recovery keeps decoding whenever the lost pictures weren't needed.
 - The Mac's audio (AAC-ELD, 48 kHz stereo) through a jitter buffer, with mute.
 - Picture in Picture: keep an eye on the Mac while you use another app.
 
 **Touch and pointer**
 - Two touch modes: **Trackpad**, where your finger moves a relative cursor with speed-dependent acceleration (the default), and **Touch**, where the cursor goes wherever you tap.
-- Tap to click, two-finger tap (or press and hold in Touch mode) to right-click, drag, two-finger scrolling with momentum, and pinch to zoom.
+- Gestures modelled on Screens: tap to click, double-tap to double-click, two-finger tap to right-click, three-finger tap to middle-click, two-finger scrolling with momentum, and pinch to zoom.
+- Touch and hold, then drag: one finger drags with the left button (blue ring), two fingers with the right (red), three with the middle (green). The hold delay is adjustable.
+- Three-finger swipes send the Mac's trackpad gestures: left and right switch Spaces, up opens Mission Control, down opens App Exposé.
 - Visual feedback: ripples where clicks land, a halo and trail on the cursor, and shake to locate the pointer. Reduce Motion is respected.
 - A gesture coach the first time you connect, and help any time after.
 - Hardware mouse and trackpad support, with pointer lock on iPad.
 
 **Keyboard**
-- Hardware keyboard passthrough, including the chords iPadOS normally keeps for caret movement (⌥←, ⌘→, ⌘⌫, …) and key repeat.
+- Hardware keyboard passthrough, including the chords iPadOS normally keeps for caret movement (⌥←, ⌘→, ⌥⌫, …) and key repeat. Option is sent as Option, and Option-typed characters (™, é, @ on European layouts) arrive as typed.
 - A software keyboard with an accessory row (Esc, Tab, arrows, function keys, …).
 
 **Control menu**
-- A floating, draggable menu (⌘⌥M on a hardware keyboard) with sticky modifiers (tap ⌘ ⌥ ⌃ ⇧ to latch, tap twice to lock), Mac shortcuts that iPadOS would otherwise intercept (App Switcher, Spotlight, Mission Control, App Exposé, Show Desktop, Lock Screen, Force Quit, screenshots), clipboard actions, display and input settings, live stats, and a Mac switcher.
+- A floating, draggable menu (⌘⌥M on a hardware keyboard), grouped into Keyboard, Mac Shortcuts, View, Clipboard and Session:
+  - sticky modifiers (tap ⌘ ⌥ ⌃ ⇧ to latch, tap twice to lock) and special keys;
+  - Mac shortcuts that iPadOS would otherwise intercept (App Switcher, Spotlight, Mission Control, App Exposé, Show Desktop, Lock Screen, Force Quit, screenshots);
+  - display mode, touch mode, Find Cursor and Picture in Picture;
+  - clipboard actions, mute, a Mac switcher, and live stats.
 
 **Display**
 - Display modes: **Fit (Retina)** gives a pixel-for-pixel desktop, **More Space** gives 25% more desktop, **Sharper** uses fewer pixels for crisper motion, and **Match Mac** keeps the Mac's own resolution.
@@ -41,7 +47,7 @@ High Performance mode is the protocol Apple's own Screen Sharing app uses betwee
 
 **Robustness and platforms**
 - If the UDP media stream is blocked or fails, the session falls back to the classic TCP framebuffer and shows a "Reduced performance" badge.
-- iPhone layouts for compact screens. The iPad app also runs on Apple-silicon Macs ("Designed for iPad"), with the limitations listed below.
+- iPhone layouts for compact screens that keep clear of the Dynamic Island. The iPad app also runs on Apple-silicon Macs ("Designed for iPad"), with the limitations listed below.
 
 ## Requirements
 
@@ -93,10 +99,12 @@ A High Performance session runs over two channels:
 
 **Bitrate discovery: RCTL.** With the reference implementation's feedback, the Mac's encoder sat flat at ~17–20 Mbps no matter how much the screen moved. Packet captures of Apple's own client showed one extra RTCP packet every 50 ms: an APP packet named `RCTL` that carries a 20-byte rate-control block. Its last field is the receiver's bandwidth estimate in kbps, and the Mac uses it as its encoder target. Screener sends `RCTL` at 20 Hz with an adaptive estimate (4–65 Mbps, driven by measured loss and receive rate). With it, the host's video rate goes from ~20 Mbps to ~60 Mbps while you drag a window, at ~60 fps.
 
+**Per-tile references: LTR acks.** The Mac only predicts a tile from that tile's earlier pictures once the client has acknowledged them. Apple's client sends an RTCP APP "LTR ack" for every decoded tile picture, carrying the picture's 16-bit DON (the RTP payload's DONL), not its RTP timestamp. Without valid acks, the Mac predicts tiles 1–3 from tile 0 and re-encodes them from scratch every frame. That costs ~40–60 Mbps even on a static screen, and text visibly softens and sharpens on every keypress. With the acks, unchanged tiles are skipped entirely and an idle session needs well under 1 Mbps. Screener shows each picture as soon as no more of its tiles can arrive, so skipped tiles never hold up motion. It also sends Apple's ~80/s audio-port keepalive, which keeps the device's Wi-Fi from dozing between bursts.
+
 **Loss recovery.** Screener tracks which earlier pictures each picture uses as references, across tiles. A lost packet only drops the pictures that depend on it, and Screener asks for a keyframe only when nothing decodable is left.
 
 More detail:
-- [docs/research/2026-11-18-native-feedback.md](docs/research/2026-11-18-native-feedback.md): native client captures, the RCTL layout, A/B measurements, adaptive bandwidth estimation and loss recovery.
+- [docs/research/2026-11-18-native-feedback.md](docs/research/2026-11-18-native-feedback.md): native client captures, the RCTL layout, LTR acks, A/B measurements, adaptive bandwidth estimation and loss recovery.
 - [docs/superpowers/specs/2026-11-13-screener-ipad-hp-client-design.md](docs/superpowers/specs/2026-11-13-screener-ipad-hp-client-design.md): architecture and protocol design.
 - [docs/superpowers/plans/](docs/superpowers/plans/): the implementation plan and its task log.
 - Files ported from iShareScreen name the original Python functions in their headers.
