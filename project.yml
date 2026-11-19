@@ -4,10 +4,14 @@ options:
   deploymentTarget:
     iOS: "26.0"
   createIntermediateGroups: true
+# Signing team and bundle id come from Config/Screener.xcconfig, which
+# optionally includes the git-ignored Local.xcconfig (see Local.xcconfig.example).
+configFiles:
+  Debug: Config/Screener.xcconfig
+  Release: Config/Screener.xcconfig
 settings:
   base:
     SWIFT_VERSION: "6.0"
-    DEVELOPMENT_TEAM: YOURTEAMID
     CODE_SIGN_STYLE: Automatic
     # iPhone + iPad; the iPad app also runs on Apple-silicon Macs
     # ("Designed for iPad", README › Mac).
@@ -58,7 +62,7 @@ targets:
         UIBackgroundModes: [audio]
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: com.vestal.screener
+        PRODUCT_BUNDLE_IDENTIFIER: $(SCREENER_BUNDLE_ID)
         # The iPad app is offered on Apple-silicon Macs ("Designed for iPad").
         SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD: YES
         SUPPORTS_MACCATALYST: NO

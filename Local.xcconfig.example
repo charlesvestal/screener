@@ -1,0 +1,13 @@
+// Copy to Local.xcconfig (git-ignored) and fill in your own values:
+//
+//   cp Local.xcconfig.example Local.xcconfig
+//   xcodegen generate
+//
+// Config/Screener.xcconfig includes this file, so these settings apply to
+// every target. Simulator builds and tests work without it.
+
+// Your Apple Developer team id (10 characters), needed to sign for a device.
+DEVELOPMENT_TEAM = ABCDE12345
+
+// A bundle id registered to your team, e.g. com.yourname.screener.
+SCREENER_BUNDLE_ID = com.example.screener

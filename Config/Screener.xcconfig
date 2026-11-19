@@ -1,0 +1,16 @@
+// Project-wide build settings shared by every target (wired up in project.yml).
+//
+// Personal values (your Apple Developer team, your own bundle id) do not belong
+// here: put them in Local.xcconfig at the repository root. That file is
+// git-ignored; copy Local.xcconfig.example to start. Later assignments win, so
+// anything set in Local.xcconfig overrides the defaults below.
+
+// Signing team. Empty is fine for simulator builds and tests; device builds
+// need your team id (Xcode › Settings › Accounts, or developer.apple.com).
+DEVELOPMENT_TEAM =
+
+// The app's bundle identifier. Change it in Local.xcconfig if you sign with
+// your own team, since com.vestal.screener is registered to the maintainer.
+SCREENER_BUNDLE_ID = com.vestal.screener
+
+#include? "../Local.xcconfig"
