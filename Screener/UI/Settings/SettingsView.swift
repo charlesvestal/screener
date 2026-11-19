@@ -1,6 +1,11 @@
 // Settings (the gear in the host list toolbar): the session defaults the
 // control menu also changes during a session, plus a few app-wide ones.
 // Everything is @AppStorage (keys: ScreenerSettings and the owning types).
+//
+// The main screen holds the everyday choices (touch mode, pointer and scroll
+// speeds, scroll direction, visual feedback, display, session behaviour);
+// Advanced (AdvancedSettingsView) holds fine-tuning — the tap-to-click and
+// touch-and-hold delays — and diagnostics (Keyboard Tester, Share Log).
 import SwiftUI
 
 struct SettingsView: View {
@@ -14,10 +19,7 @@ struct SettingsView: View {
     @AppStorage(AudioPlayer.mutedDefaultsKey) private var audioMuted = false
     @AppStorage(ScreenerSettings.scrollSpeedKey) private var scrollSpeed = ScreenerSettings.scrollSpeedDefault
     @AppStorage(ScreenerSettings.keepAwakeKey) private var keepAwake = ScreenerSettings.keepAwakeDefault
-    @AppStorage(TapClickDelay.defaultsKey) private var tapDelayRaw = TapClickDelay.default.rawValue
     @AppStorage(ScrollDirection.defaultsKey) private var scrollDirectionRaw = ScrollDirection.default.rawValue
-    @AppStorage(HoldDragDelay.defaultsKey) private var holdDelayRaw = HoldDragDelay.default.rawValue
-    @AppStorage(InputPreferences.keyboardTesterKey) private var keyboardTester = false
     @AppStorage(PointerScaling.pointerSpeedKey) private var pointerSpeed = PointerScaling.defaultSpeed
     @AppStorage(PointerScaling.touchPointerSpeedKey) private var touchPointerSpeed = PointerScaling.defaultSpeed
     @AppStorage(ResumeOnLaunch.enabledKey) private var reconnectOnLaunch = ResumeOnLaunch.enabledDefault
@@ -61,6 +63,8 @@ struct SettingsView: View {
                             Text(mode.title).tag(mode.rawValue)
                         }
                     }
+                    speedSlider("Touch Pointer Speed", value: $touchPointerSpeed)
+                    speedSlider("Pointer Speed", value: $pointerSpeed)
                     VStack(alignment: .leading, spacing: 6) {
                         LabeledContent("Scroll Speed") {
                             Text(String(format: "%.1f×", scrollSpeed)).monospacedDigit()
@@ -74,39 +78,19 @@ struct SettingsView: View {
                         }
                         .accessibilityValue(String(format: "%.1f times", scrollSpeed))
                     }
-                    speedSlider("Pointer Speed", value: $pointerSpeed)
-                    speedSlider("Touch Pointer Speed", value: $touchPointerSpeed)
                     Picker("Scroll Direction", selection: $scrollDirectionRaw) {
                         ForEach(ScrollDirection.allCases, id: \.self) { d in
                             Text(d.title).tag(d.rawValue)
                         }
                     }
-                    Picker("Tap to Click Delay", selection: $tapDelayRaw) {
-                        ForEach(TapClickDelay.allCases, id: \.self) { d in
-                            Text(d.title).tag(d.rawValue)
-                        }
-                    }
-                    Picker("Touch-and-Hold Drag Delay", selection: $holdDelayRaw) {
-                        ForEach(HoldDragDelay.allCases, id: \.self) { d in
-                            Text(d.title).tag(d.rawValue)
-                        }
-                    }
-                    Toggle("Keyboard Tester", isOn: $keyboardTester)
                     Toggle("Visual Feedback", isOn: $visualFeedback)
                 } header: {
                     Text("Input")
                 } footer: {
                     Text("Trackpad: drag to move the pointer, tap to click. Touch: the pointer goes where you touch. "
-                         + "Pointer Speed sets how fast a mouse or trackpad moves the Mac's pointer when it is "
-                         + "captured (full screen); Touch Pointer Speed sets it for finger moves in Trackpad mode. "
-                         + "Scroll Direction: Natural follows the iPad; Reversed flips every scroll. "
-                         + "Tap to Click Delay is how long a tap waits for a double tap or tap-and-drag: Fast "
-                         + "clicks sooner, Relaxed gives more time. Two fingers tap to right-click, three to "
-                         + "middle-click. Touch and hold with one, two or three fingers until the blue, red or "
-                         + "green ring appears, then drag for a left, right or middle drag; Touch-and-Hold Drag "
-                         + "Delay sets how long that hold takes. Shake the pointer to find it. "
-                         + "Visual Feedback shows where touches and clicks land. Keyboard Tester lists the last "
-                         + "hardware key events on screen during a session (for checking a keyboard).")
+                         + "Touch Pointer Speed is for finger moves in Trackpad mode; Pointer Speed is for a mouse "
+                         + "or trackpad when it's captured (full screen). Natural scrolling follows the iPad; "
+                         + "Reversed flips it. Visual Feedback shows where touches and clicks land.")
                 }
 
                 Section {
@@ -132,21 +116,17 @@ struct SettingsView: View {
                 } header: {
                     Text("Session")
                 } footer: {
-                    Text("Auto Clipboard copies text between the iPad and the Mac as you copy it; iPadOS may ask "
-                         + "to allow pasting. Items a password manager marks as concealed or transient are never "
-                         + "sent automatically, and text from the Mac stays on this iPad (not shared with your other "
-                         + "devices via Universal Clipboard). Keep Screen Awake stops the iPad from locking while "
-                         + "connected. Reconnect to Last Mac on Launch connects to the Mac you used last when "
-                         + "Screener opens, if its password is saved (you can cancel it). Picture in Picture When "
-                         + "Leaving the App keeps the Mac in a floating window when you switch apps (the session "
-                         + "stays connected until you close it); when off, leaving the app ends the session and "
-                         + "it reconnects when you return.")
+                    Text("Auto Clipboard copies text between the iPad and the Mac as you copy it (iPadOS may ask "
+                         + "to allow pasting); items a password manager marks as concealed are never sent, and "
+                         + "text from the Mac stays on this iPad. Reconnect to Last Mac on Launch needs a saved "
+                         + "password. Picture in Picture keeps the Mac in a floating window when you switch apps; "
+                         + "when off, leaving the app ends the session and it reconnects when you return.")
                 }
 
                 Section {
+                    NavigationLink("Advanced") { AdvancedSettingsView() }
                     Button("Help") { showHelp = true }
                     Button("Acknowledgements") { showAcknowledgements = true }
-                    ShareLogButton()
                 } footer: {
                     Text("These are the defaults. Each saved Mac can override them (Edit Mac → Session), and "
                          + "changes made from the control menu during a session are remembered for that Mac.")
@@ -160,5 +140,48 @@ struct SettingsView: View {
             .sheet(isPresented: $showAcknowledgements) { AcknowledgementsView() }
             .sheet(isPresented: $showHelp) { HelpView() }
         }
+    }
+}
+
+/// Settings → Advanced: gesture timing and diagnostics.
+struct AdvancedSettingsView: View {
+    @AppStorage(TapClickDelay.defaultsKey) private var tapDelayRaw = TapClickDelay.default.rawValue
+    @AppStorage(HoldDragDelay.defaultsKey) private var holdDelayRaw = HoldDragDelay.default.rawValue
+    @AppStorage(InputPreferences.keyboardTesterKey) private var keyboardTester = false
+
+    var body: some View {
+        Form {
+            Section {
+                Picker("Tap to Click Delay", selection: $tapDelayRaw) {
+                    ForEach(TapClickDelay.allCases, id: \.self) { d in
+                        Text(d.title).tag(d.rawValue)
+                    }
+                }
+                Picker("Touch-and-Hold Drag Delay", selection: $holdDelayRaw) {
+                    ForEach(HoldDragDelay.allCases, id: \.self) { d in
+                        Text(d.title).tag(d.rawValue)
+                    }
+                }
+            } header: {
+                Text("Gestures")
+            } footer: {
+                Text("Tap to Click Delay is how long a tap waits for a double tap or tap-and-drag before it "
+                     + "clicks: Fast clicks sooner, Relaxed gives more time. Touch-and-Hold Drag Delay is how long "
+                     + "one, two or three fingers rest before the blue, red or green ring arms a left, right or "
+                     + "middle drag (Short 0.3 s, Normal 0.45 s, Long 0.6 s).")
+            }
+
+            Section {
+                Toggle("Keyboard Tester", isOn: $keyboardTester)
+                ShareLogButton()
+            } header: {
+                Text("Diagnostics")
+            } footer: {
+                Text("Keyboard Tester lists the last hardware key events on screen during a session. Share Log "
+                     + "sends a copy of Screener's log, with addresses and names masked, for troubleshooting.")
+            }
+        }
+        .navigationTitle("Advanced")
+        .navigationBarTitleDisplayMode(.inline)
     }
 }
