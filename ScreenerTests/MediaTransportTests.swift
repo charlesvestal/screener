@@ -290,27 +290,27 @@ final class MediaTransportTests: XCTestCase {
         XCTAssertEqual(firs.first?.hex, expected.hex)
     }
 
-    /// session._send_ltr_ack: the APP LTR packet (subtype 5, the DON) goes to
-    /// the VIDEO port, SRTCP-protected with videoKeyV, once per new timestamp (or per picture).
-    func testLTRAckGoesToTheVideoPortOncePerTimestamp() async throws {
+    /// The APP LTR ack (name 5, the picture's DONL) goes to the VIDEO port,
+    /// SRTCP-protected with videoKeyV, once per call (one per tile picture,
+    /// repeats included: the four tiles' pictures have distinct DONs).
+    func testLTRAckGoesToTheVideoPortOncePerPicture() async throws {
         let ch = FakeChannels()
         var tuning = fastTuning
         tuning.txInterval = .seconds(60)
         let t = make(ch, tuning: tuning)
         try await t.open()
         try await t.activate(activation)
-        await t.sendLTRAck(timestamp: 60146)
-        await t.sendLTRAck(timestamp: 60146)     // unchanged: not re-sent
-        await t.sendLTRAck(timestamp: 60150)
-        await t.sendLTRAck(timestamp: 60150, everyPicture: true)   // per tile picture: re-sent
+        await t.sendLTRAck(don: 60146)
+        await t.sendLTRAck(don: 60147)
+        await t.sendLTRAck(don: 60147)
         let sent = await t.stats.ltrAcksSent
         await t.close()
         XCTAssertEqual(sent, 3)
         let rtcpDec = try SRTCPDecryptor(blob: keys.videoKeyV)
         let acks = ch.video.sent.filter { RTCP.isRTCP($0) }.compactMap { rtcpDec.unprotect($0) }
         XCTAssertEqual(acks.map(\.hex), [RTCP.appLTR(senderSSRC: ourVideo, ltrID: 60146).hex,
-                                         RTCP.appLTR(senderSSRC: ourVideo, ltrID: 60150).hex,
-                                         RTCP.appLTR(senderSSRC: ourVideo, ltrID: 60150).hex])
+                                         RTCP.appLTR(senderSSRC: ourVideo, ltrID: 60147).hex,
+                                         RTCP.appLTR(senderSSRC: ourVideo, ltrID: 60147).hex])
         XCTAssertEqual(acks.first?.hex, "80cc0003" + "40142f36" + "00000005" + "0000eaf2")
         XCTAssertFalse(ch.audio.sent.contains { RTCP.isRTCP($0) && rtcpDec.unprotect($0)?[1] == 204 })
     }
@@ -341,9 +341,8 @@ final class MediaTransportTests: XCTestCase {
         XCTAssertEqual(f.estimator.floorKbps, 3_000)
         XCTAssertEqual(f.estimator.ceilingKbps, 50_000)
         XCTAssertEqual(MediaTransport.Feedback.fromEnvironment(["SCREENER_RCTL_BWE": "45000"]).rctlBWE, 45_000)
-        XCTAssertEqual(VideoPipeline.LTRAckMode.fromEnvironment([:]), .off)
-        XCTAssertEqual(VideoPipeline.LTRAckMode.fromEnvironment(["SCREENER_LTR_ACK": "1"]), .tile0)
-        XCTAssertEqual(VideoPipeline.LTRAckMode.fromEnvironment(["SCREENER_FB_ACKALL": "1"]), .allTiles)
+        XCTAssertEqual(VideoPipeline.LTRAckMode.fromEnvironment([:]), .everyPicture)
+        XCTAssertEqual(VideoPipeline.LTRAckMode.fromEnvironment(["SCREENER_LTR_ACK": "0"]), .off)
     }
 
     /// RCTL (the native viewer's 50 ms rate-control feedback) goes to the

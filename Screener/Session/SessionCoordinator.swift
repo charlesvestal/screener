@@ -881,7 +881,7 @@ final class SessionCoordinator {
             requestKeyframe: { _ = await media.requestKeyframe(ssrc: $0) },
             notePublished: { await media.notePublished() },
             onNotHEVC: { [weak self] in await self?.videoIsNotHEVC(gen) },
-            ackLTR: { await media.sendLTRAck(timestamp: $0, everyPicture: $1) },
+            ackLTR: { await media.sendLTRAck(don: $0) },
             onHardFailure: { [weak self] in await self?.decoderHardFailure(gen) })
         let pipeline = VideoPipeline(store: frames, hooks: hooks)
         #if DEBUG

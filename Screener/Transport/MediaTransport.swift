@@ -411,7 +411,6 @@ actor MediaTransport {
     private var serverSR: [UInt32: RTCP.SRInfo] = [:]
     private var tick = 0
     private var lastKeyframeRequest: [UInt32: ContinuousClock.Instant] = [:]
-    private var lastLTRAcked: UInt32?
     private var decoderDrivesPublish = false
 
     // Burst / SSRC group.
@@ -588,7 +587,7 @@ actor MediaTransport {
         bweRxBytes = 0; pendingRecoveryEvents = 0; lastStreamDropsSeen = streamDrops.video
         lastRCTL = (0, 0, 0)
         serverSR = [:]; tick = 0
-        lastKeyframeRequest = [:]; lastLTRAcked = nil
+        lastKeyframeRequest = [:]
         decoderDrivesPublish = false
         tracker = SSRCGroupTracker(threshold: tuning.adoptThreshold, stall: tuning.adoptStall)
         groupLocked = false; burstLockScheduled = false
@@ -696,19 +695,18 @@ actor MediaTransport {
     static let keyframeRequestMode: String =
         ExperimentEnv.current["SCREENER_KF_MODE"] ?? "fir+pli+legacy"
 
-    /// APP name 5 "LTRP ACK" on the video port. The u32 is the RTP
-    /// TIMESTAMP of a decoded picture: AVConference's
-    /// VideoReceiver_ProcessRtcpLTRAck logs it as "Received APP_LTRP_ACK
-    /// timestamp=%u" and VideoTransmitter_ACKLTRFrame matches it against the
-    /// timestamps of the frames it sent (macOS 27 build). The reference
-    /// (session._send_ltr_ack) sent the DONL instead, which matches nothing.
-    /// `everyPicture` (native: one per tile picture) skips the
-    /// unchanged-value filter.
-    func sendLTRAck(timestamp: UInt32, everyPicture: Bool = false) {
-        guard everyPicture || timestamp != lastLTRAcked, let sender = activation?.ourVideoSSRC,
-              let enc = rtcpEncryptor, let channel = channels[.video],
-              let wire = try? enc.protect(RTCP.appLTR(senderSSRC: sender, ltrID: timestamp)) else { return }
-        lastLTRAcked = timestamp
+    /// APP name 5 "LTRP ACK" on the video port, one per decoded tile
+    /// picture: the u32 is the picture's RFC 7798 DONL. In multi-tile screen
+    /// mode AVConference keys the LTR ring it matches acks against
+    /// (VideoTransmitter_ACKLTRFrame) by a random-based 16-bit id per tile
+    /// picture (VideoTransmitter_CreateHandle: tx+0x5ee6 = hwrandom16, plus
+    /// the sample's TileID / decoding order), which is what the packetizer
+    /// sends as the DONL; the native receiver acks VideoPacketBuffer's frame
+    /// DON (macOS 27 build). The RTP timestamp is shared by the four tiles
+    /// and matches nothing in this mode.
+    func sendLTRAck(don: UInt16) {
+        guard let sender = activation?.ourVideoSSRC, let enc = rtcpEncryptor, let channel = channels[.video],
+              let wire = try? enc.protect(RTCP.appLTR(senderSSRC: sender, ltrID: UInt32(don))) else { return }
         channel.send(wire)
         counters.ltrAcksSent += 1
     }
