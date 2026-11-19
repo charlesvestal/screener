@@ -113,7 +113,14 @@ extension VideoCaptureFile {
     /// ONE consumer, so the capture never subscribes to it itself.
     @MainActor
     static func attachIfRequested(to model: SessionCoordinator) {
-        guard let path = ProcessInfo.processInfo.environment[envKey], !path.isEmpty else { return }
+        guard var requested = ProcessInfo.processInfo.environment[envKey], !requested.isEmpty else { return }
+        // A relative path lands in Library/Caches (the only writable place
+        // a device launch can name without knowing the container path).
+        if !requested.hasPrefix("/"),
+           let caches = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first {
+            requested = caches.appendingPathComponent(requested).path
+        }
+        let path = requested
         model.makeVideoTap = {
             guard let writer = VideoCaptureWriter(path: path) else {
                 Log.video.error("DEBUG capture: cannot open \(path)")

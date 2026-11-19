@@ -49,6 +49,9 @@ struct HostListView: View {
 
     init() {
         let model = SessionCoordinator()
+        #if DEBUG
+        VideoCaptureFile.attachIfRequested(to: model)
+        #endif
         _model = State(initialValue: model)
         _connector = State(initialValue: HostConnector(model: model))
     }
