@@ -77,7 +77,23 @@ targets:
     settings:
       base:
         GENERATE_INFOPLIST_FILE: YES
+  # UI tests (no Mac needed: DEBUG preview launch arguments). Own scheme,
+  # so the default `Screener` test run stays unit tests only.
+  ScreenerUITests:
+    type: bundle.ui-testing
+    platform: iOS
+    sources: [ScreenerUITests]
+    dependencies:
+      - target: Screener
+    settings:
+      base:
+        GENERATE_INFOPLIST_FILE: YES
 schemes:
+  ScreenerUITests:
+    build:
+      targets: {Screener: all, ScreenerUITests: [test]}
+    test:
+      targets: [ScreenerUITests]
   Screener:
     build:
       targets: {Screener: all, ScreenerTests: [test]}

@@ -632,9 +632,11 @@ private struct MenuGlass<S: Shape>: ViewModifier {
 ///
 /// `-previewSettings YES` shows Settings instead; `-previewStats YES` adds
 /// synthetic live stats (badge + overlay) and a toast; `-previewKeyboard YES`
-/// brings up the on-screen keyboard with its accessory row.
+/// brings up the on-screen keyboard with its accessory row. The menu's key
+/// events are logged (PreviewKeyLog) for the UI tests.
 struct FloatingMenuPreview: View {
     @State private var menu = ControlMenuModel()
+    @State private var keyLog = PreviewKeyLog()
     @State private var expanded = UserDefaults.standard.bool(forKey: "previewMenuExpanded")
     @State private var keyboard = false
     @State private var stats = LiveStatsModel()
@@ -661,10 +663,18 @@ struct FloatingMenuPreview: View {
                 if UserDefaults.standard.bool(forKey: "previewKeyboard") {
                     AccessoryBarPreviewField(menu: menu).frame(width: 1, height: 1).opacity(0.01)
                 }
+                Text(keyLog.text)
+                    .font(.caption2.monospaced()).foregroundStyle(.white.opacity(0.5))
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+                    .padding(.top, 4).padding(.leading, 16)
+                    .accessibilityIdentifier("previewKeyLog")
+                    .accessibilityLabel(keyLog.text.isEmpty ? "-" : keyLog.text)
+                    .allowsHitTesting(false)
             }
             .overlay(alignment: .top) { ToastOverlay(center: toasts) }
             .environment(withStats ? stats : nil)
             .onAppear {
+                menu.sink = keyLog
                 menu.password = { "preview" }
                 menu.tapModifier(.command)
                 menu.tapModifier(.shift)
@@ -677,6 +687,23 @@ struct FloatingMenuPreview: View {
         }
     }
 }
+/// DEBUG preview: the menu's key events as text ("↓ff1b ↑ff1b"; ⇣/⇡ for
+/// modifier holds), the most recent last.
+@MainActor @Observable
+final class PreviewKeyLog: RemoteKeySink {
+    private(set) var events: [String] = []
+    var text: String { events.joined(separator: " ") }
+
+    private func add(_ e: String) {
+        events.append(e)
+        if events.count > 40 { events.removeFirst(events.count - 40) }
+    }
+
+    func sendKey(down: Bool, keysym: UInt32) { add((down ? "↓" : "↑") + String(keysym, radix: 16)) }
+    func holdModifier(_ keysym: UInt32) { add("⇣" + String(keysym, radix: 16)) }
+    func releaseModifier(_ keysym: UInt32) { add("⇡" + String(keysym, radix: 16)) }
+}
+
 /// DEBUG preview: a hidden text field that brings up the keyboard with the
 /// session's accessory row (KeyboardAccessoryBar).
 private struct AccessoryBarPreviewField: UIViewRepresentable {
