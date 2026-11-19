@@ -2,7 +2,7 @@ import XCTest
 @testable import Screener
 
 final class ModifierStateTests: XCTestCase {
-    private let cmd: UInt32 = 0xffeb, opt: UInt32 = 0xffe9, ctrl: UInt32 = 0xffe3, shift: UInt32 = 0xffe1
+    private let cmd: UInt32 = 0xffeb, opt: UInt32 = 0xffe7, ctrl: UInt32 = 0xffe3, shift: UInt32 = 0xffe1
 
     // MARK: transitions
 

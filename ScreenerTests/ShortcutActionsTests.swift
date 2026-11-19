@@ -13,7 +13,7 @@ final class FakeKeySink: RemoteKeySink {
 }
 
 final class ShortcutChordTests: XCTestCase {
-    private let cmd: UInt32 = 0xffeb, opt: UInt32 = 0xffe9, ctrl: UInt32 = 0xffe3, shift: UInt32 = 0xffe1
+    private let cmd: UInt32 = 0xffeb, opt: UInt32 = 0xffe7, ctrl: UInt32 = 0xffe3, shift: UInt32 = 0xffe1
 
     func testEveryChord() {
         let expected: [ShortcutAction: KeyChord] = [

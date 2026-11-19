@@ -12,12 +12,13 @@
 //
 // Arbitration, per key press (`KeyArbiter`):
 //   - GC down of a key that needs no character (modifiers, Caps Lock,
-//     specials — arrows, Delete, Return, F-keys… — or any key while ⌘/⌃/⌥
+//     specials — arrows, Delete, Return, F-keys… — or any key while ⌘/⌃
 //     is held) is sent at once; its UIKit press, if one comes, is swallowed.
-//   - GC down of an unmodified printable key waits up to `partnerWait` for
-//     its UIKit press to take the layout character from it; if none comes
-//     (the text system ate it, or it arrived first and was already matched)
-//     the US-table keysym is sent.
+//   - GC down of a printable key without ⌘/⌃ (unmodified, ⇧, or ⌥ — whose
+//     Option character the host must get, Keysyms) waits up to
+//     `partnerWait` for its UIKit press to take the layout character from
+//     it; if none comes (the text system ate it, or it arrived first and was
+//     already matched) the US-table keysym is sent.
 //   - A UIKit press while a GC keyboard is connected waits up to
 //     `partnerWait` for its GC report (then the GC press owns the key); if
 //     none comes (GC not delivering) it is sent as before — UIKit stays the
@@ -241,10 +242,11 @@ final class KeyArbiter {
 
     // MARK: arbitration
 
-    /// An unmodified printable key: its keysym comes from the layout character.
+    /// A printable key without ⌘/⌃: its keysym comes from the layout
+    /// character (under Option, the Option character: Keysyms.optionCharacter).
     static func needsCharacter(_ usage: UIKeyboardHIDUsage, flags: UIKeyModifierFlags) -> Bool {
         !Keysyms.isModifier(usage) && !Keysyms.isSpecial(usage)
-            && flags.isDisjoint(with: [.command, .control, .alternate])
+            && flags.isDisjoint(with: [.command, .control])
     }
 
     private func pendingDown(_ key: UIKeyboardHIDUsage) -> Int? {

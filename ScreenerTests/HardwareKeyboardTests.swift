@@ -60,8 +60,8 @@ final class GCKeyCodeTableTests: XCTestCase {
         XCTAssertEqual(ks(.rightShift), 0xffe2)
         XCTAssertEqual(ks(.leftControl), 0xffe3)
         XCTAssertEqual(ks(.rightControl), 0xffe4)
-        XCTAssertEqual(ks(.leftAlt), 0xffe9)
-        XCTAssertEqual(ks(.rightAlt), 0xffea)
+        XCTAssertEqual(ks(.leftAlt), 0xffe7)
+        XCTAssertEqual(ks(.rightAlt), 0xffe8)
         XCTAssertEqual(ks(.leftGUI), 0xffeb)
         XCTAssertEqual(ks(.rightGUI), 0xffec)
         XCTAssertEqual(ks(.capsLock), 0xffe5)
@@ -72,7 +72,7 @@ final class GCKeyCodeTableTests: XCTestCase {
 /// the exact key events on the wire (GC events injected through `gcKey`).
 @MainActor
 final class GCKeyPathTests: XCTestCase {
-    private let cmd: UInt32 = 0xffeb, opt: UInt32 = 0xffe9, ctrl: UInt32 = 0xffe3, shift: UInt32 = 0xffe1
+    private let cmd: UInt32 = 0xffeb, opt: UInt32 = 0xffe7, ctrl: UInt32 = 0xffe3, shift: UInt32 = 0xffe1
     private let bs: UInt32 = 0xff08, left: UInt32 = 0xff51, right: UInt32 = 0xff53, home: UInt32 = 0xff50
     private let fdel: UInt32 = 0xffff
 
@@ -160,6 +160,39 @@ final class GCKeyPathTests: XCTestCase {
         gcChord([.keyboardLeftGUI], .keyboardDeleteOrBackspace)
         let got = await strokes()
         XCTAssertEqual(got, wrapped([opt], bs) + wrapped([cmd], bs))
+    }
+
+    func testOptionPrintableWaitsForUIKitsCharacter() async {
+        make()
+        gc(.keyboardLeftAlt, true)
+        gc(.keyboard2, true)
+        var got = await strokes()
+        XCTAssertEqual(got, [.down(opt)])               // waiting for the Option character
+        uk(.keyboard2, true, .alternate, "@")
+        gc(.keyboard2, false)
+        gc(.keyboardLeftAlt, false)
+        got = await strokes()
+        XCTAssertEqual(got, wrapped([opt], 0x40))
+    }
+
+    func testOptionPrintableGCOnlyFallsBackToTheBaseKey() async {
+        make()
+        gc(.keyboardLeftAlt, true)
+        gc(.keyboardE, true)
+        clock.advance(by: KeyArbiter.partnerWait + 0.001)
+        gc(.keyboardE, false)
+        gc(.keyboardLeftAlt, false)
+        let got = await strokes()
+        XCTAssertEqual(got, wrapped([opt], 0x65))
+    }
+
+    func testCommandOptionPrintableIsNotDelayed() async {
+        make()
+        gc(.keyboardLeftGUI, true)
+        gc(.keyboardLeftAlt, true)
+        gc(.keyboard2, true)
+        let got = await strokes()                       // no clock advance
+        XCTAssertEqual(got, [.down(cmd), .down(opt), .down(0x32)])
     }
 
     func testChordsAreNotDelayed() async {

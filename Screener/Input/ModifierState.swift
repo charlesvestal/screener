@@ -24,7 +24,7 @@ enum StickyModifier: Int, CaseIterable, Sendable, Hashable {
     var keysym: UInt32? {
         switch self {
         case .control: 0xffe3
-        case .option: 0xffe9
+        case .option: Keysyms.optionL       // Meta_L: the host's Option (Alt_L is Command)
         case .shift: Keysyms.shiftL
         case .command: Keysyms.superL
         case .fn: nil

@@ -71,13 +71,14 @@
 // Keyboard:
 //   - Hardware keys via pressesBegan/Ended (UIKey.keyCode + modifierFlags +
 //     characters → HardwareKeyState / Keysyms: layout-aware character when
-//     no Cmd/Ctrl/Opt is held, US table otherwise).
+//     no Cmd/Ctrl/Opt is held, the Option character under Option alone, US
+//     table otherwise).
 //   - While a GameController keyboard is connected (GCKeyboardSource), every
 //     hardware key's down/up comes from GC as well and KeyArbiter merges the
 //     two (HardwareKeyboard.swift): GC decides which key and when (so ⌥←,
 //     ⌘→, ⌥⌫ that UIKit's text system swallows still reach the Mac), UIKit
-//     supplies the layout character for unmodified printable keys and stays
-//     the fallback. GC keys only count while this view (or the keyboard
+//     supplies the layout character for printable keys without ⌘/⌃ (the
+//     Option character under ⌥) and stays the fallback. GC keys only count while this view (or the keyboard
 //     proxy) is first responder, as UIKit's would.
 //   - Auto-repeat: iPadOS sends no repeats, so the most recently pressed
 //     non-modifier key re-sends its key-down (no key-up between) after 500 ms,
@@ -99,7 +100,8 @@
 // ⌘⌥M toggles the floating menu (a UIKeyCommand; the M is not forwarded).
 //
 // Modifier chords on every key path — the Mac sees, for e.g. ⌥⌫:
-//   Alt_L↓ BackSpace↓ [BackSpace↓ … while held] BackSpace↑ Alt_L↑
+//   Meta_L↓ BackSpace↓ [BackSpace↓ … while held] BackSpace↑ Meta_L↑
+//   (Option is Meta_L/R: screensharingd maps Alt_L/R to Command — Keysyms.)
 //   - Hardware: the modifier keys are forwarded as their own holds. Each
 //     non-modifier key-down is also checked against UIKey.modifierFlags:
 //     a modifier the flags report but whose key-down never reached us (held

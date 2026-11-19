@@ -58,8 +58,10 @@ final class KeysymsTests: XCTestCase {
         // Command key under GLFW on macOS) and the Windows key to 0xffeb/0xffec.
         XCTAssertEqual(Keysyms.keysym(for: .keyboardLeftGUI, shifted: false), 0xffeb)
         XCTAssertEqual(Keysyms.keysym(for: .keyboardRightGUI, shifted: false), 0xffec)
-        XCTAssertEqual(Keysyms.keysym(for: .keyboardLeftAlt, shifted: false), 0xffe9)
-        XCTAssertEqual(Keysyms.keysym(for: .keyboardRightAlt, shifted: false), 0xffea)
+        // Option → Meta_L/R: screensharingd maps Meta to Option and Alt_L/R to
+        // Command (iShareScreen PR #25).
+        XCTAssertEqual(Keysyms.keysym(for: .keyboardLeftAlt, shifted: false), 0xffe7)
+        XCTAssertEqual(Keysyms.keysym(for: .keyboardRightAlt, shifted: false), 0xffe8)
         XCTAssertEqual(Keysyms.keysym(for: .keyboardLeftShift, shifted: false), 0xffe1)
         XCTAssertEqual(Keysyms.keysym(for: .keyboardRightShift, shifted: false), 0xffe2)
         XCTAssertEqual(Keysyms.keysym(for: .keyboardLeftControl, shifted: false), 0xffe3)
@@ -81,13 +83,71 @@ final class KeysymsTests: XCTestCase {
 
     func testHardwareKeyStateUsesUnshiftedKeysymWhileACommandModifierIsHeld() {
         var s = HardwareKeyState()
-        // app.py on_key: with Ctrl/Super/Alt held, letters go as the raw lowercase keysym
+        // app.py on_key: with Ctrl/Super held, letters go as the raw lowercase keysym
         // (US position; the layout's character is ignored, as GLFW key codes are).
         XCTAssertEqual(s.press(.keyboardC, modifiers: [.command, .shift], characters: "C"), 0x63)
         XCTAssertEqual(s.release(.keyboardC), 0x63)
         XCTAssertEqual(s.press(.keyboardQ, modifiers: [.command], characters: "a"), 0x71)   // AZERTY A-key
-        XCTAssertEqual(s.press(.keyboardE, modifiers: [.alternate], characters: "\u{b4}"), 0x65)
+        XCTAssertEqual(s.press(.keyboardE, modifiers: [.alternate], characters: ""), 0x65)  // ⌥ dead key: base
+        XCTAssertEqual(s.press(.keyboard2, modifiers: [.command, .alternate], characters: "™"), 0x32)
+        XCTAssertEqual(s.press(.keyboard3, modifiers: [.control, .alternate], characters: "£"), 0x33)
         XCTAssertEqual(s.press(.keyboardC, modifiers: [.shift]), 0x43)                     // no characters: US table
+    }
+
+    // MARK: Option characters (iShareScreen PR #25)
+
+    func testOptionMapsToMetaEverywhere() {
+        XCTAssertEqual(Keysyms.optionL, 0xffe7)
+        XCTAssertEqual(Keysyms.optionR, 0xffe8)
+        XCTAssertEqual(StickyModifier.option.keysym, 0xffe7)
+        let opt = Keysyms.flagKeysyms.first { $0.flag == .alternate }
+        XCTAssertEqual(opt?.left, 0xffe7)
+        XCTAssertEqual(opt?.sides, [0xffe7, 0xffe8])
+        XCTAssertEqual(Keysyms.modifierPressOrder, [0xffe3, 0xffe7, 0xffe1, 0xffeb])
+        // Nothing sends Alt_L/R (the host's Command) any more.
+        for usage in [UIKeyboardHIDUsage.keyboardLeftAlt, .keyboardRightAlt] {
+            XCTAssertFalse([0xffe9, 0xffea].contains(Keysyms.keysym(for: usage, shifted: false)))
+        }
+    }
+
+    func testOptionCharacterIsTheLayoutCharacterUnderOptionAlone() {
+        XCTAssertEqual(Keysyms.optionCharacter(.keyboard2, modifiers: [.alternate], characters: "™"), 0x2122)  // US
+        XCTAssertEqual(Keysyms.optionCharacter(.keyboard2, modifiers: [.alternate], characters: "@"), 0x40)    // Swedish
+        XCTAssertEqual(Keysyms.optionCharacter(.keyboard8, modifiers: [.alternate], characters: "{"), 0x7b)
+        XCTAssertEqual(Keysyms.optionCharacter(.keyboard7, modifiers: [.alternate, .shift], characters: "\\"), 0x5c)
+        XCTAssertEqual(Keysyms.optionCharacter(.keyboardA, modifiers: [.alternate], characters: "å"), 0xe5)
+        XCTAssertEqual(Keysyms.optionCharacter(.keyboardSpacebar, modifiers: [.alternate], characters: "\u{a0}"), 0xa0)
+        XCTAssertEqual(Keysyms.optionCharacter(.keyboardNonUSBackslash, modifiers: [.alternate], characters: "|"), 0x7c)
+    }
+
+    func testOptionCharacterIsNilWhereOptionStaysAModifier() {
+        // No Option, or ⌘/⌃ also held: a chord, sent as the base key.
+        XCTAssertNil(Keysyms.optionCharacter(.keyboard2, modifiers: [], characters: "2"))
+        XCTAssertNil(Keysyms.optionCharacter(.keyboard2, modifiers: [.shift], characters: "@"))
+        XCTAssertNil(Keysyms.optionCharacter(.keyboard2, modifiers: [.alternate, .command], characters: "™"))
+        XCTAssertNil(Keysyms.optionCharacter(.keyboard2, modifiers: [.alternate, .control], characters: "™"))
+        // Specials and modifiers keep Option as a modifier (⌥← ⌥⌫ word moves).
+        XCTAssertNil(Keysyms.optionCharacter(.keyboardLeftArrow, modifiers: [.alternate], characters: "\u{f702}"))
+        XCTAssertNil(Keysyms.optionCharacter(.keyboardDeleteOrBackspace, modifiers: [.alternate], characters: "\u{8}"))
+        XCTAssertNil(Keysyms.optionCharacter(.keyboardReturnOrEnter, modifiers: [.alternate], characters: "\r"))
+        XCTAssertNil(Keysyms.optionCharacter(.keyboardTab, modifiers: [.alternate], characters: "\t"))
+        XCTAssertNil(Keysyms.optionCharacter(.keyboardF5, modifiers: [.alternate], characters: "\u{f708}"))
+        XCTAssertNil(Keysyms.optionCharacter(.keyboardLeftShift, modifiers: [.alternate, .shift], characters: ""))
+        // No single printable character (a dead key reports none).
+        XCTAssertNil(Keysyms.optionCharacter(.keyboardE, modifiers: [.alternate], characters: ""))
+        XCTAssertNil(Keysyms.optionCharacter(.keyboardE, modifiers: [.alternate], characters: "\u{1}"))
+    }
+
+    func testHardwareKeyStateSendsTheOptionCharacterAndReleasesIt() {
+        var s = HardwareKeyState()
+        XCTAssertEqual(s.press(.keyboard2, modifiers: [.alternate], characters: "@"), 0x40)
+        XCTAssertEqual(s.release(.keyboard2), 0x40)                       // the up matches the down
+        XCTAssertEqual(s.press(.keyboard2, modifiers: [.alternate, .shift], characters: "€"), 0x20ac)
+        XCTAssertEqual(s.release(.keyboard2), 0x20ac)
+        XCTAssertEqual(s.press(.keyboardLeftArrow, modifiers: [.alternate], characters: "\u{f702}"), 0xff51)
+        XCTAssertEqual(s.press(.keyboardDeleteOrBackspace, modifiers: [.alternate], characters: "\u{8}"), 0xff08)
+        XCTAssertEqual(s.press(.keyboardLeftAlt, modifiers: [.alternate]), 0xffe7)
+        XCTAssertEqual(s.press(.keyboardRightAlt, modifiers: [.alternate]), 0xffe8)
     }
 
     func testHardwareKeyStateSendsTheLayoutCharacterWithoutCommandModifiers() {

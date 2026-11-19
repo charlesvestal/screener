@@ -8,7 +8,7 @@ import XCTest
 /// keyboard accessory row.
 @MainActor
 final class ModifierKeyPathsTests: XCTestCase {
-    private let cmd: UInt32 = 0xffeb, opt: UInt32 = 0xffe9, ctrl: UInt32 = 0xffe3, shift: UInt32 = 0xffe1
+    private let cmd: UInt32 = 0xffeb, opt: UInt32 = 0xffe7, ctrl: UInt32 = 0xffe3, shift: UInt32 = 0xffe1
     private let bs: UInt32 = 0xff08, left: UInt32 = 0xff51, up: UInt32 = 0xff52, right: UInt32 = 0xff53
     private let down: UInt32 = 0xff54
 
@@ -121,12 +121,43 @@ final class ModifierKeyPathsTests: XCTestCase {
         XCTAssertEqual(got, wrapped([ctrl], 0x61) + wrapped([ctrl], 0x65))
     }
 
-    func testHardwareOptionLetterDeadKeySendsTheUSLetterWithAlt() async {
+    func testHardwareOptionDeadKeyWithoutACharacterSendsTheUSLetterWithMeta() async {
         let r = make()
         chord(r, [lOpt], .keyboardE, characters: "")          // dead key: no character
-        chord(r, [lOpt], .keyboardU, characters: "¨")
         let got = await strokes(r)
-        XCTAssertEqual(got, wrapped([opt], 0x65) + wrapped([opt], 0x75))
+        XCTAssertEqual(got, wrapped([opt], 0x65))
+    }
+
+    func testHardwareOptionCharactersSendTheTypedCharacterWithMetaHeld() async {
+        // The host types keysyms exactly with its own layout, so ⌥2 must send
+        // the character ⌥2 makes (Swedish "@", US "™"), not '2' (PR #25).
+        let r = make()
+        chord(r, [lOpt], .keyboard2, characters: "@")
+        chord(r, [lOpt], .keyboard2, characters: "™")
+        chord(r, [lShift, lOpt], .keyboard7, characters: "\\")
+        chord(r, [(.keyboardRightAlt, .alternate)], .keyboard8, characters: "{")
+        let got = await strokes(r)
+        XCTAssertEqual(got, wrapped([opt], 0x40) + wrapped([opt], 0x2122) + wrapped([shift, opt], 0x5c)
+                       + wrapped([0xffe8], 0x7b))
+    }
+
+    func testHardwareOptionChordWithCommandOrControlSendsTheBaseKey() async {
+        let r = make()
+        chord(r, [lOpt, lCmd], .keyboard2, characters: "™")
+        chord(r, [lCtrl, lOpt], .keyboardA, characters: "å")
+        let got = await strokes(r)
+        XCTAssertEqual(got, wrapped([opt, cmd], 0x32) + wrapped([ctrl, opt], 0x61))
+    }
+
+    func testLatchedOptionOnAHardwareKeySendsTheBaseKey() async {
+        // A sticky ⌥ isn't held on the iPad, so UIKit's character has no Option
+        // in it: the key goes as Meta + the US base key (as a ⌘/⌃ chord).
+        let r = make()
+        r.menu.tapModifier(.option)
+        XCTAssertTrue(r.view.keyDown(.keyboardA, modifiers: [], characters: "a"))
+        XCTAssertTrue(r.view.keyUp(.keyboardA))
+        let got = await strokes(r)
+        XCTAssertEqual(got, wrapped([opt], 0x61))
     }
 
     func testHardwareCommandLettersAndCommandShiftLetter() async {
@@ -193,7 +224,7 @@ final class ModifierKeyPathsTests: XCTestCase {
         let r = make()
         chord(r, [(.keyboardRightAlt, .alternate)], .keyboardDeleteOrBackspace)
         let got = await strokes(r)
-        XCTAssertEqual(got, wrapped([0xffea], bs))
+        XCTAssertEqual(got, wrapped([0xffe8], bs))
     }
 
     func testClaimedKeyCommandsHavePriorityAndForwardTheChord() async {

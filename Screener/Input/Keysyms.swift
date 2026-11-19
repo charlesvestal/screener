@@ -10,8 +10,14 @@
 //   0xff08, Delete (forward) 0xffff, arrows 0xff51–54, F1… 0xffbe…, etc.
 // - Command → Super_L/R (0xffeb/0xffec). The reference maps GLFW's
 //   KEY_LEFT_SUPER (which IS the Command key under GLFW on macOS) and the
-//   Windows key to 0xffeb; the host treats Super as Command. Option → Alt_L/R
-//   (0xffe9/0xffea), Control → 0xffe3/4, Shift → 0xffe1/2, CapsLock 0xffe5.
+//   Windows key to 0xffeb; the host treats Super as Command. Control →
+//   0xffe3/4, Shift → 0xffe1/2, CapsLock 0xffe5.
+// - Option → Meta_L/R (0xffe7/0xffe8), NOT Alt_L/R. screensharingd's
+//   modifier table (ScreensharingAgent: pairs of Mac keycode and keysym)
+//   maps Meta_L/R to Option / Right Option and Alt_L/R (0xffe9/0xffea), like
+//   Super_L/R, to Command / Right Command — so an Option sent as Alt arrives
+//   as Command (⌥← became ⌘←, ⌥⌫ became ⌘⌫). Found by alakangas in
+//   iShareScreen PR #25 (renegadelink/iShareScreen).
 // - Printable keys send the FINAL character keysym ("Apple's RFB key handler
 //   expects the final character keysym, not base-char + Shift",
 //   keyboard_grab.py), with the physical Shift also sent as its own key, as
@@ -25,10 +31,21 @@
 //   codepoint)`), not X11's 0x01000000|cp Unicode keysym; we match it
 //   (`Keysyms.character(_:)` is the single place to change that if the host
 //   turns out to want the 0x01000000 form — untested on screensharingd).
-// - While Command/Control/Option is held, letters/digits go as the raw
-//   unshifted keysym from the US table (app.py on_key: on_char doesn't fire
-//   under a modifier, so it synthesises the lowercase ASCII keysym from the
-//   GLFW key code, which is a US-position code).
+// - While Command/Control is held, letters/digits go as the raw unshifted
+//   keysym from the US table (app.py on_key: on_char doesn't fire under a
+//   modifier, so it synthesises the lowercase ASCII keysym from the GLFW key
+//   code, which is a US-position code).
+// - Option alone (⌥ or ⌥⇧, no ⌘/⌃) on a printable key sends the CHARACTER
+//   the iPad's layout produced (UIKey.characters: ⌥2 = ™ on US, @ on
+//   Swedish/German), with Meta held as the key's own modifier
+//   (`Keysyms.optionCharacter`). The host looks each keysym up in its own
+//   layout and types it exactly — it presses whatever modifiers that
+//   character needs itself — so the base key '2' under Option would type
+//   '2' (iShareScreen PR #25). Non-printable keys under Option (arrows,
+//   Delete, Return, F-keys, …) stay Meta + the key, so ⌥← / ⌥⌫ are the
+//   Mac's word moves. With no character from UIKit (a dead key such as
+//   ⌥E, or GC without a UIKit partner) the US-table base key is sent under
+//   Meta, as before.
 // - Caps Lock is forwarded to the Mac as its own key (0xffe5) and letters are
 //   NOT pre-cased locally from the caps state: the character the iPad reports
 //   is sent as is. macOS's Caps Lock doesn't invert Shift, so a Mac that also
@@ -43,6 +60,10 @@ enum Keysyms {
     static let delete: UInt32 = 0xffff
     static let shiftL: UInt32 = 0xffe1
     static let superL: UInt32 = 0xffeb
+    static let superR: UInt32 = 0xffec
+    /// Option: Meta_L/R — screensharingd's Option keys (Alt_L/R are Command).
+    static let optionL: UInt32 = 0xffe7
+    static let optionR: UInt32 = 0xffe8
 
     /// The keysym for a hardware key, or nil if it has none.
     static func keysym(for usage: UIKeyboardHIDUsage, shifted: Bool) -> UInt32? {
@@ -65,6 +86,22 @@ enum Keysyms {
         guard scalars.count == 1, let s = scalars.first else { return nil }
         guard s.value >= 0x20, s.value != 0x7f, !(0xf700...0xf8ff).contains(s.value) else { return nil }
         return character(s)
+    }
+
+    /// The keysym for a printable key typed with Option alone (⌥ or ⌥⇧, no
+    /// ⌘/⌃): the character the iPad's layout produced (`characters`, e.g.
+    /// "™" for ⌥2 on US, "@" on Swedish), so the host — which types keysyms
+    /// exactly, pressing the modifiers its own layout needs — types that
+    /// character instead of the base key. Nil (send Meta + the US base key)
+    /// for anything else: no Option, ⌘/⌃ also held, a special or modifier key
+    /// (arrows, Delete, Return, … keep Option as a modifier), or no single
+    /// printable character (a dead key reports none). Sent like typed text
+    /// (`character(_:)`).
+    static func optionCharacter(_ usage: UIKeyboardHIDUsage, modifiers: UIKeyModifierFlags,
+                                characters: String) -> UInt32? {
+        guard modifiers.contains(.alternate), modifiers.isDisjoint(with: [.command, .control]),
+              !isModifier(usage), !isSpecial(usage) else { return nil }
+        return character(in: characters)
     }
 
     /// One key press for typed text (the on-screen keyboard).
@@ -131,9 +168,9 @@ enum Keysyms {
     /// in press order (⌃ ⌥ ⇧ ⌘, as StickyModifier).
     static let flagKeysyms: [(flag: UIKeyModifierFlags, left: UInt32, sides: Set<UInt32>)] = [
         (.control, 0xffe3, [0xffe3, 0xffe4]),
-        (.alternate, 0xffe9, [0xffe9, 0xffea]),
+        (.alternate, optionL, [optionL, optionR]),
         (.shift, shiftL, [shiftL, 0xffe2]),
-        (.command, superL, [superL, 0xffec]),
+        (.command, superL, [superL, superR]),
     ]
 
     /// The canonical press order of the left modifier keysyms.
@@ -168,8 +205,8 @@ enum Keysyms {
             .keyboardDownArrow: 0xff54,
             .keyboardLeftShift: shiftL, .keyboardRightShift: 0xffe2,
             .keyboardLeftControl: 0xffe3, .keyboardRightControl: 0xffe4,
-            .keyboardLeftAlt: 0xffe9, .keyboardRightAlt: 0xffea,
-            .keyboardLeftGUI: superL, .keyboardRightGUI: 0xffec,
+            .keyboardLeftAlt: optionL, .keyboardRightAlt: optionR,
+            .keyboardLeftGUI: superL, .keyboardRightGUI: superR,
             .keyboardCapsLock: 0xffe5,
         ]
         let fkeys: [UIKeyboardHIDUsage] = [.keyboardF1, .keyboardF2, .keyboardF3, .keyboardF4, .keyboardF5,
@@ -224,12 +261,15 @@ struct HardwareKeyState {
 
     /// The keysym to send as key-down, or nil if the key has none.
     /// `characters`: UIKey.characters (layout-aware), used for printable keys
-    /// when no Command/Control/Option is held (on_char vs on_key).
+    /// when no Command/Control/Option is held (on_char vs on_key), and under
+    /// Option alone for the Option character (`Keysyms.optionCharacter`).
     mutating func press(_ usage: UIKeyboardHIDUsage, modifiers: UIKeyModifierFlags,
                         characters: String = "") -> UInt32? {
         let commandHeld = !modifiers.isDisjoint(with: [.command, .control, .alternate])
         let ks: UInt32?
-        if commandHeld {
+        if let ch = Keysyms.optionCharacter(usage, modifiers: modifiers, characters: characters) {
+            ks = ch
+        } else if commandHeld {
             ks = Keysyms.keysym(for: usage, shifted: false)
         } else if !Keysyms.isSpecial(usage), let ch = Keysyms.character(in: characters) {
             ks = ch

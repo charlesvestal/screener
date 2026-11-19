@@ -312,9 +312,9 @@ final class RemoteInputViewTests: XCTestCase {
         view.movePointer(to: CGPoint(x: 20, y: 20), coalescable: false)
         view.releaseAll()
         let got = await events(input, sink)
-        XCTAssertEqual(got.first, .key(down: true, keysym: 0xffe9))
+        XCTAssertEqual(got.first, .key(down: true, keysym: 0xffe7))
         XCTAssertEqual(got[1], .pointer(buttons: 1, x: 5, y: 5))
-        XCTAssertTrue(got.contains(.key(down: false, keysym: 0xffe9)))
+        XCTAssertTrue(got.contains(.key(down: false, keysym: 0xffe7)))
         XCTAssertEqual(sticky.state[.option], .locked)
     }
 
