@@ -1,7 +1,10 @@
 // SwiftUI touch-feedback overlay over the remote screen (FeedbackCenter):
-//   - direct-mode long press: a ring filling toward the right-click threshold
-//     at the finger (appears after a short delay so plain taps don't flash
-//     it; gone at once on a move; a brief completion pop when it fires)
+//   - touch-and-hold: a ring filling toward the hold-drag threshold at the
+//     fingers (Touch mode) or the cursor (Trackpad mode), tinted by the
+//     drag's button — blue left, red right, green middle (DragIndicatorTint).
+//     It appears after a short delay so plain taps don't flash it, is gone
+//     at once on a move, and pops briefly when it fires (no pop under
+//     Reduce Motion); the drag pulse then marks the armed drag.
 //   - zoom pill: "2.4×" at the top while pinching, fading 1 s after
 //   - minimap (top-right, glass) while zoomed: the whole picture with the
 //     visible region outlined; tap or drag on it to move the view there. It
@@ -74,8 +77,8 @@ struct FeedbackOverlayView: View {
     var body: some View {
         GeometryReader { geo in
             ZStack(alignment: .topLeading) {
-                if let lp = center.longPress {
-                    LongPressRing(state: lp, reduceMotion: reduceMotion)
+                if let lp = center.hold {
+                    HoldRing(state: lp, reduceMotion: reduceMotion)
                         .id(lp.id)
                         .position(lp.point)
                         .transition(.opacity)
@@ -112,32 +115,37 @@ struct FeedbackOverlayView: View {
         .animation(.easeOut(duration: 0.3), value: center.scrollPill == nil)
         .animation(.easeOut(duration: 0.25), value: center.minimap == nil)
         .animation(.easeInOut(duration: 0.4), value: center.minimapShown)
-        .animation(.easeOut(duration: 0.12), value: center.longPress?.id)
+        .animation(.easeOut(duration: 0.12), value: center.hold?.id)
     }
 }
 
-/// A ring filling over the long-press duration.
-private struct LongPressRing: View {
-    let state: FeedbackCenter.LongPress
+/// A ring filling over the hold duration, tinted by the drag's button.
+private struct HoldRing: View {
+    let state: FeedbackCenter.Hold
     let reduceMotion: Bool
     /// Plain taps end before this: the ring stays invisible for them.
     static let showDelay: TimeInterval = 0.12
     @State private var progress: CGFloat = 0
     @State private var visible = false
 
+    private var tint: Color {
+        let c = DragIndicatorTint.rgb(for: state.button)
+        return Color(red: Double(c.x), green: Double(c.y), blue: Double(c.z))
+    }
+
     var body: some View {
         ZStack {
-            Circle().stroke(.white.opacity(0.25), lineWidth: 4)
+            Circle().stroke(tint.opacity(0.3), lineWidth: 4)
             Circle()
                 .trim(from: 0, to: state.fired ? 1 : progress)
-                .stroke(.white, style: StrokeStyle(lineWidth: 4, lineCap: .round))
+                .stroke(tint, style: StrokeStyle(lineWidth: 4, lineCap: .round))
                 .rotationEffect(.degrees(-90))
         }
         .frame(width: 64, height: 64)
         .shadow(color: .black.opacity(0.35), radius: 3)
         .scaleEffect(state.fired && !reduceMotion ? 1.25 : 1)
         .opacity(state.fired ? 0 : (visible ? 1 : 0))
-        .animation(.easeOut(duration: FeedbackCenter.longPressFlash), value: state.fired)
+        .animation(.easeOut(duration: FeedbackCenter.holdFlash), value: state.fired)
         .onAppear {
             let delay = Self.showDelay
             withAnimation(.easeIn(duration: 0.08).delay(delay)) { visible = true }

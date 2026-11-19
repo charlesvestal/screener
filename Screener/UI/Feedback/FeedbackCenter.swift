@@ -3,8 +3,8 @@
 //   - GPU effect state (RippleField, CursorEffects) the MetalRenderer samples
 //     every frame (`gpuState(at:)`), asking for frames while anything moves
 //     (`needsFrames(at:)`) and through `onChange` when an event arrives;
-//   - observable overlay state for FeedbackOverlayView: the direct-mode
-//     long-press ring, the zoom pill, the scroll pill and the minimap.
+//   - observable overlay state for FeedbackOverlayView: the hold progress
+//     ring (tinted by button), the zoom pill, the scroll pill and the minimap.
 // Settings and Reduce Motion: FeedbackEvent.swift header. Both are read when
 // an event arrives (no per-frame defaults reads).
 import CoreGraphics
@@ -19,18 +19,20 @@ final class FeedbackCenter: FeedbackSink {
     static let zoomPillLinger: TimeInterval = 1
     /// The scroll pill fades this long after the last scroll step.
     static let scrollPillLinger: TimeInterval = 0.6
-    /// The long-press ring lingers this long after firing (completion flash).
-    static let longPressFlash: TimeInterval = 0.25
+    /// The hold ring lingers this long after firing (completion flash).
+    static let holdFlash: TimeInterval = 0.25
     /// The minimap fades this long after it appeared or the view last moved
     /// (zoom / pan / a jump), like the control pill's idle fade; the next
     /// zoom or pan brings it back.
     static let minimapLinger: TimeInterval = 3
 
-    struct LongPress: Equatable {
+    struct Hold: Equatable {
         var id: Int
         /// SCREEN point.
         var point: CGPoint
         var duration: TimeInterval
+        /// The drag's button (InputController.Button): the ring's tint.
+        var button: Int
         var fired = false
     }
 
@@ -55,7 +57,7 @@ final class FeedbackCenter: FeedbackSink {
 
     // MARK: overlay state (observed)
 
-    private(set) var longPress: LongPress?
+    private(set) var hold: Hold?
     /// The zoom pill's scale (nil: hidden).
     private(set) var zoomPill: CGFloat?
     /// The scroll pill's thumb position 0…1 (nil: hidden).
@@ -86,7 +88,7 @@ final class FeedbackCenter: FeedbackSink {
     @ObservationIgnored var visualEnabled: () -> Bool = { FeedbackSettings.visualEnabled() }
     @ObservationIgnored private let schedule: KeyRepeater.Schedule
 
-    @ObservationIgnored private var longPressIDs = 0
+    @ObservationIgnored private var holdIDs = 0
     @ObservationIgnored private var scrollTravel: CGFloat = 0
     @ObservationIgnored private var lastZoomAt: Double = 0
     @ObservationIgnored private var lastScrollAt: Double = 0
@@ -94,7 +96,7 @@ final class FeedbackCenter: FeedbackSink {
     @ObservationIgnored private var minimapTimer: (() -> Void)?
     @ObservationIgnored private var zoomTimer: (() -> Void)?
     @ObservationIgnored private var scrollTimer: (() -> Void)?
-    @ObservationIgnored private var longPressTimer: (() -> Void)?
+    @ObservationIgnored private var holdTimer: (() -> Void)?
 
     init(schedule: @escaping KeyRepeater.Schedule = KeyRepeater.runLoopTimer) {
         self.schedule = schedule
@@ -114,17 +116,13 @@ final class FeedbackCenter: FeedbackSink {
         case .click(let p): spawn(.click, p, t, visual, reduced)
         case .doubleClick(let p): spawn(.doubleClick, p, t, visual, reduced)
         case .rightClick(let p): spawn(.rightClick, p, t, visual, reduced)
-        case .dragBegan(let p):
+        case .dragBegan(let p, let button):
             guard visual else { return }
-            ripples.setPulse(at: p, now: t, reduceMotion: reduced)
+            ripples.setPulse(at: p, now: t, reduceMotion: reduced, tint: DragIndicatorTint.rgb(for: button))
             changed()
         case .dragEnded:
             guard ripples.pulse != nil else { return }
             ripples.setPulse(at: nil, now: t, reduceMotion: reduced)
-            changed()
-        case .dragLock(let active, let p):
-            guard visual || !active else { return }
-            ripples.setPulse(at: active ? p : nil, now: t, reduceMotion: reduced)
             changed()
         case .fingerDown:
             guard visual else { return }
@@ -137,18 +135,19 @@ final class FeedbackCenter: FeedbackSink {
             // Redraw only for the trail / pulse (a cursor move redraws anyway).
             if ripples.pulse != nil { ripples.movePulse(to: p) } else if cursorFX.ghosts == ghosts { return }
             changed()
-        case .longPressBegan(let p, let duration):
-            longPressTimer?()
-            longPressIDs += 1
-            longPress = LongPress(id: longPressIDs, point: p, duration: duration)
-        case .longPressEnded(let fired):
-            longPressTimer?()
-            longPressTimer = nil
-            guard fired, longPress != nil else { longPress = nil; return }
-            longPress?.fired = true
-            longPressTimer = schedule(Self.longPressFlash) { [weak self] in
-                self?.longPress = nil
-                self?.longPressTimer = nil
+        case .holdBegan(let p, let duration, let button):
+            holdTimer?()
+            holdTimer = nil
+            holdIDs += 1
+            hold = Hold(id: holdIDs, point: p, duration: duration, button: button)
+        case .holdEnded(let fired):
+            holdTimer?()
+            holdTimer = nil
+            guard fired, hold != nil else { hold = nil; return }
+            hold?.fired = true
+            holdTimer = schedule(Self.holdFlash) { [weak self] in
+                self?.hold = nil
+                self?.holdTimer = nil
             }
         case .zoomChanged(let scale):
             zoomPill = scale

@@ -412,53 +412,63 @@ final class InputPreferencesTests: XCTestCase {
     func testLoadDefaultsAndStoredValues() {
         let d = suite()
         XCTAssertEqual(InputPreferences.load(d), InputPreferences())
-        XCTAssertFalse(InputPreferences().longPressRightClick, "off by default: two-finger tap is the right click")
+        XCTAssertEqual(InputPreferences().holdDelay, .normal)
         d.set("relaxed", forKey: TapClickDelay.defaultsKey)
         d.set("reversed", forKey: ScrollDirection.defaultsKey)
-        d.set(true, forKey: InputPreferences.longPressRightClickKey)
+        d.set("long", forKey: HoldDragDelay.defaultsKey)
         XCTAssertEqual(InputPreferences.load(d),
-                       InputPreferences(tapDelay: .relaxed, scrollDirection: .reversed, longPressRightClick: true))
+                       InputPreferences(tapDelay: .relaxed, scrollDirection: .reversed, holdDelay: .long))
         d.set("bogus", forKey: TapClickDelay.defaultsKey)
         d.set("sideways", forKey: ScrollDirection.defaultsKey)
+        d.set("forever", forKey: HoldDragDelay.defaultsKey)
         XCTAssertEqual(InputPreferences.load(d).tapDelay, .normal)
         XCTAssertEqual(InputPreferences.load(d).scrollDirection, .natural)
+        XCTAssertEqual(InputPreferences.load(d).holdDelay, .normal)
+    }
+
+    /// The removed "Long-Press to Right-Click" toggle: a stored value changes nothing.
+    func testAStoredLongPressRightClickIsIgnored() {
+        let d = suite()
+        d.set(true, forKey: "input.longPressRightClick")
+        XCTAssertEqual(InputPreferences.load(d), InputPreferences())
     }
 
     @MainActor
     func testTheViewAppliesThemAtSessionStartAndLive() {
         let d = suite()
         d.set("fast", forKey: TapClickDelay.defaultsKey)
-        d.set(false, forKey: InputPreferences.longPressRightClickKey)
+        d.set("short", forKey: HoldDragDelay.defaultsKey)
         let view = RemoteInputView(frame: CGRect(x: 0, y: 0, width: 100, height: 100),
                                    repeatSchedule: FakeRepeatClock().schedule)
         view.defaults = d
         view.input = InputController(contentKey: nil, serverWidth: 100, serverHeight: 100, send: { _ in })
         XCTAssertEqual(view.touchInterpreter.tapDelay, 0.15)
-        XCTAssertFalse(view.touchInterpreter.longPressRightClick)
+        XCTAssertEqual(view.touchInterpreter.holdDelay, 0.3)
         d.set("relaxed", forKey: TapClickDelay.defaultsKey)
-        d.set(true, forKey: InputPreferences.longPressRightClickKey)
+        d.set("long", forKey: HoldDragDelay.defaultsKey)
         view.reloadPreferences()                    // what a UserDefaults change notification does
         XCTAssertEqual(view.touchInterpreter.tapDelay, 0.35)
-        XCTAssertTrue(view.touchInterpreter.longPressRightClick)
+        XCTAssertEqual(view.touchInterpreter.holdDelay, 0.6)
     }
 }
 
-// MARK: tap delay and long-press right click (TouchInterpreter)
+// MARK: tap delay and the one-finger hold (TouchInterpreter)
 
 @MainActor
-final class TapDelayAndLongPressTests: XCTestCase {
+final class TapDelayAndHoldTests: XCTestCase {
     private var clock = FakeRepeatClock()
     private var actions: [TouchAction] = []
     private let L = InputController.Button.left
     private let R = InputController.Button.right
     private let p = CGPoint(x: 100, y: 100)
 
-    private func make(delay: TimeInterval = 0.25, longPress: Bool = true) -> TouchInterpreter {
+    private func make(delay: TimeInterval = 0.25, hold: TimeInterval = TouchInterpreter.Tuning.holdDelay)
+        -> TouchInterpreter {
         clock = FakeRepeatClock()
         actions = []
         let t = TouchInterpreter(schedule: clock.schedule) { [weak self] in self?.actions.append($0) }
         t.tapDelay = delay
-        t.longPressRightClick = longPress
+        t.holdDelay = hold
         return t
     }
 
@@ -525,84 +535,44 @@ final class TapDelayAndLongPressTests: XCTestCase {
         XCTAssertEqual(buttonsAndHaptics, [.haptic(.medium)] + click(R))
     }
 
-    // Long-press right click
+    // One-finger hold (left drag)
 
-    func testStillLongPressRightClicksWhenItFires() {
-        let t = make()
+    func testAShortHoldArmsSooner() {
+        let t = make(hold: HoldDragDelay.short.seconds)
         t.began(1, at: p, time: clock.now)
-        clock.advance(by: TouchInterpreter.Tuning.longPress - 0.01)
+        clock.advance(by: 0.29)
         XCTAssertEqual(buttonsAndHaptics, [])
         clock.advance(by: 0.02)
-        XCTAssertEqual(buttonsAndHaptics, [.haptic(.medium)] + click(R))
-        t.ended(1, at: p, time: at(0.3))
-        clock.advance(by: 1)
-        XCTAssertEqual(buttonsAndHaptics, [.haptic(.medium)] + click(R))         // no left click on lift
+        XCTAssertEqual(buttonsAndHaptics, [.haptic(.medium)])
+        t.moved(1, to: CGPoint(x: 160, y: 100), time: at(0.05))
+        t.ended(1, at: CGPoint(x: 160, y: 100), time: at(0.01))
+        XCTAssertEqual(buttonsAndHaptics, [.haptic(.medium)] + click(L))
     }
 
-    func testAfterTheRightClickTheFingerMovesTheCursor() {
-        let t = make()
+    func testALongHoldDelayLetsASlowStillTouchStayNothing() {
+        let t = make(hold: HoldDragDelay.long.seconds)
         t.began(1, at: p, time: clock.now)
-        clock.advance(by: 0.6)
-        t.moved(1, to: CGPoint(x: 160, y: 100), time: at(0.05))
-        t.ended(1, at: CGPoint(x: 160, y: 100), time: at(0.05))
-        XCTAssertTrue(actions.contains { if case .moveBy = $0 { true } else { false } })
-        XCTAssertEqual(buttonsAndHaptics, [.haptic(.medium)] + click(R))
+        t.ended(1, at: p, time: at(0.5))              // past Normal, short of Long; too slow for a tap
+        clock.advance(by: 1)
+        XCTAssertEqual(buttonsAndHaptics, [])
+    }
+
+    func testTheDelayIsReadWhenAHoldStarts() {
+        let t = make(hold: 0.6)
+        t.began(1, at: p, time: clock.now)
+        t.holdDelay = 0.3                              // changed mid-hold: this hold keeps 0.6
+        clock.advance(by: 0.4)
+        XCTAssertEqual(buttonsAndHaptics, [])
+        clock.advance(by: 0.25)
+        XCTAssertEqual(buttonsAndHaptics, [.haptic(.medium)])
     }
 
     func testSmallJitterUnderTheSlopStillCounts() {
         let t = make()
         t.began(1, at: p, time: clock.now)
         t.moved(1, to: CGPoint(x: 104, y: 103), time: at(0.2))
-        clock.advance(by: 0.35)
-        XCTAssertEqual(buttonsAndHaptics, [.haptic(.medium)] + click(R))
-    }
-
-    func testMovingBeforeItFiresIsAMoveNotARightClick() {
-        let t = make()
-        t.began(1, at: p, time: clock.now)
-        t.moved(1, to: CGPoint(x: 140, y: 100), time: at(0.2))
-        clock.advance(by: 0.5)
-        t.ended(1, at: CGPoint(x: 140, y: 100), time: at(0.05))
-        clock.advance(by: 1)
-        XCTAssertEqual(buttonsAndHaptics, [])
-    }
-
-    func testOffALongStillTouchStartsADragUntilItLifts() {
-        let t = make(longPress: false)
-        t.began(1, at: p, time: clock.now)
-        clock.advance(by: TouchInterpreter.Tuning.longPress - 0.05)
-        XCTAssertEqual(buttonsAndHaptics, [], "nothing before the threshold")
-        clock.advance(by: 0.06)
-        XCTAssertEqual(buttonsAndHaptics, [.haptic(.medium), .button(L, down: true)])
-        t.moved(1, to: CGPoint(x: 160, y: 100), time: at(0.05))
-        XCTAssertTrue(actions.contains { if case .moveBy = $0 { true } else { false } }, "the drag moves the cursor")
-        t.ended(1, at: CGPoint(x: 160, y: 100), time: at(0.01))
-        clock.advance(by: 1)
-        XCTAssertEqual(buttonsAndHaptics, [.haptic(.medium), .button(L, down: true), .button(L, down: false)])
-    }
-
-    func testOffMovingBeforeTheThresholdIsJustAMove() {
-        let t = make(longPress: false)
-        t.began(1, at: p, time: clock.now)
-        t.moved(1, to: CGPoint(x: 160, y: 100), time: at(0.1))
-        clock.advance(by: 1)
-        t.ended(1, at: CGPoint(x: 160, y: 100), time: at(0.01))
-        XCTAssertEqual(buttonsAndHaptics, [])
-    }
-
-    func testOffLongPressUnderTheDragLockDoesNotPressAgain() {
-        let t = make(longPress: false)
-        // Three-finger drag engages the lock.
-        t.began(1, at: CGPoint(x: 100, y: 100), time: clock.now)
-        t.began(2, at: CGPoint(x: 150, y: 100), time: at(0.01))
-        t.began(3, at: CGPoint(x: 200, y: 100), time: at(0.01))
-        for (i, x) in [100.0, 150, 200].enumerated() { t.moved(i + 1, to: CGPoint(x: x, y: 140), time: at(0.01)) }
-        for i in 1...3 { t.ended(i, at: CGPoint(x: 0, y: 140), time: at(0.01)) }
-        XCTAssertTrue(t.dragLocked)
-        actions = []
-        t.began(4, at: p, time: clock.now)
-        clock.advance(by: 1)
-        XCTAssertEqual(buttonsAndHaptics, [], "the lock already holds the button")
+        clock.advance(by: 0.3)
+        XCTAssertEqual(buttonsAndHaptics, [.haptic(.medium)])
     }
 
     func testAQuickTapIsStillALeftClick() {
@@ -612,43 +582,15 @@ final class TapDelayAndLongPressTests: XCTestCase {
         XCTAssertEqual(buttonsAndHaptics, [.haptic(.light)] + click(L))
     }
 
-    func testDoubleTapAndHoldIsStillADragNotARightClick() {
+    func testDoubleTapAndHoldIsStillADragNotAHold() {
         let t = make()
         tap(t)
         clock.advance(by: 0.1)
         t.began(2, at: p, time: clock.now)
-        clock.advance(by: 0.8)                    // held well past the long press
+        clock.advance(by: 0.8)                    // held well past the hold delay
         t.ended(2, at: p, time: at(0.01))
         clock.advance(by: 1)
         XCTAssertEqual(buttonsAndHaptics, [.haptic(.medium), .button(L, down: true), .button(L, down: false)])
-    }
-
-    func testSecondFingerBeforeItFiresCancelsIt() {
-        let t = make()
-        t.began(1, at: p, time: clock.now)
-        t.began(2, at: CGPoint(x: 160, y: 100), time: at(0.2))
-        t.moved([1: CGPoint(x: 100, y: 140), 2: CGPoint(x: 160, y: 140)], time: at(0.1))   // a scroll
-        clock.advance(by: 0.5)
-        t.ended(1, at: CGPoint(x: 100, y: 140), time: at(0.01))
-        t.ended(2, at: CGPoint(x: 160, y: 140), time: at(0.01))
-        XCTAssertEqual(buttonsAndHaptics.filter { $0 == .button(R, down: true) }, [])
-    }
-
-    func testNoRightClickUnderTheDragLock() {
-        let t = make()
-        // Three-finger drag engages the lock.
-        t.began(1, at: p, time: clock.now)
-        t.began(2, at: CGPoint(x: 140, y: 100), time: clock.now)
-        t.began(3, at: CGPoint(x: 180, y: 100), time: clock.now)
-        t.moved([1: CGPoint(x: 100, y: 140), 2: CGPoint(x: 140, y: 140), 3: CGPoint(x: 180, y: 140)],
-                time: at(0.05))
-        for id in 1...3 { t.ended(id, at: .zero, time: at(0.01)) }
-        XCTAssertTrue(t.dragLocked)
-        actions = []
-        t.began(4, at: p, time: clock.now)
-        clock.advance(by: 0.8)
-        XCTAssertEqual(buttonsAndHaptics, [])
-        XCTAssertTrue(t.dragLocked)
     }
 
     func testCancelBeforeItFiresDropsIt() {
@@ -657,15 +599,6 @@ final class TapDelayAndLongPressTests: XCTestCase {
         t.cancel()
         clock.advance(by: 1)
         XCTAssertEqual(buttonsAndHaptics, [])
-    }
-
-    func testDirectModeLongPressIsUnchanged() {
-        let t = make()
-        t.mode = .direct
-        t.began(1, at: p, time: clock.now)
-        clock.advance(by: 0.6)
-        t.ended(1, at: p, time: at(0.01))
-        XCTAssertEqual(buttonsAndHaptics, [.haptic(.medium)] + click(R))
     }
 }
 

@@ -11,11 +11,12 @@
 //   fingers, and the hardware trackpad/mouse follows the iPad's own
 //   setting); Reversed flips the sign of every scroll sent to the Mac —
 //   touch (+ momentum), wheel, hardware continuous and pointer-lock.
-// - Long-press to right-click ("input.longPressRightClick", default OFF —
-//   two-finger tap is the usual trackpad right click): trackpad mode, one
-//   finger held still for TouchInterpreter.Tuning.longPress is a right click
-//   (with a haptic) instead of starting a drag —
-//   TouchInterpreter.longPressRightClick.
+// - Touch-and-Hold Drag Delay (HoldDragDelay, "input.holdDelay"): how long
+//   one, two or three still fingers take to arm a left / right / middle
+//   drag (TouchInterpreter.holdDelay). Short 0.3 s, Normal 0.45 s (default),
+//   Long 0.6 s.
+// (The old "input.longPressRightClick" toggle is gone: two-finger tap is the
+// right click and a two-finger hold a right drag. A stored value is ignored.)
 // - Pointer Speed / Touch Pointer Speed ("input.pointerSpeed",
 //   "input.touchPointerSpeed", 0.25×–3×, default 1×): PointerScaling.swift.
 // - Keyboard Tester ("input.keyboardTester", default off): a diagnostic
@@ -67,14 +68,38 @@ enum ScrollDirection: String, CaseIterable, Sendable {
     }
 }
 
+enum HoldDragDelay: String, CaseIterable, Sendable {
+    case short
+    case normal
+    case long
+
+    static let defaultsKey = "input.holdDelay"
+    static let `default` = HoldDragDelay.normal
+
+    /// Seconds still fingers take to arm a hold-drag.
+    var seconds: TimeInterval {
+        switch self {
+        case .short: 0.3
+        case .normal: 0.45
+        case .long: 0.6
+        }
+    }
+
+    var title: String {
+        switch self {
+        case .short: "Short"
+        case .normal: "Normal"
+        case .long: "Long"
+        }
+    }
+}
+
 struct InputPreferences: Equatable, Sendable {
-    static let longPressRightClickKey = "input.longPressRightClick"
-    static let longPressRightClickDefault = false
     static let keyboardTesterKey = "input.keyboardTester"
 
     var tapDelay = TapClickDelay.default
     var scrollDirection = ScrollDirection.default
-    var longPressRightClick = InputPreferences.longPressRightClickDefault
+    var holdDelay = HoldDragDelay.default
     var keyboardTester = false
     /// Hardware mouse / trackpad under pointer lock (PointerScaling).
     var pointerSpeed = PointerScaling.defaultSpeed
@@ -90,8 +115,8 @@ struct InputPreferences: Equatable, Sendable {
         if let raw = d.string(forKey: ScrollDirection.defaultsKey), let v = ScrollDirection(rawValue: raw) {
             p.scrollDirection = v
         }
-        if d.object(forKey: longPressRightClickKey) != nil {
-            p.longPressRightClick = d.bool(forKey: longPressRightClickKey)
+        if let raw = d.string(forKey: HoldDragDelay.defaultsKey), let v = HoldDragDelay(rawValue: raw) {
+            p.holdDelay = v
         }
         p.keyboardTester = d.bool(forKey: keyboardTesterKey)
         if d.object(forKey: PointerScaling.pointerSpeedKey) != nil {

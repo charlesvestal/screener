@@ -108,6 +108,8 @@ private struct CoachIconView: View {
                 }
             case .scroll:
                 base.offset(y: animated ? (phase ? 16 : -16) : 0)
+            case .swipe:
+                base.offset(x: animated ? (phase ? 22 : -22) : 0)
             case .pinch:
                 HStack(spacing: animated ? (phase ? 44 : 20) : 32) {
                     Image(systemName: "hand.point.up.left.fill").font(.system(size: 28))

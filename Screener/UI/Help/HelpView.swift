@@ -46,7 +46,11 @@ struct HelpView: View {
         Section("Gestures") {
             VStack(alignment: .leading, spacing: 6) {
                 Text(LocalizedStringKey("Screener turns finger touches into clicks, drags, scrolling and zoom — "
-                     + "in either **Trackpad** or **Touch** mode (Settings › Input)."))
+                     + "in either **Trackpad** or **Touch** mode (Settings › Input). Tap to click; tap with two "
+                     + "fingers to right-click, three to middle-click. Touch and hold with one, two or three "
+                     + "fingers until the **blue**, **red** or **green** ring appears, then drag for a left, "
+                     + "right or middle drag. Swipe three fingers left or right to switch Spaces, up for "
+                     + "Mission Control, down for App Exposé."))
                     .font(.subheadline)
                 Button("Show the Gesture Coach") { showCoach = true }
                     .buttonStyle(.bordered)

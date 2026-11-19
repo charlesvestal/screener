@@ -16,8 +16,7 @@ struct SettingsView: View {
     @AppStorage(ScreenerSettings.keepAwakeKey) private var keepAwake = ScreenerSettings.keepAwakeDefault
     @AppStorage(TapClickDelay.defaultsKey) private var tapDelayRaw = TapClickDelay.default.rawValue
     @AppStorage(ScrollDirection.defaultsKey) private var scrollDirectionRaw = ScrollDirection.default.rawValue
-    @AppStorage(InputPreferences.longPressRightClickKey) private var longPressRightClick =
-        InputPreferences.longPressRightClickDefault
+    @AppStorage(HoldDragDelay.defaultsKey) private var holdDelayRaw = HoldDragDelay.default.rawValue
     @AppStorage(InputPreferences.keyboardTesterKey) private var keyboardTester = false
     @AppStorage(PointerScaling.pointerSpeedKey) private var pointerSpeed = PointerScaling.defaultSpeed
     @AppStorage(PointerScaling.touchPointerSpeedKey) private var touchPointerSpeed = PointerScaling.defaultSpeed
@@ -87,7 +86,11 @@ struct SettingsView: View {
                             Text(d.title).tag(d.rawValue)
                         }
                     }
-                    Toggle("Long-Press to Right-Click", isOn: $longPressRightClick)
+                    Picker("Touch-and-Hold Drag Delay", selection: $holdDelayRaw) {
+                        ForEach(HoldDragDelay.allCases, id: \.self) { d in
+                            Text(d.title).tag(d.rawValue)
+                        }
+                    }
                     Toggle("Keyboard Tester", isOn: $keyboardTester)
                     Toggle("Visual Feedback", isOn: $visualFeedback)
                 } header: {
@@ -98,9 +101,10 @@ struct SettingsView: View {
                          + "captured (full screen); Touch Pointer Speed sets it for finger moves in Trackpad mode. "
                          + "Scroll Direction: Natural follows the iPad; Reversed flips every scroll. "
                          + "Tap to Click Delay is how long a tap waits for a double tap or tap-and-drag: Fast "
-                         + "clicks sooner, Relaxed gives more time. Right-click is two fingers, tap together. "
-                         + "In Trackpad mode, holding one finger still starts a drag; Long-Press to Right-Click "
-                         + "(off by default) makes it right-click instead. Shake the pointer to find it. "
+                         + "clicks sooner, Relaxed gives more time. Two fingers tap to right-click, three to "
+                         + "middle-click. Touch and hold with one, two or three fingers until the blue, red or "
+                         + "green ring appears, then drag for a left, right or middle drag; Touch-and-Hold Drag "
+                         + "Delay sets how long that hold takes. Shake the pointer to find it. "
                          + "Visual Feedback shows where touches and clicks land. Keyboard Tester lists the last "
                          + "hardware key events on screen during a session (for checking a keyboard).")
                 }

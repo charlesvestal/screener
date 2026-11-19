@@ -35,16 +35,20 @@
 //   scrolls (PixelScroll, then ScrollInertia momentum on a display link —
 //   stopped by any new touch), pinch zoom / pan / reset (Viewport, shared with
 //   MetalRenderer through ViewportModel) and haptics (touch only; a hardware
-//   pointer never triggers one). Pencil hover moves the cursor through the
+//   pointer never triggers one), and a three-finger swipe's key chord (the
+//   menu's modifier holds, so they never double up with a held key).
+//   `editingInteractionConfiguration` is `.none` here and on the soft
+//   keyboard proxy, so iPadOS's three-finger edit gestures (undo/redo
+//   swipes, copy/paste pinches) never take those touches. Pencil hover moves the cursor through the
 //   hover recognizer; a Pencil double-tap / squeeze is a right click at the
 //   cursor (UIPencilInteraction, unless the user set it to do nothing).
 // Visual feedback (`feedback`, a FeedbackSink — UI/Feedback): touch clicks,
-//   drags, the drag lock, trackpad finger-downs, direct-mode long presses
+//   drags (tinted by button), trackpad finger-downs, hold progress rings
 //   (TouchInterpreter's TouchCues), touch cursor moves, zooms and touch
 //   scrolls / momentum are reported as FeedbackEvents (cursor points in
 //   BASE, unzoomed view coordinates). Hardware pointer input reports none.
-// Input preferences (InputPreferences: tap-to-click delay, scroll direction,
-//   long-press right click): read from UserDefaults when a session's input
+// Input preferences (InputPreferences: tap-to-click delay, touch-and-hold
+//   drag delay, scroll direction, pointer speeds): read from UserDefaults when a session's input
 //   arrives and again on every UserDefaults change (live), applied to the
 //   TouchInterpreter and the scroll paths.
 // Locating the cursor: every relative pointer motion (trackpad-mode moves,
@@ -146,7 +150,7 @@ final class RemoteInputView: UIView, UIPointerInteractionDelegate, UIGestureReco
         didSet { if viewport !== oldValue { viewport.update { $0.reset() } } }
     }
     /// The floating menu is open: the pointer lock is released and touch
-    /// gestures (a drag lock too) are cancelled.
+    /// gestures are cancelled (anything they hold is released).
     var menuOpen = false {
         didSet {
             guard menuOpen != oldValue else { return }
@@ -216,11 +220,11 @@ final class RemoteInputView: UIView, UIPointerInteractionDelegate, UIGestureReco
     var onPointerMoved: ((CGPoint?) -> Void)?
     /// Visual touch feedback (ripples, halo, HUDs).
     weak var feedback: FeedbackSink?
-    /// Settings → Input (tap delay, scroll direction, long-press right click).
+    /// Settings → Input (tap delay, hold-drag delay, scroll direction, …).
     var preferences = InputPreferences() {
         didSet {
             touchInterpreter.tapDelay = preferences.tapDelay.seconds
-            touchInterpreter.longPressRightClick = preferences.longPressRightClick
+            touchInterpreter.holdDelay = preferences.holdDelay.seconds
             if preferences.keyboardTester != oldValue.keyboardTester { updateKeyTester() }
         }
     }
@@ -255,7 +259,7 @@ final class RemoteInputView: UIView, UIPointerInteractionDelegate, UIGestureReco
         let t = TouchInterpreter(schedule: schedule) { [weak self] in self?.perform($0) }
         t.mode = touchMode
         t.tapDelay = preferences.tapDelay.seconds
-        t.longPressRightClick = preferences.longPressRightClick
+        t.holdDelay = preferences.holdDelay.seconds
         t.isZoomed = { [weak self] in self?.viewport.value.isZoomed ?? false }
         t.onCue = { [weak self] in self?.handleCue($0) }
         return t
@@ -375,6 +379,10 @@ final class RemoteInputView: UIView, UIPointerInteractionDelegate, UIGestureReco
     // MARK: first responder (hardware keyboard)
 
     override var canBecomeFirstResponder: Bool { true }
+
+    /// No iPadOS three-finger edit gestures (undo/redo swipes, copy/paste
+    /// pinches): three fingers are Screener's (middle click/drag, swipes).
+    override var editingInteractionConfiguration: UIEditingInteractionConfiguration { .none }
 
     override func willMove(toWindow newWindow: UIWindow?) {
         super.willMove(toWindow: newWindow)
@@ -766,7 +774,6 @@ final class RemoteInputView: UIView, UIPointerInteractionDelegate, UIGestureReco
         }
         stopInertia()
         guard !pointerLocked else { return }          // GCMouse has the buttons
-        if touchInterpreter.dragLocked { touchInterpreter.cancel() }   // a real click ends a touch drag lock
         let m = Self.mask(event?.buttonMask ?? .primary)
         pointerDown(buttons: m == 0 ? InputController.Button.left : m, at: t.location(in: self))
     }
@@ -964,7 +971,19 @@ final class RemoteInputView: UIView, UIPointerInteractionDelegate, UIGestureReco
         case .haptic(let h):
             let g = h == .light ? lightImpact : mediumImpact
             g.impactOccurred()
+        case .keyChord(let chord):
+            sendChord(chord)
         }
+    }
+
+    /// Taps a key chord: modifiers held (reference-counted with any other
+    /// holds), the key down/up, the modifiers released in reverse.
+    func sendChord(_ chord: KeyChord) {
+        guard input != nil else { return }
+        for m in chord.modifiers { holdModifier(m) }
+        sendKey(down: true, keysym: chord.key)
+        sendKey(down: false, keysym: chord.key)
+        for m in chord.modifiers.reversed() { releaseModifier(m) }
     }
 
     /// Presses / releases `button` at the cursor (placed mid-screen if it
@@ -1021,19 +1040,19 @@ final class RemoteInputView: UIView, UIPointerInteractionDelegate, UIGestureReco
             } else {
                 feedback.feedback(count >= 2 ? .doubleClick(at: p) : .click(at: p))
             }
-        case .dragBegan:
+        case .dragBegan(let button):
             guard let p = cursorBasePoint else { return }
-            feedback.feedback(.dragBegan(at: p))
+            feedback.feedback(.dragBegan(at: p, button: button))
         case .dragEnded:
             feedback.feedback(.dragEnded)
-        case .dragLock(let on):
-            feedback.feedback(.dragLock(active: on, at: cursorBasePoint))
-        case .longPressArmed(let p, let duration):
-            feedback.feedback(.longPressBegan(at: p, duration: duration))
-        case .longPressFired:
-            feedback.feedback(.longPressEnded(fired: true))
-        case .longPressCancelled:
-            feedback.feedback(.longPressEnded(fired: false))
+        case .holdArmed(let p, let duration, let button):
+            // Touch: at the fingers; Trackpad: at the cursor.
+            guard let at = p ?? cursorViewPoint else { return }
+            feedback.feedback(.holdBegan(at: at, duration: duration, button: button))
+        case .holdFired:
+            feedback.feedback(.holdEnded(fired: true))
+        case .holdCancelled:
+            feedback.feedback(.holdEnded(fired: false))
         }
     }
 
@@ -1160,7 +1179,6 @@ final class RemoteInputView: UIView, UIPointerInteractionDelegate, UIGestureReco
     private func lockedButton(_ button: Int, pressed: Bool) {
         guard pointerLocked else { return }
         stopInertia()
-        if pressed, touchInterpreter.dragLocked { touchInterpreter.cancel() }
         pressButton(button, down: pressed)
     }
 
@@ -1533,6 +1551,9 @@ final class SoftKeyboardProxy: UIView, UIKeyInput {
     required init?(coder: NSCoder) { fatalError("init(coder:) is not used") }
 
     override var canBecomeFirstResponder: Bool { true }
+
+    /// As RemoteInputView: three fingers stay Screener's while typing.
+    override var editingInteractionConfiguration: UIEditingInteractionConfiguration { .none }
 
     override func resignFirstResponder() -> Bool {
         let did = super.resignFirstResponder()

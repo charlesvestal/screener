@@ -75,7 +75,7 @@ final class RippleFieldTests: XCTestCase {
         XCTAssertLessThanOrEqual(f.samples(at: 0.12).count, RippleField.maxCount)
     }
 
-    func testDragLockPulsePersistsFollowsAndStops() {
+    func testDragPulsePersistsFollowsAndStops() {
         var f = RippleField()
         f.setPulse(at: p, now: 0, reduceMotion: false)
         XCTAssertTrue(f.isAnimating(at: 100))
@@ -103,6 +103,31 @@ final class RippleFieldTests: XCTestCase {
         // It breathes, and is always stronger than a click's rim at birth.
         XCTAssertGreaterThan(rims.map(\.rim).max()! - rims.map(\.rim).min()!, 0.1)
         XCTAssertGreaterThan(rims.map(\.rim).min()!, RippleField.clickRimAlpha)
+    }
+
+    func testDragPulseTakesTheButtonsTintAndKeepsItWhileMoving() {
+        var f = RippleField()
+        f.setPulse(at: p, now: 0, reduceMotion: false, tint: DragIndicatorTint.right)
+        XCTAssertEqual(f.samples(at: 0.2)[0].rimTint, DragIndicatorTint.right)
+        f.movePulse(to: CGPoint(x: 9, y: 9))
+        XCTAssertEqual(f.samples(at: 0.4)[0].rimTint, DragIndicatorTint.right)
+        // Re-set while on: the tint follows (a new drag's button).
+        f.setPulse(at: p, now: 0.5, reduceMotion: false, tint: DragIndicatorTint.middle)
+        XCTAssertEqual(f.samples(at: 0.6)[0].rimTint, DragIndicatorTint.middle)
+        // Reduce Motion keeps the tint too.
+        var r = RippleField()
+        r.setPulse(at: p, now: 0, reduceMotion: true, tint: DragIndicatorTint.middle)
+        XCTAssertEqual(r.samples(at: 1)[0].rimTint, DragIndicatorTint.middle)
+    }
+
+    func testIndicatorTintsAreBlueRedGreenByButton() {
+        XCTAssertEqual(DragIndicatorTint.rgb(for: InputController.Button.left), DragIndicatorTint.left)
+        XCTAssertEqual(DragIndicatorTint.rgb(for: InputController.Button.right), DragIndicatorTint.right)
+        XCTAssertEqual(DragIndicatorTint.rgb(for: InputController.Button.middle), DragIndicatorTint.middle)
+        // Blue, red, green: the dominant channel.
+        XCTAssertGreaterThan(DragIndicatorTint.left.z, max(DragIndicatorTint.left.x, DragIndicatorTint.left.y))
+        XCTAssertGreaterThan(DragIndicatorTint.right.x, max(DragIndicatorTint.right.y, DragIndicatorTint.right.z))
+        XCTAssertGreaterThan(DragIndicatorTint.middle.y, max(DragIndicatorTint.middle.x, DragIndicatorTint.middle.z))
     }
 
     func testReduceMotionGivesInPlaceFadesWithoutDistortion() {
@@ -201,7 +226,7 @@ final class FeedbackCenterTests: XCTestCase {
         let c = make()
         var redraws = 0
         c.onChange = { redraws += 1 }
-        c.feedback(.dragBegan(at: CGPoint(x: 1, y: 1)))
+        c.feedback(.dragBegan(at: CGPoint(x: 1, y: 1), button: InputController.Button.left))
         XCTAssertEqual(redraws, 1)
         XCTAssertTrue(c.needsFrames(at: clock.now + 5))
         c.feedback(.cursorMoved(to: CGPoint(x: 20, y: 30)))
@@ -217,8 +242,7 @@ final class FeedbackCenterTests: XCTestCase {
         c.onChange = { redraws += 1 }
         c.feedback(.click(at: .zero))
         c.feedback(.rightClick(at: .zero))
-        c.feedback(.dragBegan(at: .zero))
-        c.feedback(.dragLock(active: true, at: .zero))
+        c.feedback(.dragBegan(at: .zero, button: InputController.Button.right))
         c.feedback(.fingerDown)
         c.feedback(.scrolled(dy: 10))
         XCTAssertEqual(redraws, 0)
@@ -228,8 +252,8 @@ final class FeedbackCenterTests: XCTestCase {
         // Informational HUDs stay.
         c.feedback(.zoomChanged(scale: 2))
         XCTAssertEqual(c.zoomPill, 2)
-        c.feedback(.longPressBegan(at: .zero, duration: 0.5))
-        XCTAssertNotNil(c.longPress)
+        c.feedback(.holdBegan(at: .zero, duration: 0.5, button: InputController.Button.middle))
+        XCTAssertNotNil(c.hold, "the hold ring is informational: shown with visual feedback off")
     }
 
     func testReduceMotionHasNoDistortionOrHaloScale() {
@@ -313,26 +337,40 @@ final class FeedbackCenterTests: XCTestCase {
         XCTAssertNil(c.scrollPill)
     }
 
-    func testLongPressRingCancelsAtOnceAndFlashesWhenFired() {
+    func testHoldRingCancelsAtOnceAndFlashesWhenFired() {
         let c = make()
-        c.feedback(.longPressBegan(at: CGPoint(x: 3, y: 4), duration: 0.5))
-        XCTAssertEqual(c.longPress?.point, CGPoint(x: 3, y: 4))
-        c.feedback(.longPressEnded(fired: false))
-        XCTAssertNil(c.longPress)
-        c.feedback(.longPressBegan(at: .zero, duration: 0.5))
-        c.feedback(.longPressEnded(fired: true))
-        XCTAssertEqual(c.longPress?.fired, true)
-        clock.advance(by: FeedbackCenter.longPressFlash + 0.01)
-        XCTAssertNil(c.longPress)
+        c.feedback(.holdBegan(at: CGPoint(x: 3, y: 4), duration: 0.45, button: InputController.Button.right))
+        XCTAssertEqual(c.hold?.point, CGPoint(x: 3, y: 4))
+        XCTAssertEqual(c.hold?.button, InputController.Button.right)
+        XCTAssertEqual(c.hold?.duration, 0.45)
+        c.feedback(.holdEnded(fired: false))
+        XCTAssertNil(c.hold)
+        c.feedback(.holdBegan(at: .zero, duration: 0.45, button: InputController.Button.left))
+        c.feedback(.holdEnded(fired: true))
+        XCTAssertEqual(c.hold?.fired, true)
+        clock.advance(by: FeedbackCenter.holdFlash + 0.01)
+        XCTAssertNil(c.hold)
     }
 
-    func testDragLockPulseFollowsTheCursorUntilReleased() {
+    func testANewHoldDuringTheFlashReplacesIt() {
         let c = make()
-        c.feedback(.dragLock(active: true, at: CGPoint(x: 1, y: 1)))
+        c.feedback(.holdBegan(at: .zero, duration: 0.45, button: InputController.Button.left))
+        c.feedback(.holdEnded(fired: true))
+        c.feedback(.holdBegan(at: CGPoint(x: 8, y: 8), duration: 0.45, button: InputController.Button.middle))
+        clock.advance(by: FeedbackCenter.holdFlash + 0.01)
+        XCTAssertEqual(c.hold?.button, InputController.Button.middle, "the old flash's timer doesn't clear it")
+        XCTAssertEqual(c.hold?.fired, false)
+    }
+
+    func testDragPulseIsTintedByButtonAndFollowsTheCursorUntilEnded() {
+        let c = make()
+        c.feedback(.dragBegan(at: CGPoint(x: 1, y: 1), button: InputController.Button.middle))
         c.feedback(.cursorMoved(to: CGPoint(x: 50, y: 60)))
-        XCTAssertEqual(c.gpuState(at: clock.now + 0.2).ripples.last?.center, CGPoint(x: 50, y: 60))
+        let s = c.gpuState(at: clock.now + 0.2).ripples.last
+        XCTAssertEqual(s?.center, CGPoint(x: 50, y: 60))
+        XCTAssertEqual(s?.rimTint, DragIndicatorTint.middle)
         XCTAssertTrue(c.needsFrames(at: clock.now + 5))
-        c.feedback(.dragLock(active: false, at: nil))
+        c.feedback(.dragEnded)
         XCTAssertFalse(c.needsFrames(at: clock.now + 5))
     }
 }
@@ -346,6 +384,7 @@ final class FeedbackCueTests: XCTestCase {
     private var zoomed = false
     private let L = InputController.Button.left
     private let R = InputController.Button.right
+    private let M = InputController.Button.middle
 
     private func make(_ mode: TouchInputMode = .trackpad) -> TouchInterpreter {
         clock = FakeRepeatClock()
@@ -363,6 +402,16 @@ final class FeedbackCueTests: XCTestCase {
         return clock.now
     }
 
+    private static func isHold(_ c: TouchCue) -> Bool {
+        switch c {
+        case .holdArmed, .holdFired, .holdCancelled: true
+        default: false
+        }
+    }
+
+    /// The cues without the hold ring's (armed / fired / cancelled).
+    private var plain: [TouchCue] { cues.filter { !Self.isHold($0) } }
+
     /// The ripple cue fires the moment the tap is recognised (touch-up); the
     /// actual click (haptic + button, TouchAction, tested in
     /// TrackpadModeTests) still waits for the tap-drag window.
@@ -370,9 +419,12 @@ final class FeedbackCueTests: XCTestCase {
         let t = make()
         t.began(1, at: CGPoint(x: 10, y: 10), time: at(0))
         t.ended(1, at: CGPoint(x: 10, y: 10), time: at(0.1))
-        XCTAssertEqual(cues, [.fingerDown, .click(button: L, count: 1)], "the ripple cue, right away")
+        XCTAssertEqual(plain, [.fingerDown, .click(button: L, count: 1)], "the ripple cue, right away")
         _ = at(TouchInterpreter.Tuning.tapDragWindow + 0.01)
-        XCTAssertEqual(cues, [.fingerDown, .click(button: L, count: 1)], "no second cue once the click is sent")
+        XCTAssertEqual(plain, [.fingerDown, .click(button: L, count: 1)], "no second cue once the click is sent")
+        XCTAssertEqual(cues.filter(Self.isHold), [
+            .holdArmed(at: nil, duration: TouchInterpreter.Tuning.holdDelay, button: L), .holdCancelled,
+        ], "the hold armed at the touch and was dropped by the tap")
     }
 
     /// Each tap of a double tap rings on its own touch-up: the first tap's
@@ -381,12 +433,12 @@ final class FeedbackCueTests: XCTestCase {
         let t = make()
         t.began(1, at: .zero, time: at(0))
         t.ended(1, at: .zero, time: at(0.08))
-        XCTAssertEqual(cues, [.fingerDown, .click(button: L, count: 1)], "the first tap's ring, immediately")
+        XCTAssertEqual(plain, [.fingerDown, .click(button: L, count: 1)], "the first tap's ring, immediately")
         t.began(2, at: .zero, time: at(0.1))
         t.ended(2, at: .zero, time: at(0.08))
-        XCTAssertEqual(cues, [.fingerDown, .click(button: L, count: 1), .fingerDown, .click(button: L, count: 1)])
+        XCTAssertEqual(plain, [.fingerDown, .click(button: L, count: 1), .fingerDown, .click(button: L, count: 1)])
         _ = at(1)
-        XCTAssertEqual(cues.count, 4, "no further cue once both clicks are actually sent")
+        XCTAssertEqual(plain.count, 4, "no further cue once both clicks are actually sent")
     }
 
     /// The first tap's ring already fired at its touch-up (its click was
@@ -397,7 +449,7 @@ final class FeedbackCueTests: XCTestCase {
         t.ended(1, at: .zero, time: at(0.08))
         t.began(2, at: .zero, time: at(0.1))
         t.moved(2, to: CGPoint(x: 40, y: 0), time: at(0.05))
-        XCTAssertEqual(cues, [.fingerDown, .click(button: L, count: 1), .fingerDown, .dragBegan])
+        XCTAssertEqual(plain, [.fingerDown, .click(button: L, count: 1), .fingerDown, .dragBegan(button: L)])
     }
 
     func testTrackpadTapDragEndsWithDragEndedOnLift() {
@@ -434,71 +486,104 @@ final class FeedbackCueTests: XCTestCase {
         XCTAssertEqual(cues.filter { $0 == .click(button: R, count: 1) }.count, 1, "no second cue when it's sent")
     }
 
-    func testThreeFingerDragLocksAndATapReleases() {
+    func testTrackpadHoldArmsAtTheCursorFiresAndShowsTheDragIndicator() {
         let t = make()
-        let p = [CGPoint(x: 10, y: 10), CGPoint(x: 40, y: 10), CGPoint(x: 70, y: 10)]
-        for (i, q) in p.enumerated() { t.began(i, at: q, time: at(0.01)) }
-        t.moved(Dictionary(uniqueKeysWithValues: p.enumerated().map { ($0, CGPoint(x: $1.x, y: $1.y + 40)) }),
-                time: at(0.05))
-        XCTAssertEqual(cues.filter { if case .dragLock = $0 { true } else { false } }, [.dragLock(true)])
-        for i in 0..<3 { t.ended(i, at: .zero, time: at(0.01)) }
-        t.began(9, at: .zero, time: at(0.3))
-        t.ended(9, at: .zero, time: at(0.05))
-        XCTAssertEqual(cues.last, .dragLock(false))
+        t.began(1, at: CGPoint(x: 30, y: 40), time: at(0))
+        XCTAssertEqual(cues, [.fingerDown, .holdArmed(at: nil, duration: TouchInterpreter.Tuning.holdDelay, button: L)])
+        _ = at(TouchInterpreter.Tuning.holdDelay + 0.01)
+        XCTAssertEqual(Array(cues.suffix(2)), [.holdFired, .dragBegan(button: L)])
+        t.moved(1, to: CGPoint(x: 80, y: 40), time: at(0.05))
+        XCTAssertEqual(cues.count, 4, "pressing the button on the move adds no cue")
+        t.ended(1, at: CGPoint(x: 80, y: 40), time: at(0.05))
+        XCTAssertEqual(cues.last, .dragEnded)
     }
 
-    func testCancelReleasesTheDragLockCue() {
+    func testAStillHoldReleasedEndsTheIndicator() {
         let t = make()
-        let p = [CGPoint(x: 10, y: 10), CGPoint(x: 40, y: 10), CGPoint(x: 70, y: 10)]
-        for (i, q) in p.enumerated() { t.began(i, at: q, time: at(0.01)) }
-        t.moved(Dictionary(uniqueKeysWithValues: p.enumerated().map { ($0, CGPoint(x: $1.x + 40, y: $1.y)) }),
-                time: at(0.05))
+        t.began(1, at: .zero, time: at(0))
+        _ = at(1)
+        t.ended(1, at: .zero, time: at(0.05))
+        XCTAssertEqual(Array(cues.suffix(3)), [.holdFired, .dragBegan(button: L), .dragEnded])
+    }
+
+    func testTwoFingerHoldIsARedRightDragIndicator() {
+        let t = make()
+        t.began(1, at: CGPoint(x: 10, y: 10), time: at(0))
+        t.began(2, at: CGPoint(x: 60, y: 10), time: at(0.02))
+        XCTAssertEqual(Array(cues.suffix(2)), [
+            .holdCancelled, .holdArmed(at: nil, duration: TouchInterpreter.Tuning.holdDelay, button: R),
+        ], "the one-finger hold gives way to the two-finger one")
+        _ = at(TouchInterpreter.Tuning.holdDelay + 0.01)
+        XCTAssertEqual(Array(cues.suffix(2)), [.holdFired, .dragBegan(button: R)])
+    }
+
+    func testThreeFingerHoldIsAGreenMiddleDragIndicator() {
+        let t = make()
+        for (i, x) in [10.0, 40, 70].enumerated() { t.began(i, at: CGPoint(x: x, y: 10), time: at(0.01)) }
+        XCTAssertEqual(cues.last, .holdArmed(at: nil, duration: TouchInterpreter.Tuning.holdDelay, button: M))
+        _ = at(TouchInterpreter.Tuning.holdDelay + 0.01)
+        XCTAssertEqual(Array(cues.suffix(2)), [.holdFired, .dragBegan(button: M)])
         t.cancel()
-        XCTAssertEqual(cues.last, .dragLock(false))
+        XCTAssertEqual(cues.last, .dragEnded)
     }
 
-    func testDirectLongPressArmsFiresThenRightClicks() {
+    func testDirectHoldArmsAtTheFingersCentroid() {
         let t = make(.direct)
-        let p = CGPoint(x: 30, y: 40)
-        t.began(1, at: p, time: at(0))
-        XCTAssertEqual(cues, [.longPressArmed(at: p, duration: TouchInterpreter.Tuning.longPress)])
-        _ = at(TouchInterpreter.Tuning.longPress + 0.01)
-        XCTAssertEqual(cues.last, .longPressFired)
-        t.ended(1, at: p, time: at(0.1))
-        XCTAssertEqual(cues.last, .click(button: R, count: 1))
+        t.began(1, at: CGPoint(x: 100, y: 100), time: at(0))
+        XCTAssertEqual(cues, [.holdArmed(at: CGPoint(x: 100, y: 100), duration: TouchInterpreter.Tuning.holdDelay,
+                                         button: L)])
+        t.began(2, at: CGPoint(x: 200, y: 100), time: at(0.02))
+        XCTAssertEqual(cues.last, .holdArmed(at: CGPoint(x: 150, y: 100), duration: TouchInterpreter.Tuning.holdDelay,
+                                             button: R))
     }
 
-    func testDirectMoveCancelsTheLongPressAndStartsADrag() {
+    func testHoldCueUsesTheConfiguredDelay() {
+        let t = make()
+        t.holdDelay = HoldDragDelay.long.seconds
+        t.began(1, at: .zero, time: at(0))
+        XCTAssertEqual(cues.last, .holdArmed(at: nil, duration: 0.6, button: L))
+    }
+
+    func testScrollCancelsTheTwoFingerHold() {
+        let t = make()
+        t.began(1, at: CGPoint(x: 10, y: 10), time: at(0))
+        t.began(2, at: CGPoint(x: 60, y: 10), time: at(0.01))
+        t.moved([1: CGPoint(x: 10, y: 50), 2: CGPoint(x: 60, y: 50)], time: at(0.05))
+        XCTAssertEqual(cues.last, .holdCancelled)
+        _ = at(1)
+        XCTAssertFalse(cues.contains(.holdFired))
+    }
+
+    func testThreeFingerTapIsAMiddleClick() {
+        let t = make()
+        for (i, x) in [10.0, 40, 70].enumerated() { t.began(i, at: CGPoint(x: x, y: 10), time: at(0.01)) }
+        for i in 0..<3 { t.ended(i, at: .zero, time: at(0.02)) }
+        XCTAssertEqual(cues.last, .click(button: M, count: 1))
+    }
+
+    func testDirectTouchDragIsALeftDragIndicator() {
         let t = make(.direct)
         t.began(1, at: .zero, time: at(0))
         t.moved(1, to: CGPoint(x: 30, y: 0), time: at(0.1))
-        XCTAssertEqual(Array(cues.dropFirst()), [.longPressCancelled, .dragBegan])
+        XCTAssertEqual(Array(cues.dropFirst()), [.holdCancelled, .dragBegan(button: L)])
         _ = at(1)                                        // the timer never fires
         XCTAssertEqual(cues.count, 3)
     }
 
-    func testDirectTapCancelsTheLongPressAndClicks() {
+    func testDirectTapCancelsTheHoldAndClicks() {
         let t = make(.direct)
         t.began(1, at: .zero, time: at(0))
         t.ended(1, at: .zero, time: at(0.1))
-        XCTAssertEqual(Array(cues.dropFirst()), [.longPressCancelled, .click(button: L, count: 1)])
+        XCTAssertEqual(Array(cues.dropFirst()), [.holdCancelled, .click(button: L, count: 1)])
     }
 
-    func testDirectLongPressThenMoveIsADrag() {
-        let t = make(.direct)
-        t.began(1, at: .zero, time: at(0))
-        _ = at(0.6)
-        t.moved(1, to: CGPoint(x: 30, y: 0), time: at(0.05))
-        XCTAssertEqual(Array(cues.dropFirst()), [.longPressFired, .dragBegan])
-    }
-
-    func testDirectLongPressDragEndsWithDragEndedOnLift() {
+    func testDirectHoldThenMoveKeepsOneIndicator() {
         let t = make(.direct)
         t.began(1, at: .zero, time: at(0))
         _ = at(0.6)
         t.moved(1, to: CGPoint(x: 30, y: 0), time: at(0.05))
         t.ended(1, at: CGPoint(x: 30, y: 0), time: at(0.1))
-        XCTAssertEqual(cues.last, .dragEnded)
+        XCTAssertEqual(Array(cues.dropFirst()), [.holdFired, .dragBegan(button: L), .dragEnded])
     }
 }
 
@@ -530,12 +615,12 @@ final class FeedbackEmissionTests: XCTestCase {
         view.handleCue(.click(button: InputController.Button.left, count: 1))
         view.handleCue(.click(button: InputController.Button.left, count: 2))
         view.handleCue(.click(button: InputController.Button.right, count: 1))
-        view.handleCue(.dragBegan)
+        view.handleCue(.click(button: InputController.Button.middle, count: 1))
+        view.handleCue(.dragBegan(button: InputController.Button.right))
         view.handleCue(.dragEnded)
-        view.handleCue(.dragLock(true))
         view.handleCue(.fingerDown)
-        XCTAssertEqual(r.events, [.click(at: p), .doubleClick(at: p), .rightClick(at: p), .dragBegan(at: p),
-                                  .dragEnded, .dragLock(active: true, at: p), .fingerDown])
+        XCTAssertEqual(r.events, [.click(at: p), .doubleClick(at: p), .rightClick(at: p), .click(at: p),
+                                  .dragBegan(at: p, button: InputController.Button.right), .dragEnded, .fingerDown])
     }
 
     func testZoomedClicksStillReportTheUnzoomedPoint() throws {
@@ -566,13 +651,20 @@ final class FeedbackEmissionTests: XCTestCase {
         XCTAssertEqual(r.events, [.scrollEnded])
     }
 
-    func testLongPressCuesPassThrough() {
+    func testHoldCuesPassThroughAtTheFingersOrTheCursor() throws {
         let (view, r) = make()
-        view.handleCue(.longPressArmed(at: CGPoint(x: 5, y: 6), duration: 0.5))
-        view.handleCue(.longPressFired)
-        view.handleCue(.longPressCancelled)
-        XCTAssertEqual(r.events, [.longPressBegan(at: CGPoint(x: 5, y: 6), duration: 0.5),
-                                  .longPressEnded(fired: true), .longPressEnded(fired: false)])
+        // Touch mode: at the fingers.
+        view.handleCue(.holdArmed(at: CGPoint(x: 5, y: 6), duration: 0.45, button: InputController.Button.right))
+        view.handleCue(.holdFired)
+        view.handleCue(.holdCancelled)
+        XCTAssertEqual(r.events, [.holdBegan(at: CGPoint(x: 5, y: 6), duration: 0.45, button: InputController.Button.right),
+                                  .holdEnded(fired: true), .holdEnded(fired: false)])
+        // Trackpad mode: at the cursor (SCREEN).
+        r.events = []
+        view.perform(.moveTo(CGPoint(x: 50, y: 40)))
+        let cursor = try XCTUnwrap(view.cursorViewPoint)
+        view.handleCue(.holdArmed(at: nil, duration: 0.3, button: InputController.Button.middle))
+        XCTAssertEqual(r.events, [.holdBegan(at: cursor, duration: 0.3, button: InputController.Button.middle)])
     }
 
     func testMinimapJumpCentresTheViewport() {

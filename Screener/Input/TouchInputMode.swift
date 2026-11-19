@@ -3,11 +3,32 @@
 // TouchInterpreter is fed raw touches (RemoteInputView's touchesBegan/…
 // for `.direct` and `.pencil` touches) and emits TouchActions; it never
 // touches the wire, so every gesture's event sequence is unit-tested
-// (TrackpadModeTests). RemoteInputView performs the actions.
+// (TrackpadModeTests, HoldGestureTests). RemoteInputView performs the actions.
 //
-// Trackpad mode (the default for fingers; like Screens):
+// The gestures follow Screens 5 (Edovia). In BOTH modes:
+//   - tap: left click; double tap: double click
+//   - two-finger tap: right click; three-finger tap: middle click
+//   - two-finger drag: scroll (momentum after)
+//   - touch and hold (`holdDelay`, Settings → Touch-and-Hold Drag Delay:
+//     0.3 / 0.45 / 0.6 s) with one, two or three fingers until the
+//     indicator appears (a progress ring, then a pulse at the cursor —
+//     blue / red / green), then drag: a left / right / middle-button drag.
+//     The button goes down when the fingers move past the slop after the
+//     hold fired; lifting without moving does nothing more. Moving or
+//     pinching before it fires cancels the hold (it is then a scroll / zoom
+//     / swipe). The first finger to lift ends a multi-finger drag.
+//   - three-finger swipe (moved `Tuning.swipeDistance` before the hold
+//     fires): the Mac trackpad's shortcut, once per swipe — left ⌃→ (to the
+//     Space on the right, as on a Magic Trackpad), right ⌃←, up ⌃↑ Mission
+//     Control, down ⌃↓ App Exposé (ThreeFingerSwipe)
+//   - pinch zooms around the fingers (Viewport, 1×–4×) and pans with them;
+//     a two-finger double-tap resets to fit. While zoomed, a two-finger tap
+//     waits `tapDelay` for a second one (reset) before right-clicking.
+//   - four or more fingers are left to the system.
+// Trackpad mode (the default for fingers):
 //   - one-finger drag: moves the cursor relatively; finger speed sets the
-//     gain (TrackpadAcceleration, 1.0 → 2.5)
+//     gain (TrackpadAcceleration, 1.0 → 2.5). A hold-drag moves it the same
+//     way (the fingers' centroid) with the button held.
 //   - tap: left click at the cursor. The click (haptic + button) waits
 //     `tapDelay` (Settings → Tap to Click: 0.15 / 0.25 / 0.35 s) for a second
 //     touch, so a tap-and-drag never reaches the Mac as a click followed by a
@@ -18,40 +39,25 @@
 //   - double-tap: a double click (both clicks sent at the second tap; each
 //     tap's cue fires at its own touch-up, giving two rings)
 //   - double-tap-and-hold (second touch within the window, then held still
-//     `tapMaxDuration` or moved): left-button drag until it lifts
-//   - long press: one finger held still for `Tuning.longPress` starts a
-//     left-button drag (medium haptic) until it lifts — like
-//     double-tap-and-hold, in one touch. With `longPressRightClick`
-//     (Settings, default OFF — two-finger tap is the usual right click) it
-//     is a right click instead, the moment it fires; moving after it moves
-//     the cursor, lifting does nothing more. Neither is armed for the second
-//     touch of a double tap (that is double-tap-and-hold = drag) nor under
-//     the drag lock
-//   - two-finger tap: right click; two-finger drag: scroll (momentum after)
-//   - three-finger drag: drag lock — the button goes down and stays down
-//     after the fingers lift; one-finger drags keep dragging; a tap releases
-// Direct mode (the original touch behaviour; Pencil always uses it):
-//   - tap: left click at the touch; one-finger drag: left-button drag from
-//     the touch point
-//   - long press (0.5 s, haptic): released in place = right click there;
-//     moved after = left-button drag (the original long-press drag)
-//   - two-finger tap: right click at the fingers; two-finger drag: scroll at
-//     the fingers
-// Both modes: pinch zooms around the fingers (Viewport, 1×–4×) and pans with
-// them; a two-finger double-tap resets to fit. While zoomed, a two-finger tap
-// waits `tapDelay` for a second one (reset) before right-clicking.
-// Four or more fingers are left to the system.
+//     `tapMaxDuration` or moved): left-button drag until it lifts (no hold
+//     indicator: the second touch is never a hold)
+//   - clicks, taps and hold indicators are at the cursor.
+// Touch (direct) mode (Pencil always uses it):
+//   - tap: left click at the touch; one-finger drag: an immediate left-button
+//     drag from the touch point
+//   - holds, two-/three-finger taps and scrolls act at the fingers'
+//     centroid (the cursor jumps there when a hold fires).
 //
 // Feedback cues (`onCue`, TouchCue): alongside its actions the interpreter
-// reports what a gesture MEANT — a click (and how many), a drag starting or
-// ending, the drag lock engaging/releasing, a trackpad finger landing, a
-// direct-mode long press arming / firing / being abandoned — for the visual feedback
-// (RemoteInputView → FeedbackSink). Cues never change the actions.
+// reports what a gesture MEANT — a click (and how many), a hold arming /
+// firing / being abandoned, a drag (and its button) starting or ending, a
+// trackpad finger landing — for the visual feedback (RemoteInputView →
+// FeedbackSink). Cues never change the actions.
 //
 // Nothing stays pressed: every button-down has its button-up on lift, on a
-// cancelled touch (system gesture), on `cancel()` (mode switch, menu open,
-// focus loss, teardown). The drag lock is the one deliberate hold; it too
-// is released by `cancel()`.
+// cancelled touch (system gesture), on too many fingers (abandon), on
+// `cancel()` (mode switch, menu open, focus loss, teardown). Swipe chords are
+// complete taps (modifiers down, key down/up, modifiers up).
 import CoreGraphics
 import Foundation
 
@@ -100,10 +106,33 @@ enum TrackpadAcceleration {
 }
 
 enum TouchHaptic: Equatable, Sendable {
-    /// A click.
+    /// A click, a swipe's shortcut.
     case light
-    /// A right click, a drag starting, a long press.
+    /// A right / middle click, a drag starting, a hold firing.
     case medium
+}
+
+/// A three-finger swipe: the Mac trackpad's equivalent shortcut. The swipe
+/// direction is the fingers' (left = fingers moved left), mapped as a Magic
+/// Trackpad does: swiping left reveals the Space on the right (⌃→).
+enum ThreeFingerSwipe: Equatable, CaseIterable, Sendable {
+    case left, right, up, down
+
+    var chord: KeyChord {
+        let ctrl = StickyModifier.control.keysym!
+        switch self {
+        case .left: return KeyChord([ctrl], SpecialKey.right.keysym)
+        case .right: return KeyChord([ctrl], SpecialKey.left.keysym)
+        case .up: return ShortcutAction.missionControl.chord        // ⌃↑
+        case .down: return ShortcutAction.appExpose.chord           // ⌃↓
+        }
+    }
+
+    /// The dominant direction of a travel `d` (view points, y down).
+    static func direction(_ d: CGPoint) -> ThreeFingerSwipe {
+        if abs(d.x) >= abs(d.y) { return d.x < 0 ? .left : .right }
+        return d.y < 0 ? .up : .down
+    }
 }
 
 /// What a gesture asks of the pointer.
@@ -124,6 +153,8 @@ enum TouchAction: Equatable {
     case zoom(factor: CGFloat, center: CGPoint, pan: CGPoint)
     case resetZoom
     case haptic(TouchHaptic)
+    /// Tap this key chord (a three-finger swipe's shortcut).
+    case keyChord(KeyChord)
 }
 
 /// What a gesture meant, for visual feedback (never sent to the Mac).
@@ -132,17 +163,18 @@ enum TouchCue: Equatable {
     case fingerDown
     /// `count` clicks of `button` were sent (2: a double click).
     case click(button: Int, count: Int)
-    /// A gesture pressed the left button to drag (tap-drag / long-press-drag).
-    case dragBegan
-    /// That drag released the button.
+    /// A one-/two-/three-finger hold started arming: it fires after
+    /// `duration` if the fingers stay still, for a `button` drag. `at`: the
+    /// fingers' centroid (Touch mode, view points); nil in Trackpad mode (at
+    /// the cursor).
+    case holdArmed(at: CGPoint?, duration: TimeInterval, button: Int)
+    case holdFired
+    case holdCancelled
+    /// A drag with `button` is armed or pressed (a fired hold, a tap-drag, a
+    /// Touch-mode drag): the indicator pulse at the cursor.
+    case dragBegan(button: Int)
+    /// That drag is over (button released, or the hold ended unused).
     case dragEnded
-    /// The three-finger drag lock engaged (true) or released (false).
-    case dragLock(Bool)
-    /// Direct mode: a touch at `at` will be a long press after `duration`
-    /// if it stays still.
-    case longPressArmed(at: CGPoint, duration: TimeInterval)
-    case longPressFired
-    case longPressCancelled
 }
 
 @MainActor
@@ -156,30 +188,32 @@ final class TouchInterpreter {
         static let tapMaxDuration: TimeInterval = 0.3
         /// The default `tapDelay` (TapClickDelay.normal).
         static let tapDragWindow: TimeInterval = 0.25
-        /// Direct: long press; trackpad: long-press right click.
-        static let longPress: TimeInterval = 0.5
+        /// The default `holdDelay` (HoldDragDelay.normal).
+        static let holdDelay: TimeInterval = 0.45
+        /// Three fingers' travel (points) that makes a swipe.
+        static let swipeDistance: CGFloat = 50
         /// Scroll release velocity is measured over this much recent motion.
         static let velocityWindow: TimeInterval = 0.1
     }
 
     private enum Phase: Equatable {
         case idle
-        /// Down, undecided.
+        /// One finger down, undecided.
         case pending
-        /// Trackpad: cursor moving (button held only under a drag lock).
+        /// Trackpad: cursor moving, no button.
         case moving
-        /// Left button held for this gesture.
+        /// `dragButton` held for this gesture.
         case dragging
-        /// Direct: long press recognised, finger still down.
-        case longPressed
+        /// A hold fired; the drag's button goes down when the fingers move.
+        case held
         /// Two fingers, undecided.
         case twoPending
         case scrolling
         case zooming
-        /// Trackpad: three fingers, undecided.
+        /// Three fingers, undecided.
         case threePending
-        /// Trackpad: three-finger drag (lock).
-        case threeDrag
+        /// Three fingers moving before the hold fired: a swipe so far.
+        case swiping
         /// Ignored until every finger lifts.
         case ignored
     }
@@ -198,14 +232,17 @@ final class TouchInterpreter {
     /// zoomed: a two-finger tap waits this long for a double tap
     /// (Settings → Tap to Click, TapClickDelay).
     var tapDelay: TimeInterval = Tuning.tapDragWindow
-    /// Trackpad: a still one-finger long press is a right click (Settings).
-    var longPressRightClick = false
+    /// How long a still hold takes to arm a drag (Settings → Touch-and-Hold
+    /// Drag Delay, HoldDragDelay). Read when a hold starts arming.
+    var holdDelay: TimeInterval = Tuning.holdDelay
 
     private let perform: (TouchAction) -> Void
     /// Feedback cues (TouchCue).
     var onCue: ((TouchCue) -> Void)?
-    /// A long press is armed (its cue was sent; fired / cancelled is owed).
-    private var longPressArmed = false
+    /// A hold is armed (its cue was sent; fired / cancelled is owed).
+    private var holdArmed = false
+    /// The button of the armed / fired hold.
+    private var holdButton = InputController.Button.left
     private let schedule: KeyRepeater.Schedule
 
     private var fingers: [Int: Finger] = [:]
@@ -220,10 +257,11 @@ final class TouchInterpreter {
     private var lastSpread: CGFloat = 0
     private var scrollSamples: [(t: TimeInterval, d: CGPoint)] = []
 
-    /// This gesture holds the left button.
+    /// This gesture holds `dragButton`.
     private var buttonDown = false
-    /// Trackpad drag lock: the button stays down between gestures.
-    private(set) var dragLocked = false
+    private var dragButton = InputController.Button.left
+    /// A `dragBegan` cue was sent; `dragEnded` is owed.
+    private var dragCueOpen = false
     /// Trackpad: a tap's click waiting for the tap-drag window.
     private var pendingClick: (() -> Void)?
     /// Trackpad: this gesture began inside a pending click's window.
@@ -242,6 +280,9 @@ final class TouchInterpreter {
     /// Gesture semantics for this gesture: Pencil is always direct.
     private var effectiveMode: TouchInputMode { pencil ? .direct : mode }
 
+    /// Whether this gesture holds a mouse button now.
+    var isHoldingButton: Bool { buttonDown }
+
     // MARK: input
 
     func began(_ id: Int, at p: CGPoint, time t: TimeInterval, pencil isPencil: Bool = false) {
@@ -258,12 +299,16 @@ final class TouchInterpreter {
             flushOwedClick()
             phase = .twoPending
             markMultiStart()
-        case (.twoPending, 3) where effectiveMode == .trackpad:
+            armHold(InputController.Button.right)
+        case (.twoPending, 3):
+            cancelTimer()
+            flushPendingRightClick()
             phase = .threePending
             markMultiStart()
+            armHold(InputController.Button.middle)
         case (_, let n) where n >= 4:
             abandon()
-        case (.dragging, _), (.longPressed, _), (.scrolling, _), (.zooming, _), (.threeDrag, _):
+        case (.dragging, _), (.held, _), (.scrolling, _), (.zooming, _):
             // A resting extra finger: not part of this gesture.
             fingers[id] = nil
             ignoredFingers.insert(id)
@@ -291,8 +336,8 @@ final class TouchInterpreter {
             guard let f = fingers.values.first, distance(f.start, f.last) > Tuning.slop else { return }
             let delta = sub(f.last, f.start)
             flushPendingRightClick()
+            cancelTimer()
             if effectiveMode == .trackpad {
-                cancelTimer()
                 if owedClick {
                     owedClick = false
                     startDrag()
@@ -301,36 +346,40 @@ final class TouchInterpreter {
                 }
                 perform(.moveBy(delta))
             } else {
-                cancelTimer()
                 perform(.moveTo(f.start))
                 startDrag()
                 perform(.moveTo(f.last))
             }
             lastCentroid = f.last
         case .moving, .dragging:
-            guard let f = fingers.values.first else { return }
+            let c = centroid()
             if effectiveMode == .trackpad {
-                perform(.moveBy(TrackpadAcceleration.apply(sub(f.last, lastCentroid), dt: dt)))
+                perform(.moveBy(TrackpadAcceleration.apply(sub(c, lastCentroid), dt: dt)))
             } else {
-                perform(.moveTo(f.last))
+                perform(.moveTo(c))
             }
-            lastCentroid = f.last
-        case .longPressed:
-            guard let f = fingers.values.first, distance(f.start, f.last) > Tuning.slop else { return }
+            lastCentroid = c
+        case .held:
+            let c = centroid()
+            guard distance(c, startCentroid) > Tuning.slop else { return }
             phase = .dragging
-            buttonDown = true
-            perform(.button(InputController.Button.left, down: true))
-            onCue?(.dragBegan)
-            perform(.moveTo(f.last))
-            lastCentroid = f.last
+            pressDragButton(holdButton)
+            if effectiveMode == .trackpad {
+                perform(.moveBy(sub(c, startCentroid)))
+            } else {
+                perform(.moveTo(c))
+            }
+            lastCentroid = c
         case .twoPending:
             guard fingers.count == 2 else { return }
             let c = centroid(), s = spread()
             if abs(s - startSpread) > Tuning.pinchSlop {
+                cancelTimer()
                 phase = .zooming
                 lastCentroid = c
                 lastSpread = s
             } else if distance(c, startCentroid) > Tuning.slop {
+                cancelTimer()
                 phase = .scrolling
                 scrollSamples = []
                 if effectiveMode == .direct { perform(.moveTo(startCentroid)) }
@@ -349,24 +398,20 @@ final class TouchInterpreter {
             perform(.zoom(factor: factor, center: c, pan: sub(c, lastCentroid)))
             lastCentroid = c
             lastSpread = s
-        case .threePending:
+        case .threePending, .swiping:
             guard fingers.count == 3 else { return }
-            let c = centroid()
-            guard distance(c, startCentroid) > Tuning.slop else { return }
-            phase = .threeDrag
-            perform(.haptic(.medium))
-            if !dragLocked {
-                perform(.button(InputController.Button.left, down: true))
-                dragLocked = true
-                onCue?(.dragLock(true))
+            let d = sub(centroid(), startCentroid)
+            let travel = hypot(d.x, d.y)
+            if phase == .threePending {
+                guard travel > Tuning.slop else { return }
+                cancelTimer()
+                phase = .swiping
             }
-            perform(.moveBy(sub(c, startCentroid)))
-            lastCentroid = c
-        case .threeDrag:
-            guard fingers.count == 3 else { return }
-            let c = centroid()
-            perform(.moveBy(TrackpadAcceleration.apply(sub(c, lastCentroid), dt: dt)))
-            lastCentroid = c
+            guard travel >= Tuning.swipeDistance else { return }
+            // One shortcut per swipe; the rest of the touch is ignored.
+            phase = .ignored
+            perform(.haptic(.light))
+            perform(.keyChord(ThreeFingerSwipe.direction(d).chord))
         case .idle, .ignored:
             break
         }
@@ -384,10 +429,17 @@ final class TouchInterpreter {
             // The first finger up ends the scroll; the other is ignored.
             perform(.scrollEnded(velocity: scrollVelocity(at: t)))
             phase = .ignored
-        case .zooming:
+        case .zooming, .swiping:
             phase = .ignored
-        case .threeDrag:
-            phase = .ignored                       // the lock holds the button
+        case .dragging, .held:
+            // The first finger up ends a multi-finger drag.
+            if !fingers.isEmpty {
+                releaseGestureButton()
+                phase = .ignored
+            }
+        case .twoPending, .threePending:
+            // A finger lifted: no hold (a tap is still possible).
+            if !fingers.isEmpty { cancelTimer() }
         default:
             break
         }
@@ -403,13 +455,13 @@ final class TouchInterpreter {
                 perform(.moveTo(f.start))
                 click(InputController.Button.left, haptic: .light)
             }
-        case .longPressed:
-            click(InputController.Button.right, haptic: nil)          // haptic given at the press
-        case .dragging:
-            releaseGestureButton()
+        case .dragging, .held:
+            releaseGestureButton()                   // a still hold: nothing more
         case .twoPending:
             if duration <= Tuning.tapMaxDuration * 1.5 { twoFingerTap() }
-        case .moving, .scrolling, .zooming, .threePending, .threeDrag, .ignored, .idle:
+        case .threePending:
+            if duration <= Tuning.tapMaxDuration * 1.5 { threeFingerTap() }
+        case .moving, .scrolling, .zooming, .swiping, .ignored, .idle:
             break
         }
         ignoredFingers.removeAll()
@@ -417,7 +469,7 @@ final class TouchInterpreter {
     }
 
     /// A touch was cancelled (a system gesture took it): the whole gesture
-    /// ends, releasing anything it pressed (the drag lock stays).
+    /// ends, releasing anything it pressed.
     func cancelled(_ id: Int) {
         if ignoredFingers.remove(id) != nil { return }
         guard fingers.removeValue(forKey: id) != nil else { return }
@@ -426,11 +478,14 @@ final class TouchInterpreter {
         releaseGestureButton()
         owedClick = false
         phase = fingers.isEmpty ? .idle : .ignored
-        if fingers.isEmpty { ignoredFingers.removeAll() }
+        if fingers.isEmpty { ignoredFingers.removeAll() } else {
+            ignoredFingers.formUnion(fingers.keys)
+            fingers.removeAll()
+        }
     }
 
-    /// Ends everything: pending clicks are dropped, held buttons (the drag
-    /// lock too) released. Mode switch, menu open, focus loss, teardown.
+    /// Ends everything: pending clicks are dropped, held buttons released.
+    /// Mode switch, menu open, focus loss, teardown.
     func cancel() {
         cancelTimer()
         pendingClick?()
@@ -440,11 +495,6 @@ final class TouchInterpreter {
         owedClick = false
         if phase == .scrolling { perform(.scrollEnded(velocity: .zero)) }
         releaseGestureButton()
-        if dragLocked {
-            dragLocked = false
-            perform(.button(InputController.Button.left, down: false))
-            onCue?(.dragLock(false))
-        }
         // Fingers still down stay out of the next gesture.
         ignoredFingers.formUnion(fingers.keys)
         fingers.removeAll()
@@ -461,6 +511,7 @@ final class TouchInterpreter {
         gestureStart = t
         lastTime = t
         lastCentroid = p
+        startCentroid = p
         phase = .pending
         if effectiveMode == .trackpad {
             onCue?(.fingerDown)
@@ -470,25 +521,51 @@ final class TouchInterpreter {
                 pendingClick = nil
                 owedClick = true
                 timer = schedule(Tuning.tapMaxDuration) { [weak self] in self?.holdBecameDrag() }
-            } else if !dragLocked {
-                timer = schedule(Tuning.longPress) { [weak self] in self?.trackpadLongPressFired() }
+                return
             }
         } else {
             flushPendingClicks()
-            timer = schedule(Tuning.longPress) { [weak self] in self?.longPressFired() }
-            longPressArmed = true
-            onCue?(.longPressArmed(at: p, duration: Tuning.longPress))
         }
+        armHold(InputController.Button.left)
+    }
+
+    /// Starts the hold timer for a `button` drag (the fingers are still).
+    private func armHold(_ button: Int) {
+        holdButton = button
+        let delay = holdDelay
+        timer = schedule(delay) { [weak self] in self?.holdFired() }
+        holdArmed = true
+        onCue?(.holdArmed(at: effectiveMode == .direct ? startCentroid : nil, duration: delay, button: button))
+    }
+
+    /// The fingers stayed still for `holdDelay`: the drag is armed (the
+    /// indicator shows); its button goes down when they move.
+    private func holdFired() {
+        timer = nil
+        let needed: Int
+        let expected: Phase
+        switch holdButton {
+        case InputController.Button.right: (needed, expected) = (2, .twoPending)
+        case InputController.Button.middle: (needed, expected) = (3, .threePending)
+        default: (needed, expected) = (1, .pending)
+        }
+        let valid = phase == expected && fingers.count == needed && !owedClick
+        if holdArmed {
+            holdArmed = false
+            if !valid { onCue?(.holdCancelled) }
+        }
+        guard valid else { return }
+        flushPendingRightClick()
+        phase = .held
+        if effectiveMode == .direct { perform(.moveTo(startCentroid)) }
+        perform(.haptic(.medium))
+        onCue?(.holdFired)
+        dragButton = holdButton
+        dragCueOpen = true
+        onCue?(.dragBegan(button: holdButton))
     }
 
     private func trackpadTap(quick: Bool) {
-        if dragLocked {
-            dragLocked = false
-            perform(.button(InputController.Button.left, down: false))
-            perform(.haptic(.light))
-            onCue?(.dragLock(false))
-            return
-        }
         guard quick else { return }
         if owedClick {
             // The first tap's ring already fired at its own touch-up; this is
@@ -537,6 +614,12 @@ final class TouchInterpreter {
         }
     }
 
+    /// Middle click at the cursor (Touch: at the fingers).
+    private func threeFingerTap() {
+        if effectiveMode == .direct { perform(.moveTo(startCentroid)) }
+        click(InputController.Button.middle, haptic: .medium)
+    }
+
     private func rightClick(at p: CGPoint) {
         if effectiveMode == .direct { perform(.moveTo(p)) }
         click(InputController.Button.right, haptic: .medium)
@@ -558,50 +641,32 @@ final class TouchInterpreter {
         startDrag()
     }
 
-    /// Trackpad: one finger held still for `Tuning.longPress` — a drag
-    /// starts (button down until the finger lifts), or with
-    /// `longPressRightClick` a right click now and the rest of the touch
-    /// only moves the cursor.
-    private func trackpadLongPressFired() {
-        timer = nil
-        guard phase == .pending, effectiveMode == .trackpad, !owedClick, !dragLocked, fingers.count == 1
-        else { return }
-        flushPendingRightClick()
-        if longPressRightClick {
-            phase = .moving
-            click(InputController.Button.right, haptic: .medium)
-        } else {
-            startDrag()
-        }
-    }
-
-    private func longPressFired() {
-        timer = nil
-        if longPressArmed {
-            longPressArmed = false
-            onCue?(phase == .pending ? .longPressFired : .longPressCancelled)
-        }
-        guard phase == .pending, let f = fingers.values.first else { return }
-        flushPendingRightClick()
-        phase = .longPressed
-        perform(.moveTo(f.start))
-        perform(.haptic(.medium))
-    }
-
+    /// An immediate left drag (tap-drag, Touch-mode drag): pressed now.
     private func startDrag() {
         phase = .dragging
         perform(.haptic(.medium))
-        if dragLocked { return }                     // already held by the lock
-        buttonDown = true
-        perform(.button(InputController.Button.left, down: true))
-        onCue?(.dragBegan)
+        pressDragButton(InputController.Button.left)
+        dragCueOpen = true
+        onCue?(.dragBegan(button: InputController.Button.left))
     }
 
+    private func pressDragButton(_ button: Int) {
+        guard !buttonDown else { return }
+        buttonDown = true
+        dragButton = button
+        perform(.button(button, down: true))
+    }
+
+    /// Releases this gesture's button (if pressed) and ends its indicator.
     private func releaseGestureButton() {
-        guard buttonDown else { return }
-        buttonDown = false
-        perform(.button(InputController.Button.left, down: false))
-        onCue?(.dragEnded)
+        if buttonDown {
+            buttonDown = false
+            perform(.button(dragButton, down: false))
+        }
+        if dragCueOpen {
+            dragCueOpen = false
+            onCue?(.dragEnded)
+        }
     }
 
     private func click(_ button: Int, haptic: TouchHaptic?) {
@@ -625,9 +690,9 @@ final class TouchInterpreter {
         sendClick(InputController.Button.left, haptic: .light)
     }
 
-    /// A one-finger gesture committed while a zoomed two-finger tap waited
-    /// for its double tap: right click now, before the cursor moves. Its
-    /// ripple already fired when the two-finger tap was recognised.
+    /// A gesture committed while a zoomed two-finger tap waited for its
+    /// double tap: right click now, before the cursor moves. Its ripple
+    /// already fired when the two-finger tap was recognised.
     private func flushPendingRightClick() {
         guard let cancelRight = pendingRightClick else { return }
         cancelRight()
@@ -659,9 +724,9 @@ final class TouchInterpreter {
     private func cancelTimer() {
         timer?()
         timer = nil
-        if longPressArmed {
-            longPressArmed = false
-            onCue?(.longPressCancelled)
+        if holdArmed {
+            holdArmed = false
+            onCue?(.holdCancelled)
         }
     }
 

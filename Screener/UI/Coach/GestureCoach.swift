@@ -27,6 +27,8 @@ enum CoachAnimationKind: Equatable {
     case drag
     case longPress
     case scroll
+    /// Three-finger swipe (side to side).
+    case swipe
     case pinch
     case shake
     case menu
@@ -70,20 +72,24 @@ enum GestureCoach {
                   title: "Move the Pointer", subtitle: "One finger moves the pointer, like a trackpad.",
                   kind: .moveTrackpad),
         CoachCard(id: "click", systemImage: "hand.tap.fill",
-                  title: "Click & Right-Click", subtitle: "Tap to click. Two fingers, tap together, to right-click.",
+                  title: "Click", subtitle: "Tap to click. Tap with two fingers to right-click, "
+                     + "three to middle-click.",
                   kind: .tap),
         CoachCard(id: "drag", systemImage: "hand.draw.fill",
-                  title: "Drag", subtitle: "Press and hold, then move, to drag. Or double-tap and hold.",
-                  kind: .drag),
+                  title: "Drag", subtitle: "Touch and hold until the blue ring appears, then move. "
+                     + "Hold two fingers (red) to right-drag, three (green) to middle-drag.",
+                  kind: .longPress),
         CoachCard(id: "scrollZoom", systemImage: "hand.draw",
                   title: "Scroll & Zoom", subtitle: "Two fingers drag to scroll. Pinch to zoom; "
                      + "two-finger double-tap resets.",
                   kind: .pinch),
-        CoachCard(id: "findCursor", systemImage: "iphone.gen3.radiowaves.left.and.right",
-                  title: "Find the Cursor", subtitle: "Shake the iPad to flash the pointer's position.",
-                  kind: .shake),
+        CoachCard(id: "swipe", systemImage: "hand.raised.fingers.spread.fill",
+                  title: "Spaces & Mission Control", subtitle: "Swipe three fingers left or right to switch "
+                     + "Spaces, up for Mission Control, down for App Exposé.",
+                  kind: .swipe),
         CoachCard(id: "menu", systemImage: "circle.grid.2x2.fill",
-                  title: "Open the Control Menu", subtitle: "Tap the floating button — or press ⌘⌥M.",
+                  title: "Open the Control Menu", subtitle: "Tap the floating button — or press ⌘⌥M. "
+                     + "Shake the iPad to find the pointer.",
                   kind: .menu),
     ]
 
@@ -92,20 +98,24 @@ enum GestureCoach {
                   title: "Tap to Click", subtitle: "The pointer follows your finger; tap where you touch to click.",
                   kind: .moveDirect),
         CoachCard(id: "rightClick", systemImage: "hand.tap",
-                  title: "Right-Click", subtitle: "Press and hold, then lift, to right-click where you touched.",
-                  kind: .longPress),
+                  title: "Right- & Middle-Click", subtitle: "Tap with two fingers to right-click, three to "
+                     + "middle-click, where you touch.",
+                  kind: .twoFingerTap),
         CoachCard(id: "drag", systemImage: "hand.draw.fill",
-                  title: "Drag", subtitle: "Press and hold, then move without lifting, to drag.",
+                  title: "Drag", subtitle: "Drag with one finger. Or hold until the ring appears, then move: "
+                     + "one finger (blue) drags, two (red) right-drags, three (green) middle-drags.",
                   kind: .drag),
         CoachCard(id: "scrollZoom", systemImage: "hand.draw",
                   title: "Scroll & Zoom", subtitle: "Two fingers drag to scroll. Pinch to zoom; "
                      + "two-finger double-tap resets.",
                   kind: .pinch),
-        CoachCard(id: "findCursor", systemImage: "iphone.gen3.radiowaves.left.and.right",
-                  title: "Find the Cursor", subtitle: "Shake the iPad to flash the pointer's position.",
-                  kind: .shake),
+        CoachCard(id: "swipe", systemImage: "hand.raised.fingers.spread.fill",
+                  title: "Spaces & Mission Control", subtitle: "Swipe three fingers left or right to switch "
+                     + "Spaces, up for Mission Control, down for App Exposé.",
+                  kind: .swipe),
         CoachCard(id: "menu", systemImage: "circle.grid.2x2.fill",
-                  title: "Open the Control Menu", subtitle: "Tap the floating button — or press ⌘⌥M.",
+                  title: "Open the Control Menu", subtitle: "Tap the floating button — or press ⌘⌥M. "
+                     + "Shake the iPad to find the pointer.",
                   kind: .menu),
     ]
 }

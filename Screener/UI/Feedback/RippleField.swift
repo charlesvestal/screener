@@ -9,10 +9,12 @@
 //                and never for hardware mouse/trackpad clicks)
 //   doubleClick  two rings, the second `doubleGap` later
 //   rightClick   a ring plus a fainter, tinted echo `echoDelay` later
-//   pulse        a slow repeating ring following the cursor while a
-//                tap-drag, a long-press drag, or the three-finger drag lock
-//                is held (FeedbackCenter drives this directly, not through
-//                `spawn` — see `setPulse`) — released the moment it lets go
+//   pulse        a slow repeating ring following the cursor while a drag
+//                is armed or held (a fired one-/two-/three-finger hold, a
+//                tap-drag, a Touch-mode drag), its rim tinted by the drag's
+//                button (DragIndicatorTint: blue left, red right, green
+//                middle; FeedbackCenter drives this directly, not through
+//                `spawn` — see `setPulse`) — gone the moment it lets go
 // Plain pointing, hovering and an ordinary one-finger drag's cursor motion
 // get nothing: see FeedbackEvent.swift for which gestures reach this at all.
 // Ring timings and sizes are tuned slow and subtle on purpose (see the
@@ -52,6 +54,8 @@ struct Ripple: Equatable, Sendable {
     var echo = false
     /// Reduce Motion pulse: drawn static.
     var reduced = false
+    /// The pulse's rim colour (nil: `RippleField.rimTint`).
+    var tint: SIMD3<Float>?
 }
 
 /// One ripple's shape at an instant (BASE point, sizes in view points).
@@ -97,7 +101,7 @@ struct RippleField: Equatable, Sendable {
     static let echoStrength: CGFloat = 0.6
     /// Reduce Motion: the in-place highlight fade's life.
     static let fadeDuration = 0.3
-    /// Drag pulse (tap-drag / long-press-drag / three-finger lock): repeat period.
+    /// Drag pulse (hold-drag / tap-drag / Touch-mode drag): repeat period.
     static let pulsePeriod = 1.5
 
     static let white = SIMD3<Float>(1, 1, 1)
@@ -128,7 +132,7 @@ struct RippleField: Equatable, Sendable {
 
     /// Transient ripples, oldest first.
     private(set) var ripples: [Ripple] = []
-    /// The drag pulse (tap-drag / long-press-drag / three-finger lock).
+    /// The drag pulse (hold-drag / tap-drag / Touch-mode drag).
     private(set) var pulse: Ripple?
 
     var isEmpty: Bool { ripples.isEmpty && pulse == nil }
@@ -160,11 +164,16 @@ struct RippleField: Equatable, Sendable {
         }
     }
 
-    /// Starts (a point) or stops (nil) the drag pulse.
-    mutating func setPulse(at p: CGPoint?, now: Double, reduceMotion: Bool) {
+    /// Starts (a point) or stops (nil) the drag pulse; `tint` colours its
+    /// rim (nil: `rimTint`).
+    mutating func setPulse(at p: CGPoint?, now: Double, reduceMotion: Bool, tint: SIMD3<Float>? = nil) {
         guard let p else { pulse = nil; return }
-        if pulse != nil { pulse?.center = p; return }
-        pulse = Ripple(kind: .pulse, center: p, start: now, reduced: reduceMotion)
+        if pulse != nil {
+            pulse?.center = p
+            pulse?.tint = tint
+            return
+        }
+        pulse = Ripple(kind: .pulse, center: p, start: now, reduced: reduceMotion, tint: tint)
         trim()
     }
 
@@ -213,7 +222,7 @@ struct RippleField: Equatable, Sendable {
         let age = now - r.start
         guard age >= 0, age < duration(r) else { return nil }
         let tint = r.echo ? echoTint : white
-        let rimTint = r.echo ? echoRimTint : rimTint
+        let rimTint = r.tint ?? (r.echo ? echoRimTint : rimTint)
         switch r.kind {
         case .ring:
             let p = CGFloat(age / ringDuration)
